@@ -348,19 +348,84 @@ class ResourceMonitor:
         return summary
 
 
+def resolve_model_path(model_name: str) -> str:
+    """Resolve model path, supporting local directories and HF model names"""
+    
+    # Check if it's a local directory
+    if os.path.isdir(model_name):
+        logger.info(f"Using local model directory: {model_name}")
+        return model_name
+    
+    # Check if it's a relative path that exists
+    if os.path.exists(model_name):
+        abs_path = os.path.abspath(model_name)
+        logger.info(f"Using local model path: {abs_path}")
+        return abs_path
+    
+    # Check environment variable override
+    if "LOCAL_MODEL_PATH" in os.environ and os.path.isdir(os.environ["LOCAL_MODEL_PATH"]):
+        local_path = os.environ["LOCAL_MODEL_PATH"]
+        logger.info(f"Using model from LOCAL_MODEL_PATH: {local_path}")
+        return local_path
+    
+    # Default: assume it's a HF model name (will use cache if available)
+    logger.info(f"Using Hugging Face model: {model_name}")
+    return model_name
+
+def validate_local_model(model_path: str) -> bool:
+    """Validate that a local model directory contains necessary files"""
+    if not os.path.isdir(model_path):
+        return False
+    
+    # Check for essential model files
+    required_files = []
+    optional_files = ['config.json', 'tokenizer.json', 'tokenizer_config.json']
+    model_files = ['pytorch_model.bin', 'model.safetensors', 'pytorch_model-00001-of-*.bin']
+    
+    dir_contents = os.listdir(model_path)
+    
+    # Check for config file
+    has_config = any(f in dir_contents for f in ['config.json'])
+    
+    # Check for model weights (any format)
+    has_weights = any(
+        f in dir_contents or any(f.startswith(pattern.split('*')[0]) for f in dir_contents)
+        for pattern in model_files
+    ) or any(f.endswith('.safetensors') for f in dir_contents)
+    
+    if has_config and has_weights:
+        logger.info(f"Local model validation passed: {model_path}")
+        logger.info(f"Found files: {[f for f in dir_contents if f.endswith(('.json', '.bin', '.safetensors'))]}")
+        return True
+    else:
+        logger.warning(f"Local model validation failed: {model_path}")
+        logger.warning(f"Missing: {'config.json' if not has_config else ''} {'model weights' if not has_weights else ''}")
+        return False
+
 class SimpleLLMExperiment:
     """Simple experiment class for LLM querying with predefined templates and resource monitoring"""
     
     def __init__(self, 
-                 model_name: str = "meta-llama/Llama-2-7b-hf",  # Updated default model
+                 model_name: str = "meta-llama/Llama-2-7b-hf",
                  output_dir: str = "llm_results",
                  gpu_id: int = 0):
-        self.model_name = model_name
+        
+        # Resolve model path (local or HuggingFace)
+        self.model_name = resolve_model_path(model_name)
+        self.is_local_model = os.path.exists(self.model_name)
+        
         self.output_dir = output_dir
         self.gpu_id = gpu_id
         self.llm = None
         self.sampling_params = None
         self.resource_monitor = ResourceMonitor(gpu_id=gpu_id)
+        
+        # Validate local model if it's a local path
+        if self.is_local_model:
+            if not validate_local_model(self.model_name):
+                logger.error(f"Invalid local model directory: {self.model_name}")
+                sys.exit(1)
+            logger.info(f"Using local model: {self.model_name}")
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
@@ -419,6 +484,7 @@ class SimpleLLMExperiment:
                         **kwargs):
         """Initialize vLLM model with GPU configuration"""
         logger.info(f"Initializing vLLM model: {self.model_name}")
+        logger.info(f"Model type: {'Local' if self.is_local_model else 'HuggingFace'}")
         logger.info(f"Target GPU: {self.gpu_id}")
         
         try:
@@ -429,9 +495,16 @@ class SimpleLLMExperiment:
                 'max_num_seqs': 16,
                 'enable_prefix_caching': True,  # Enable for KV cache reuse
                 'seed': 42,
-                # Removed trust_remote_code parameter
                 **kwargs
             }
+            
+            # Add local model specific configurations if needed
+            if self.is_local_model:
+                # For local models, we might need to be more explicit about tokenizer
+                tokenizer_path = self.model_name
+                if os.path.exists(os.path.join(self.model_name, 'tokenizer.json')):
+                    llm_config['tokenizer'] = tokenizer_path
+                    logger.info(f"Using tokenizer from: {tokenizer_path}")
             
             logger.info(f"vLLM Configuration: {llm_config}")
             
@@ -461,6 +534,14 @@ class SimpleLLMExperiment:
                 allocated = torch.cuda.memory_allocated(self.gpu_id) / 1e9
                 total = torch.cuda.get_device_properties(self.gpu_id).total_memory / 1e9
                 logger.error(f"GPU {self.gpu_id} Memory: {allocated:.1f}GB allocated, {total:.1f}GB total")
+            
+            # Provide helpful error messages for local models
+            if self.is_local_model:
+                logger.error(f"Local model loading failed. Please check:")
+                logger.error(f"1. Model files exist in: {self.model_name}")
+                logger.error(f"2. Model format is compatible with vLLM")
+                logger.error(f"3. All required files (config.json, model weights) are present")
+            
             return False
     
     def get_vllm_stats(self) -> Dict[str, Any]:
@@ -939,9 +1020,9 @@ def main():
     parser.add_argument("query_key", help="Query template key to use", 
                        choices=list(QUERY_TEMPLATES.keys()))
     
-    # Model configuration - Updated default model
+    # Model configuration - Updated to support local paths
     parser.add_argument("--model", default="meta-llama/Llama-2-7b-hf",
-                       help="vLLM model name")
+                       help="vLLM model name (HuggingFace) or local path to model directory")
     parser.add_argument("--gpu", type=int, default=0,
                        help="GPU device to use (0, 1, 2, 3, etc.)")
     parser.add_argument("--gpu-memory", type=float, default=0.85,
@@ -961,6 +1042,10 @@ def main():
     # Monitoring configuration
     parser.add_argument("--monitor-interval", type=float, default=2.0, 
                        help="Resource monitoring interval in seconds")
+    
+    # Model validation
+    parser.add_argument("--validate-model", action="store_true", 
+                       help="Validate model path/name before running experiment")
     
     # Utility arguments
     parser.add_argument("--list-queries", action="store_true", help="List available query templates")
@@ -985,6 +1070,19 @@ def main():
             print(f"   Datasets: {', '.join(info['datasets'])}")
             print(f"   Prompt: {info['prompt'][:100]}...")
             print()
+        return
+    
+    # Validate model if requested
+    if args.validate_model:
+        resolved_path = resolve_model_path(args.model)
+        if os.path.exists(resolved_path):
+            if validate_local_model(resolved_path):
+                logger.info(f"✅ Model validation passed: {resolved_path}")
+            else:
+                logger.error(f"❌ Model validation failed: {resolved_path}")
+                return
+        else:
+            logger.info(f"🌐 HuggingFace model (will be downloaded if needed): {args.model}")
         return
     
     # Initialize experiment
