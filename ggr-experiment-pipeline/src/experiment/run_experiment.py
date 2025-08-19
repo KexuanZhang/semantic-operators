@@ -352,7 +352,7 @@ class SimpleLLMExperiment:
     """Simple experiment class for LLM querying with predefined templates and resource monitoring"""
     
     def __init__(self, 
-                 model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct",
+                 model_name: str = "meta-llama/Llama-2-7b-hf",  # Updated default model
                  output_dir: str = "llm_results",
                  gpu_id: int = 0):
         self.model_name = model_name
@@ -429,7 +429,7 @@ class SimpleLLMExperiment:
                 'max_num_seqs': 16,
                 'enable_prefix_caching': True,  # Enable for KV cache reuse
                 'seed': 42,
-                'trust_remote_code': True,
+                # Removed trust_remote_code parameter
                 **kwargs
             }
             
@@ -939,8 +939,8 @@ def main():
     parser.add_argument("query_key", help="Query template key to use", 
                        choices=list(QUERY_TEMPLATES.keys()))
     
-    # Model configuration
-    parser.add_argument("--model", default="meta-llama/Meta-Llama-3-8B-Instruct",
+    # Model configuration - Updated default model
+    parser.add_argument("--model", default="meta-llama/Llama-2-7b-hf",
                        help="vLLM model name")
     parser.add_argument("--gpu", type=int, default=0,
                        help="GPU device to use (0, 1, 2, 3, etc.)")
