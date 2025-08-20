@@ -9,11 +9,13 @@ Usage:
     python ggr.py dataset.csv [--fds "col1->col2,col1->col3"] [--output results/] [--max-depth 100]
 
 Features:
-- Automatic functional dependency discovery
+- Automatic functional dependency discovery (1->1 only)
 - GGR algorithm implementation with configurable depth
 - PHC (Prefix Hit Count) score calculation
 - Result saving with metadata
 - Comprehensive logging and analysis
+
+Note: Only 1->1 functional dependencies are supported for optimal performance.
 """
 
 import argparse
@@ -39,59 +41,39 @@ logger = logging.getLogger(__name__)
 class FunctionalDependencyDiscoverer:
     """Discover functional dependencies in a dataset using statistical analysis"""
     
-    def __init__(self, min_confidence: float = 0.95, max_lhs_size: int = 2):
+    def __init__(self, min_confidence: float = 0.95):
         self.min_confidence = min_confidence
-        # Hard limit to 2 columns on left-hand side for efficiency
-        self.max_lhs_size = min(max_lhs_size, 2)
-        logger.info(f"FD Discovery configured: max_lhs_size={self.max_lhs_size}, min_confidence={self.min_confidence}")
+        logger.info(f"FD Discovery configured: 1->1 only, min_confidence={self.min_confidence}")
     
     def discover_dependencies(self, df: pd.DataFrame) -> List[Tuple[str, str]]:
         """
         Discover functional dependencies in the dataset
-        Limited to at most 2 columns -> 1 column for efficiency
-        Returns list of (source_column(s), target_column) tuples
+        Only supports 1->1 dependencies (single column -> single column)
+        Returns list of (source_column, target_column) tuples
         """
-        logger.info(f"Discovering functional dependencies with confidence >= {self.min_confidence}")
-        logger.info(f"Limited to max {self.max_lhs_size} columns on left-hand side")
+        logger.info(f"Discovering 1->1 functional dependencies with confidence >= {self.min_confidence}")
         
         dependencies = []
         columns = df.columns.tolist()
         
-        # Check single column dependencies (A -> B)
+        # Check single column dependencies only (A -> B)
         logger.info("Checking single-column dependencies (A -> B)...")
         for source in columns:
             for target in columns:
                 if source != target:
-                    confidence = self._calculate_confidence(df, [source], target)
+                    confidence = self._calculate_confidence(df, source, target)
                     if confidence >= self.min_confidence:
                         dependencies.append((source, target))
                         logger.info(f"Found FD: {source} -> {target} (confidence: {confidence:.3f})")
         
-        # Check two-column dependencies (A,B -> C) only if max_lhs_size >= 2
-        if self.max_lhs_size >= 2:
-            logger.info("Checking two-column dependencies (A,B -> C)...")
-            for source_cols in combinations(columns, 2):
-                for target in columns:
-                    if target not in source_cols:
-                        confidence = self._calculate_confidence(df, list(source_cols), target)
-                        if confidence >= self.min_confidence:
-                            source_str = ",".join(source_cols)
-                            dependencies.append((source_str, target))
-                            logger.info(f"Found FD: {source_str} -> {target} (confidence: {confidence:.3f})")
-        
-        logger.info(f"Discovered {len(dependencies)} functional dependencies (max 2->1 constraint)")
+        logger.info(f"Discovered {len(dependencies)} functional dependencies (1->1 constraint)")
         return dependencies
     
-    def _calculate_confidence(self, df: pd.DataFrame, source_cols: List[str], target_col: str) -> float:
-        """Calculate confidence of functional dependency source_cols -> target_col"""
+    def _calculate_confidence(self, df: pd.DataFrame, source_col: str, target_col: str) -> float:
+        """Calculate confidence of functional dependency source_col -> target_col"""
         try:
-            # Validate that we don't exceed the 2->1 limit
-            if len(source_cols) > 2:
-                logger.warning(f"Skipping FD with {len(source_cols)} source columns (exceeds limit of 2)")
-                return 0.0
-            
-            # Group by source columns and check if target is unique
-            grouped = df.groupby(source_cols)[target_col].nunique()
+            # Group by source column and check if target is unique
+            grouped = df.groupby(source_col)[target_col].nunique()
             
             # Count how many groups have exactly one unique target value
             valid_groups = (grouped == 1).sum()
@@ -103,7 +85,7 @@ class FunctionalDependencyDiscoverer:
             confidence = valid_groups / total_groups
             return confidence
         except Exception as e:
-            logger.debug(f"Error calculating confidence for {source_cols} -> {target_col}: {e}")
+            logger.debug(f"Error calculating confidence for {source_col} -> {target_col}: {e}")
             return 0.0
 
 
@@ -126,7 +108,18 @@ class GGRAlgorithm:
         Returns (total_phc_score, reordered_dataframe, statistics)
         """
         logger.info(f"Applying GGR algorithm to table with shape {table.shape}")
-        logger.info(f"Using {len(functional_dependencies)} functional dependencies")
+        logger.info(f"Using {len(functional_dependencies)} functional dependencies (1->1 only)")
+        
+        # Validate that all FDs are 1->1
+        for source, target in functional_dependencies:
+            if ',' in source:
+                logger.warning(f"Skipping multi-column FD: {source} -> {target} (only 1->1 supported)")
+                continue
+        
+        # Filter to only 1->1 dependencies
+        filtered_fds = [(s, t) for s, t in functional_dependencies if ',' not in s]
+        if len(filtered_fds) != len(functional_dependencies):
+            logger.info(f"Filtered to {len(filtered_fds)} valid 1->1 dependencies")
         
         # Reset statistics
         self.total_phc_score = 0
@@ -138,7 +131,7 @@ class GGRAlgorithm:
         }
         
         start_time = time.time()
-        phc_score, reordered_table = self._ggr_recursive(table, functional_dependencies, depth=0)
+        phc_score, reordered_table = self._ggr_recursive(table, filtered_fds, depth=0)
         end_time = time.time()
         
         # Compile statistics
@@ -151,7 +144,7 @@ class GGRAlgorithm:
             'total_recursive_calls': self.recursion_stats['total_calls'],
             'single_row_cases': self.recursion_stats['single_row_cases'],
             'single_col_cases': self.recursion_stats['single_col_cases'],
-            'functional_dependencies_count': len(functional_dependencies)
+            'functional_dependencies_count': len(filtered_fds)
         }
         
         logger.info(f"GGR completed: PHC Score = {phc_score}, Time = {stats['execution_time_seconds']:.2f}s")
@@ -265,7 +258,7 @@ class GGRAlgorithm:
         return total_hit_count, combined_result
     
     def _calculate_hit_count(self, value: Any, field: str, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]]) -> Tuple[int, List[str]]:
-        """Calculate hit count for a value in a field"""
+        """Calculate hit count for a value in a field (1->1 FDs only)"""
         try:
             # Get rows with this value
             if pd.isna(value):
@@ -276,7 +269,7 @@ class GGRAlgorithm:
             if len(rows_with_value) == 0:
                 return 0, [field]
             
-            # Find functionally dependent columns
+            # Find functionally dependent columns (1->1 only)
             inferred_columns = []
             for source, target in functional_dependencies:
                 if source == field and target in table.columns:
@@ -337,6 +330,15 @@ class GGRProcessor:
             functional_dependencies = self.fd_discoverer.discover_dependencies(df)
         else:
             logger.info(f"Using provided functional dependencies: {functional_dependencies}")
+            # Validate that provided FDs are 1->1
+            valid_fds = []
+            for source, target in functional_dependencies:
+                if ',' in source:
+                    logger.warning(f"Skipping multi-column FD: {source} -> {target} (only 1->1 supported)")
+                else:
+                    valid_fds.append((source, target))
+            functional_dependencies = valid_fds
+            logger.info(f"Using {len(functional_dependencies)} valid 1->1 functional dependencies")
         
         # Apply GGR algorithm
         self.ggr_algorithm.max_depth = max_depth
@@ -378,12 +380,12 @@ class GGRProcessor:
         return df
     
     def _save_results(self, dataset_path: str, reordered_df: pd.DataFrame, results: Dict[str, Any]):
-        """Save the reordered dataset and metadata in a timestamped folder"""
+        """Save the reordered dataset and a simple text report in a timestamped folder"""
         base_name = os.path.splitext(os.path.basename(dataset_path))[0]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Create timestamped folder for this run
-        run_folder = os.path.join(self.output_dir, f"{base_name}_ggr_run_{timestamp}")
+        run_folder = os.path.join(self.output_dir, f"{base_name}_ggr_{timestamp}")
         os.makedirs(run_folder, exist_ok=True)
         logger.info(f"Created run folder: {run_folder}")
         
@@ -394,202 +396,134 @@ class GGRProcessor:
             logger.info(f"Reordered dataset saved to: {reordered_path}")
             results["reordered_dataset_path"] = reordered_path
         
-        # Save original dataset copy for reference
-        original_copy_path = os.path.join(run_folder, f"{base_name}_original.csv")
-        try:
-            original_df = pd.read_csv(dataset_path)
-            original_df.to_csv(original_copy_path, index=False)
-            logger.info(f"Original dataset copy saved to: {original_copy_path}")
-            results["original_dataset_copy_path"] = original_copy_path
-        except Exception as e:
-            logger.warning(f"Could not save original dataset copy: {e}")
-        
-        # Save metadata
-        metadata_path = os.path.join(run_folder, "ggr_results.json")
-        with open(metadata_path, 'w') as f:
-            json.dump(results, f, indent=2, default=str)
-        logger.info(f"Results metadata saved to: {metadata_path}")
-        
-        # Save summary report
-        report_path = os.path.join(run_folder, "ggr_summary.txt")
-        self._generate_summary_report(results, report_path)
-        
-        # Save run information
-        run_info_path = os.path.join(run_folder, "run_info.txt")
-        with open(run_info_path, 'w') as f:
-            f.write(f"GGR Run Information\n")
-            f.write(f"=" * 50 + "\n\n")
-            f.write(f"Run Timestamp: {timestamp}\n")
-            f.write(f"Run Folder: {os.path.basename(run_folder)}\n")
-            f.write(f"Original Dataset: {dataset_path}\n")
-            f.write(f"Output Directory: {self.output_dir}\n\n")
-            
-            f.write(f"Files in this run:\n")
-            f.write(f"- {base_name}_original.csv: Copy of original input dataset\n")
-            f.write(f"- {base_name}_reordered.csv: GGR-reordered dataset\n")
-            f.write(f"- ggr_results.json: Complete results with metadata\n")
-            f.write(f"- ggr_summary.txt: Human-readable summary report\n")
-            f.write(f"- run_info.txt: This run information file\n")
-        logger.info(f"Run information saved to: {run_info_path}")
+        # Save simple summary report
+        report_path = os.path.join(run_folder, "ggr_report.txt")
+        self._generate_simple_report(results, report_path)
         
         # Update results with folder information
         results["run_folder"] = run_folder
         results["run_timestamp"] = timestamp
     
-    def _generate_summary_report(self, results: Dict[str, Any], report_path: str):
-        """Generate a human-readable summary report"""
+    def _generate_simple_report(self, results: Dict[str, Any], report_path: str):
+        """Generate a simple, concise summary report"""
         with open(report_path, 'w') as f:
-            f.write("=" * 70 + "\n")
-            f.write("GGR ALGORITHM RESULTS SUMMARY\n")
-            f.write("=" * 70 + "\n\n")
+            f.write("GGR ALGORITHM RESULTS\n")
+            f.write("=" * 40 + "\n\n")
             
-            # Run information
-            f.write("RUN INFORMATION:\n")
-            f.write(f"- Run Folder: {os.path.basename(results.get('run_folder', ''))}\n")
-            f.write(f"- Run Timestamp: {results.get('run_timestamp', results['processing_timestamp'])}\n")
-            f.write(f"- Processing Time: {results['processing_timestamp']}\n\n")
-            
-            # Dataset info
+            # Basic information
             f.write("DATASET INFORMATION:\n")
-            f.write(f"- Original file: {results['dataset_info']['path']}\n")
-            f.write(f"- Original shape: {results['dataset_info']['original_shape']}\n")
-            f.write(f"- Reordered shape: {results['reordered_shape']}\n")
-            f.write(f"- Columns: {', '.join(results['dataset_info']['columns'])}\n\n")
+            f.write(f"Original file: {os.path.basename(results['dataset_info']['path'])}\n")
+            f.write(f"Original shape: {results['dataset_info']['original_shape']}\n")
+            f.write(f"Reordered shape: {results['reordered_shape']}\n")
+            f.write(f"Columns: {len(results['dataset_info']['columns'])}\n")
+            f.write(f"Processing time: {results['processing_timestamp']}\n\n")
             
-            # Functional dependencies
-            f.write("FUNCTIONAL DEPENDENCIES:\n")
+            # Functional dependencies found
+            f.write("FUNCTIONAL DEPENDENCIES DISCOVERED:\n")
             if results['functional_dependencies']:
                 for i, (source, target) in enumerate(results['functional_dependencies'], 1):
-                    f.write(f"  {i:2d}. {source} -> {target}\n")
+                    f.write(f"{i:2d}. {source} -> {target}\n")
             else:
-                f.write("- No functional dependencies found or provided\n")
-            f.write(f"- Total dependencies: {len(results['functional_dependencies'])}\n\n")
+                f.write("None found\n")
+            f.write(f"Total: {len(results['functional_dependencies'])}\n\n")
             
-            # GGR results
-            f.write("GGR ALGORITHM RESULTS:\n")
+            # Key results
             ggr_stats = results['ggr_results']
-            f.write(f"- PHC Score: {results['phc_score']:,}\n")
-            f.write(f"- Execution time: {ggr_stats['execution_time_seconds']:.3f} seconds\n")
-            f.write(f"- Max recursion depth: {ggr_stats['max_recursion_depth']}\n")
-            f.write(f"- Total recursive calls: {ggr_stats['total_recursive_calls']:,}\n")
-            f.write(f"- Single row cases: {ggr_stats['single_row_cases']:,}\n")
-            f.write(f"- Single column cases: {ggr_stats['single_col_cases']:,}\n\n")
+            f.write("GGR RESULTS:\n")
+            f.write(f"PHC Score: {results['phc_score']:,}\n")
+            f.write(f"Execution time: {ggr_stats['execution_time_seconds']:.2f} seconds\n")
+            f.write(f"Max recursion depth: {ggr_stats['max_recursion_depth']}\n")
+            f.write(f"Total recursive calls: {ggr_stats['total_recursive_calls']:,}\n\n")
             
-            # Performance analysis
-            f.write("PERFORMANCE ANALYSIS:\n")
-            original_size = results['dataset_info']['original_shape'][0] * results['dataset_info']['original_shape'][1]
-            if original_size > 0:
-                phc_per_cell = results['phc_score'] / original_size
-                processing_rate = original_size / ggr_stats['execution_time_seconds']
-                f.write(f"- PHC score per cell: {phc_per_cell:.2f}\n")
-                f.write(f"- Processing rate: {processing_rate:.0f} cells/second\n")
-                
-                # Performance rating
-                if results['phc_score'] > 1000:
-                    f.write(f"- Performance rating: ✅ Excellent - High potential for cache optimization\n")
-                elif results['phc_score'] > 100:
-                    f.write(f"- Performance rating: ✅ Good - Moderate cache optimization benefits\n")
-                elif results['phc_score'] > 10:
-                    f.write(f"- Performance rating: ⚠️  Fair - Limited cache optimization benefits\n")
-                else:
-                    f.write(f"- Performance rating: ❌ Poor - Minimal cache optimization benefits\n")
+            # Performance assessment
+            f.write("PERFORMANCE ASSESSMENT:\n")
+            if results['phc_score'] > 1000:
+                f.write("✅ EXCELLENT - High optimization potential\n")
+                f.write("Expected benefits: 2-3x speedup in LLM inference\n")
+            elif results['phc_score'] > 100:
+                f.write("✅ GOOD - Moderate optimization benefits\n")
+                f.write("Expected benefits: 1.5-2x speedup in LLM inference\n")
+            elif results['phc_score'] > 10:
+                f.write("⚠️  FAIR - Limited optimization benefits\n")
+                f.write("Expected benefits: Minor speedup in LLM inference\n")
             else:
-                f.write(f"- Unable to calculate performance metrics (empty dataset)\n")
+                f.write("❌ LOW - Minimal optimization benefits\n")
+                f.write("Original dataset may already be well-organized\n")
             
-            f.write(f"\n")
-            
-            # Algorithm efficiency
-            f.write("ALGORITHM EFFICIENCY:\n")
+            f.write(f"\nAlgorithm efficiency: ")
             if ggr_stats['max_recursion_depth'] < 50:
-                f.write(f"- Recursion depth: ✅ Optimal (max depth: {ggr_stats['max_recursion_depth']})\n")
+                f.write("Optimal\n")
             elif ggr_stats['max_recursion_depth'] < 80:
-                f.write(f"- Recursion depth: ⚠️  Moderate (max depth: {ggr_stats['max_recursion_depth']})\n")
+                f.write("Good\n")
             else:
-                f.write(f"- Recursion depth: ❌ Deep (max depth: {ggr_stats['max_recursion_depth']})\n")
+                f.write("Deep recursion\n")
             
-            calls_per_second = ggr_stats['total_recursive_calls'] / ggr_stats['execution_time_seconds']
-            f.write(f"- Recursive calls per second: {calls_per_second:.0f}\n")
+            # Usage instructions
+            f.write(f"\nUSAGE:\n")
+            base_name = os.path.splitext(os.path.basename(results['dataset_info']['path']))[0]
+            f.write(f"Use {base_name}_reordered.csv for LLM inference experiments\n")
+            f.write(f"Enable prefix caching in vLLM for optimal results\n")
             
-            # Files generated
-            f.write(f"\nFILES GENERATED:\n")
-            run_folder = results.get('run_folder', '')
-            if run_folder:
-                base_name = os.path.splitext(os.path.basename(results['dataset_info']['path']))[0]
-                f.write(f"All files saved in folder: {os.path.basename(run_folder)}/\n")
-                f.write(f"- {base_name}_original.csv: Copy of original input dataset\n")
-                f.write(f"- {base_name}_reordered.csv: GGR-reordered dataset for optimal inference\n")
-                f.write(f"- ggr_results.json: Complete results with detailed metadata\n")
-                f.write(f"- ggr_summary.txt: This human-readable summary report\n")
-                f.write(f"- run_info.txt: Run information and file descriptions\n")
-            else:
-                if results.get('reordered_dataset_path'):
-                    f.write(f"- Reordered dataset: {results['reordered_dataset_path']}\n")
-                f.write(f"- Results metadata: Available in JSON format\n")
-            
-            # Usage recommendations
-            f.write(f"\nUSAGE RECOMMENDATIONS:\n")
-            if results['phc_score'] > 100:
-                f.write(f"✅ RECOMMENDED: Use the reordered dataset for LLM inference experiments\n")
-                f.write(f"   - Expected benefits: Improved KV cache hit rates\n")
-                f.write(f"   - Potential speedup: 1.5-3x faster inference\n")
-                f.write(f"   - Memory efficiency: Reduced memory usage due to cache reuse\n")
-            else:
-                f.write(f"⚠️  MARGINAL: Dataset may have limited benefits from reordering\n")
-                f.write(f"   - Consider: Adding more functional dependencies\n")
-                f.write(f"   - Alternative: Try different grouping strategies\n")
-                f.write(f"   - Analysis: Original data may already be well-organized\n")
-            
-            f.write(f"\nFor LLM inference experiments, use the reordered dataset with:\n")
-            f.write(f"- vLLM with prefix caching enabled\n")
-            f.write(f"- Batch processing to maximize cache utilization\n")
-            f.write(f"- Performance monitoring to measure cache hit rates\n")
+            # Files in this folder
+            f.write(f"\nFILES IN THIS FOLDER:\n")
+            f.write(f"- {base_name}_reordered.csv: GGR-optimized dataset\n")
+            f.write(f"- ggr_report.txt: This summary report\n")
         
-        logger.info(f"Summary report saved to: {report_path}")
+        logger.info(f"Simple report saved to: {report_path}")
         
         # Log the folder location for easy access
         run_folder = results.get('run_folder', '')
         if run_folder:
-            logger.info(f"📁 All results saved in folder: {run_folder}")
-            logger.info(f"🔍 To view results: ls -la '{run_folder}'")
-            logger.info(f"📊 To view summary: cat '{report_path}'")
+            logger.info(f"📁 Results saved in: {os.path.basename(run_folder)}/")
+            logger.info(f"🔍 Full path: {run_folder}")
+            logger.info(f"📊 View report: cat '{report_path}'")
 
 
 def parse_functional_dependencies(fd_string: str) -> List[Tuple[str, str]]:
-    """Parse functional dependencies from command line string"""
+    """Parse functional dependencies from command line string (1->1 only)"""
     dependencies = []
     if fd_string:
         for fd in fd_string.split(','):
             fd = fd.strip()
             if '->' in fd:
                 source, target = fd.split('->', 1)
-                dependencies.append((source.strip(), target.strip()))
+                source = source.strip()
+                target = target.strip()
+                
+                # Validate that it's a 1->1 dependency
+                if ',' in source:
+                    logger.warning(f"Skipping multi-column FD: {source} -> {target} (only 1->1 supported)")
+                    continue
+                
+                dependencies.append((source, target))
     return dependencies
 
 
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Apply GGR algorithm to reorder datasets for improved LLM inference performance",
+        description="Apply GGR algorithm to reorder datasets for improved LLM inference performance (1->1 FDs only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python ggr.py data.csv
   python ggr.py data.csv --fds "movie_id->title,movie_id->genre"
   python ggr.py data.csv --output results/ --max-depth 50 --verbose
+
+Note: Only 1->1 functional dependencies (single column -> single column) are supported.
+Multi-column dependencies will be automatically filtered out.
         """
     )
     
     parser.add_argument('dataset', help='Path to the CSV dataset file')
     parser.add_argument('--fds', '--functional-dependencies', 
-                       help='Functional dependencies as comma-separated list (e.g., "col1->col2,col1->col3")')
+                       help='Functional dependencies as comma-separated list (e.g., "col1->col2,col1->col3") - 1->1 only')
     parser.add_argument('--output', '-o', default='reorder_results',
                        help='Output directory for results (default: reorder_results)')
     parser.add_argument('--max-depth', type=int, default=100,
                        help='Maximum recursion depth for GGR algorithm (default: 100)')
     parser.add_argument('--fd-confidence', type=float, default=0.95,
                        help='Confidence threshold for automatic FD discovery (default: 0.95)')
-    parser.add_argument('--fd-max-lhs', type=int, default=2,
-                       help='Maximum left-hand side size for FD discovery (default: 2)')
     parser.add_argument('--verbose', '-v', action='store_true',
                        help='Enable verbose logging')
     
@@ -608,17 +542,16 @@ Examples:
     functional_dependencies = None
     if args.fds:
         functional_dependencies = parse_functional_dependencies(args.fds)
-        logger.info(f"Parsed {len(functional_dependencies)} functional dependencies")
+        logger.info(f"Parsed {len(functional_dependencies)} valid 1->1 functional dependencies")
     
     # Create processor with configuration
     processor = GGRProcessor(output_dir=args.output)
     processor.fd_discoverer.min_confidence = args.fd_confidence
-    processor.fd_discoverer.max_lhs_size = args.fd_max_lhs
     
     # Process dataset
     try:
         logger.info("=" * 60)
-        logger.info("STARTING GGR PROCESSING")
+        logger.info("STARTING GGR PROCESSING (1->1 FDs ONLY)")
         logger.info("=" * 60)
         
         results = processor.process_dataset(
@@ -633,22 +566,21 @@ Examples:
         
         # Print summary
         logger.info("=" * 70)
-        logger.info("GGR PROCESSING COMPLETE")
+        logger.info("GGR PROCESSING COMPLETE (1->1 FDs)")
         logger.info("=" * 70)
         logger.info(f"📊 PHC Score: {results['phc_score']:,}")
         logger.info(f"⏱️  Processing time: {results['ggr_results']['execution_time_seconds']:.3f}s")
         logger.info(f"📐 Original shape: {results['dataset_info']['original_shape']}")
         logger.info(f"🔄 Reordered shape: {results['reordered_shape']}")
-        logger.info(f"🔗 Functional dependencies: {len(results['functional_dependencies'])}")
+        logger.info(f"🔗 Functional dependencies (1->1): {len(results['functional_dependencies'])}")
         
         # Show run folder information
         if 'run_folder' in results:
             run_folder = results['run_folder']
             logger.info(f"📁 Results saved in: {os.path.basename(run_folder)}/")
             logger.info(f"🔍 Full path: {run_folder}")
-            logger.info(f"📋 View summary: cat '{os.path.join(run_folder, 'ggr_summary.txt')}'")
             
-            # List files in the run folder
+            # List files in the run folder (should only be 2 files now)
             try:
                 files = os.listdir(run_folder)
                 logger.info(f"📄 Generated files: {', '.join(files)}")
@@ -666,6 +598,8 @@ Examples:
             logger.info(f"⚠️  FAIR: Limited optimization benefits expected")
         else:
             logger.info(f"⚠️  LOW: Dataset may not benefit significantly from GGR reordering")
+        
+        logger.info(f"🎯 Algorithm used 1->1 functional dependencies for optimal performance")
         
     except KeyboardInterrupt:
         logger.info("Processing interrupted by user")
