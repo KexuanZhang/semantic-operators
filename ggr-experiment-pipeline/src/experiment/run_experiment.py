@@ -89,7 +89,7 @@ def calculate_memory_requirements(model_path: str, max_seq_len: int = None) -> D
         # Try to read config.json to get model parameters
         config_path = os.path.join(model_path, 'config.json') if os.path.isdir(model_path) else None
         
-        if config_path and os.path.exists(config_path):
+        if (config_path and os.path.exists(config_path)):
             with open(config_path, 'r') as f:
                 config = json.load(f)
             
@@ -990,46 +990,105 @@ class SimpleLLMExperiment:
         return experiment_results
     
     def save_results(self, experiment_results: Dict[str, Any]):
-        """Save experiment results"""
+        """Save experiment results to timestamped folder"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         query_key = experiment_results['experiment_info']['query_key']
-        gpu_id = experiment_results['experiment_info']['gpu_id']
+        gpu_info = f"gpu{experiment_results['experiment_info']['gpu_id']}"
+        
+        # Create timestamped folder for this run
+        run_folder = os.path.join(self.output_dir, f"{query_key}_{gpu_info}_{timestamp}")
+        os.makedirs(run_folder, exist_ok=True)
         
         # Save detailed results as JSON
-        json_file = os.path.join(self.output_dir, f"{query_key}_gpu{gpu_id}_{timestamp}_results.json")
+        json_file = os.path.join(run_folder, "experiment_results.json")
         with open(json_file, 'w') as f:
             json.dump(experiment_results, f, indent=2, default=str)
         logger.info(f"Detailed results saved to: {json_file}")
         
         # Save results as CSV
         results_df = pd.DataFrame(experiment_results['results'])
-        csv_file = os.path.join(self.output_dir, f"{query_key}_gpu{gpu_id}_{timestamp}_results.csv")
+        csv_file = os.path.join(run_folder, "query_results.csv")
         results_df.to_csv(csv_file, index=False)
         logger.info(f"Results CSV saved to: {csv_file}")
         
         # Save batch metrics as CSV
         batch_df = pd.DataFrame(experiment_results['batch_metrics'])
-        batch_csv = os.path.join(self.output_dir, f"{query_key}_gpu{gpu_id}_{timestamp}_batch_metrics.csv")
+        batch_csv = os.path.join(run_folder, "batch_metrics.csv")
         batch_df.to_csv(batch_csv, index=False)
         logger.info(f"Batch metrics saved to: {batch_csv}")
         
         # Save resource monitoring data if available
         if self.resource_monitor.metrics_log:
             resource_df = pd.DataFrame(self.resource_monitor.metrics_log)
-            resource_csv = os.path.join(self.output_dir, f"{query_key}_gpu{gpu_id}_{timestamp}_resource_metrics.csv")
+            resource_csv = os.path.join(run_folder, "resource_metrics.csv")
             resource_df.to_csv(resource_csv, index=False)
             logger.info(f"Resource metrics saved to: {resource_csv}")
-    
+        
+        # Save a summary file with key metrics
+        summary_file = os.path.join(run_folder, "experiment_summary.txt")
+        with open(summary_file, 'w') as f:
+            exp_info = experiment_results['experiment_info']
+            perf = experiment_results['performance_metrics']
+            
+            f.write(f"LLM Query Experiment Summary\n")
+            f.write(f"=" * 50 + "\n\n")
+            
+            f.write(f"Experiment Details:\n")
+            f.write(f"- Query Key: {exp_info['query_key']}\n")
+            f.write(f"- Query Type: {exp_info['query_type']}\n")
+            f.write(f"- Model: {exp_info['model_name']}\n")
+            f.write(f"- GPU ID: {exp_info['gpu_id']}\n")
+            f.write(f"- Dataset: {exp_info['dataset_path']}\n")
+            f.write(f"- Total Rows: {exp_info['total_rows']}\n")
+            f.write(f"- Processed Rows: {exp_info['processed_rows']}\n")
+            f.write(f"- Batch Size: {exp_info['batch_size']}\n")
+            f.write(f"- Timestamp: {exp_info['experiment_timestamp']}\n\n")
+            
+            f.write(f"Performance Metrics:\n")
+            f.write(f"- Total Inference Time: {perf['total_inference_time']:.2f} seconds\n")
+            f.write(f"- Average Time per Row: {perf['avg_time_per_row']:.3f} seconds\n")
+            f.write(f"- Overall Throughput: {perf['overall_throughput_tokens_per_sec']:.1f} tokens/second\n")
+            f.write(f"- Total Tokens Processed: {perf['estimated_total_tokens']:,}\n")
+            f.write(f"- Successful Batches: {perf['successful_batches']}\n")
+            f.write(f"- Failed Batches: {perf['failed_batches']}\n\n")
+            
+            # vLLM stats if available
+            vllm_stats = experiment_results['vllm_metrics']['final_stats']
+            if vllm_stats.get('vllm_stats_available', False):
+                f.write(f"vLLM Statistics:\n")
+                f.write(f"- KV Cache Usage: {vllm_stats.get('gpu_cache_usage_sys', 'N/A')}\n")
+                if vllm_stats.get('gpu_prefix_cache_hit_rate') is not None:
+                    hit_rate = vllm_stats['gpu_prefix_cache_hit_rate'] * 100
+                    f.write(f"- Prefix Cache Hit Rate: {hit_rate:.1f}%\n")
+                f.write(f"\n")
+            
+            f.write(f"Files in this run:\n")
+            f.write(f"- experiment_results.json: Complete experiment data\n")
+            f.write(f"- query_results.csv: Query responses and metadata\n")
+            f.write(f"- batch_metrics.csv: Per-batch performance data\n")
+            f.write(f"- resource_metrics.csv: System resource monitoring\n")
+            f.write(f"- performance_report.md: Detailed analysis report\n")
+            f.write(f"- experiment_summary.txt: This summary file\n")
+        
+        logger.info(f"Experiment summary saved to: {summary_file}")
+        logger.info(f"All results saved to folder: {run_folder}")
+
     def generate_performance_report(self, experiment_results: Dict[str, Any]):
         """Generate comprehensive performance report in Markdown format"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         query_key = experiment_results['experiment_info']['query_key']
-        gpu_id = experiment_results['experiment_info']['gpu_id']
+        gpu_info = f"gpu{experiment_results['experiment_info']['gpu_id']}"
         
-        report_file = os.path.join(self.output_dir, f"{query_key}_gpu{gpu_id}_{timestamp}_performance_report.md")
+        # Use the same timestamped folder structure
+        run_folder = os.path.join(self.output_dir, f"{query_key}_{gpu_info}_{timestamp}")
+        os.makedirs(run_folder, exist_ok=True)  # Ensure folder exists
+        
+        report_file = os.path.join(run_folder, "performance_report.md")
         
         with open(report_file, 'w') as f:
             f.write(f"# LLM Query Experiment Performance Report\n\n")
+            f.write(f"**Run Folder**: `{os.path.basename(run_folder)}`  \n")
+            f.write(f"**Generated**: {datetime.now().isoformat()}  \n\n")
             
             # Experiment configuration
             f.write(f"## Experiment Configuration\n\n")
@@ -1038,7 +1097,7 @@ class SimpleLLMExperiment:
             f.write(f"- **Query Type**: {exp_info['query_type']}\n")
             f.write(f"- **Model**: {exp_info['model_name']}\n")
             f.write(f"- **GPU ID**: {exp_info['gpu_id']}\n")
-            f.write(f"- **Dataset**: {exp_info['dataset_path']}\n")
+            f.write(f"- **Dataset**: {os.path.basename(exp_info['dataset_path'])}\n")
             f.write(f"- **Total Rows**: {exp_info['total_rows']}\n")
             f.write(f"- **Processed Rows**: {exp_info['processed_rows']}\n")
             f.write(f"- **Batch Size**: {exp_info['batch_size']}\n")
@@ -1132,9 +1191,20 @@ class SimpleLLMExperiment:
                     f.write(f"- Batch {int(batch['batch_idx'])}: {batch['batch_throughput_tokens_per_sec']:.1f} tokens/sec ({batch['batch_duration']:.3f}s)\n")
                 f.write(f"\n")
             
+            # File structure
+            f.write(f"## Generated Files\n\n")
+            f.write(f"This experiment run generated the following files in `{os.path.basename(run_folder)}/`:\n\n")
+            f.write(f"- **`experiment_results.json`**: Complete experiment data and metadata\n")
+            f.write(f"- **`query_results.csv`**: Query responses and processing details\n")
+            f.write(f"- **`batch_metrics.csv`**: Per-batch performance metrics\n")
+            f.write(f"- **`resource_metrics.csv`**: System resource monitoring data\n")
+            f.write(f"- **`performance_report.md`**: This detailed analysis report\n")
+            f.write(f"- **`experiment_summary.txt`**: Quick summary of key metrics\n\n")
+            
             # System information
             f.write(f"## System Information\n\n")
             if torch.cuda.is_available():
+                gpu_id = experiment_results['experiment_info']['gpu_id']
                 gpu_name = torch.cuda.get_device_name(gpu_id)
                 gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
                 f.write(f"- **GPU**: {gpu_name}\n")
@@ -1163,7 +1233,8 @@ class SimpleLLMExperiment:
                     f.write(f"- Low prefix cache hit rate ({hit_rate:.1f}%) indicates limited reuse opportunities\n")
             
             f.write(f"\n---\n")
-            f.write(f"Report generated on {datetime.now().isoformat()}\n")
+            f.write(f"**Run ID**: `{os.path.basename(run_folder)}`  \n")
+            f.write(f"**Report generated**: {datetime.now().isoformat()}  \n")
         
         logger.info(f"Performance report saved to: {report_file}")
 
