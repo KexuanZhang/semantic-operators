@@ -112,7 +112,7 @@ def calculate_memory_requirements(model_path: str, max_seq_len: int = None) -> D
             if max_seq_len is None:
                 max_seq_len = max_position_embeddings
             
-            logger.info(f"Model config - Hidden size: {hidden_size}, Layers: {num_layers}, "
+            logger.info(f"Model config - Hidden size: {hidden_size}, Layers: {num_layers}, "    
                        f"Attention heads: {num_attention_heads}, Max seq len: {max_seq_len}")
             
             # Rough estimates (in GB)
@@ -1342,33 +1342,39 @@ class SimpleLLMExperiment:
                         logger.info(f"✅ Found CPU cache queries metric: {variant} = {cpu_cache_queries}")
                         break
                 
-                # Calculate hit rates if we have the data
-                if gpu_cache_queries > 0:
+                # Calculate hit rates with proper validation and type checking
+                hit_rate_calculated = False
+                
+                # First, check if we have meaningful counter data (should be integers > 1 for real counters)
+                if (gpu_cache_queries > 1 and gpu_cache_hits <= gpu_cache_queries and 
+                    isinstance(gpu_cache_hits, (int, float)) and isinstance(gpu_cache_queries, (int, float))):
+                    
+                    # These look like real counters, calculate hit rate
                     gpu_hit_rate = gpu_cache_hits / gpu_cache_queries
                     key_metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
                     key_metrics['gpu_prefix_cache_hit_rate_percent'] = gpu_hit_rate * 100
-                    key_metrics['gpu_prefix_cache_hits'] = gpu_cache_hits
-                    key_metrics['gpu_prefix_cache_queries'] = gpu_cache_queries
-                    logger.info(f"🎯 GPU Prefix Cache Hit Rate (V1): {gpu_hit_rate * 100:.1f}% ({gpu_cache_hits}/{gpu_cache_queries})")
-                    
-                    # Provide GGR effectiveness feedback
-                    if gpu_hit_rate > 0.7:
-                        logger.info("✅ EXCELLENT prefix cache hit rate - GGR is highly effective!")
-                    elif gpu_hit_rate > 0.4:
-                        logger.info("✅ GOOD prefix cache hit rate - GGR providing significant benefits!")
-                    elif gpu_hit_rate > 0.15:
-                        logger.info("⚠️  MODERATE prefix cache hit rate - GGR showing some benefits")
-                    else:
-                        logger.info("⚠️  LOW prefix cache hit rate - consider optimizing data ordering or more similar prefixes")
+                    key_metrics['gpu_prefix_cache_hits'] = int(gpu_cache_hits)
+                    key_metrics['gpu_prefix_cache_queries'] = int(gpu_cache_queries)
+                    logger.info(f"🎯 GPU Prefix Cache Hit Rate (calculated): {gpu_hit_rate * 100:.1f}% ({int(gpu_cache_hits)}/{int(gpu_cache_queries)})")
+                    hit_rate_calculated = True
                     stats['vllm_stats_available'] = True
+                    
+                elif gpu_cache_queries > 0 and gpu_cache_hits > 0:
+                    # Values are too small or look like percentages/ratios - likely invalid counter data
+                    logger.warning(f"⚠️  Suspicious cache counter values - hits: {gpu_cache_hits}, queries: {gpu_cache_queries}")
+                    logger.warning("   These values appear to be percentages/ratios rather than actual counters")
+                    logger.warning("   Skipping hit rate calculation to avoid misleading results")
                 
-                if cpu_cache_queries > 0:
+                if (cpu_cache_queries > 1 and cpu_cache_hits <= cpu_cache_queries and 
+                    isinstance(cpu_cache_hits, (int, float)) and isinstance(cpu_cache_queries, (int, float))):
+                    
                     cpu_hit_rate = cpu_cache_hits / cpu_cache_queries  
                     key_metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
                     key_metrics['cpu_prefix_cache_hit_rate_percent'] = cpu_hit_rate * 100
-                    key_metrics['cpu_prefix_cache_hits'] = cpu_cache_hits
-                    key_metrics['cpu_prefix_cache_queries'] = cpu_cache_queries
-                    logger.info(f"🎯 CPU Prefix Cache Hit Rate (V1): {cpu_hit_rate * 100:.1f}% ({cpu_cache_hits}/{cpu_cache_queries})")
+                    key_metrics['cpu_prefix_cache_hits'] = int(cpu_cache_hits)
+                    key_metrics['cpu_prefix_cache_queries'] = int(cpu_cache_queries)
+                    logger.info(f"🎯 CPU Prefix Cache Hit Rate (calculated): {cpu_hit_rate * 100:.1f}% ({int(cpu_cache_hits)}/{int(cpu_cache_queries)})")
+                    hit_rate_calculated = True
                     stats['vllm_stats_available'] = True
                 
                 # KV Cache Usage
@@ -1380,18 +1386,56 @@ class SimpleLLMExperiment:
                     stats['vllm_stats_available'] = True
                 
                 # Also try direct hit rate metric (may exist in some versions)
-                if 'vllm:gpu_prefix_cache_hit_rate' in metrics_found:
-                    hit_rate = metrics_found['vllm:gpu_prefix_cache_hit_rate']
-                    key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate
-                    key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
-                    logger.info(f"🎯 GPU Prefix Cache Hit Rate (direct): {hit_rate * 100:.1f}%")
-                    stats['vllm_stats_available'] = True
-                elif 'gpu_prefix_cache_hit_rate' in metrics_found:
-                    hit_rate = metrics_found['gpu_prefix_cache_hit_rate']
-                    key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate
-                    key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
-                    logger.info(f"🎯 GPU Prefix Cache Hit Rate (direct): {hit_rate * 100:.1f}%")
-                    stats['vllm_stats_available'] = True
+                direct_hit_rate_found = False
+                for direct_metric_name in ['vllm:gpu_prefix_cache_hit_rate', 'gpu_prefix_cache_hit_rate', 
+                                         'vllm:prefix_cache_hit_rate', 'vllm_gpu_prefix_cache_hit_rate']:
+                    if direct_metric_name in metrics_found:
+                        hit_rate_value = metrics_found[direct_metric_name]
+                        
+                        # Validate hit rate value (should be between 0 and 1, or 0 and 100 for percentage)
+                        if 0 <= hit_rate_value <= 1:
+                            # Value is a ratio (0-1)
+                            key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate_value
+                            key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate_value * 100
+                            logger.info(f"🎯 GPU Prefix Cache Hit Rate (direct metric): {hit_rate_value * 100:.2f}%")
+                            direct_hit_rate_found = True
+                            stats['vllm_stats_available'] = True
+                        elif 0 <= hit_rate_value <= 100:
+                            # Value is already a percentage (0-100)
+                            key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate_value / 100
+                            key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate_value
+                            logger.info(f"🎯 GPU Prefix Cache Hit Rate (direct metric): {hit_rate_value:.2f}%")
+                            direct_hit_rate_found = True
+                            stats['vllm_stats_available'] = True
+                        else:
+                            logger.warning(f"⚠️  Invalid hit rate value from {direct_metric_name}: {hit_rate_value}")
+                        break
+                
+                # Provide GGR effectiveness feedback if we have valid hit rate data
+                effective_hit_rate = 0
+                if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                    effective_hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                elif 'cpu_prefix_cache_hit_rate_percent' in key_metrics:
+                    effective_hit_rate = key_metrics['cpu_prefix_cache_hit_rate_percent']
+                
+                if effective_hit_rate > 0:
+                    logger.info(f"\n🎯 CACHE PERFORMANCE ANALYSIS:")
+                    if effective_hit_rate > 70:
+                        logger.info(f"🏆 EXCELLENT cache performance ({effective_hit_rate:.1f}% hit rate)")
+                        logger.info("   Your data ordering is providing substantial efficiency gains!")
+                    elif effective_hit_rate > 40:
+                        logger.info(f"✅ GOOD cache performance ({effective_hit_rate:.1f}% hit rate)")
+                        logger.info("   Clear benefits from data ordering and prefix reuse.")
+                    elif effective_hit_rate > 15:
+                        logger.info(f"⚠️  MODERATE cache performance ({effective_hit_rate:.1f}% hit rate)")
+                        logger.info("   Some benefit visible, consider optimizing data ordering.")
+                    else:
+                        logger.info(f"❌ LOW cache performance ({effective_hit_rate:.1f}% hit rate)")
+                        logger.info("   Limited prefix reuse - data may need better ordering.")
+                elif hit_rate_calculated or direct_hit_rate_found:
+                    logger.info("📊 Cache metrics found but hit rate appears to be 0% (early in processing)")
+                else:
+                    logger.info("❓ No valid cache hit rate metrics found yet")
                 
                 # Check all available metrics to see what we have
                 logger.info("🔍 Available Prometheus metrics:")
@@ -1647,23 +1691,45 @@ class SimpleLLMExperiment:
         else:
             logger.info(f"✅ vLLM metrics collected via: {', '.join(stats['collection_methods_tried'])}")
             
-            # If we got metrics, provide performance feedback
-            hit_rate_metrics = [k for k in key_metrics.keys() if 'hit_rate_percent' in k]
-            if hit_rate_metrics:
-                max_hit_rate = max(key_metrics[k] for k in hit_rate_metrics)
-                logger.info(f"\n🎯 CACHE PERFORMANCE ANALYSIS:")
-                if max_hit_rate > 70:
-                    logger.info(f"🏆 EXCELLENT cache performance ({max_hit_rate:.1f}% hit rate)")
-                    logger.info("   Your data ordering is providing substantial efficiency gains!")
-                elif max_hit_rate > 40:
-                    logger.info(f"✅ GOOD cache performance ({max_hit_rate:.1f}% hit rate)")
-                    logger.info("   Clear benefits from data ordering and prefix reuse.")
-                elif max_hit_rate > 15:
-                    logger.info(f"⚠️  MODERATE cache performance ({max_hit_rate:.1f}% hit rate)")
-                    logger.info("   Some benefit visible, consider optimizing data ordering.")
+            # Validate that we have meaningful cache metrics
+            has_meaningful_cache_data = False
+            if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                if hit_rate > 0 or key_metrics.get('gpu_prefix_cache_queries', 0) > 10:
+                    # Either we have a positive hit rate, or enough queries to be meaningful
+                    has_meaningful_cache_data = True
+                    
+                    # Final performance analysis
+                    logger.info(f"\n🎯 FINAL CACHE PERFORMANCE ANALYSIS:")
+                    if hit_rate > 70:
+                        logger.info(f"🏆 EXCELLENT cache performance ({hit_rate:.2f}% hit rate)")
+                        logger.info("   GGR data ordering is providing substantial efficiency gains!")
+                    elif hit_rate > 40:
+                        logger.info(f"✅ GOOD cache performance ({hit_rate:.2f}% hit rate)")
+                        logger.info("   Clear benefits from GGR data ordering and prefix reuse.")
+                    elif hit_rate > 15:
+                        logger.info(f"⚠️  MODERATE cache performance ({hit_rate:.2f}% hit rate)")
+                        logger.info("   Some benefit visible, consider optimizing data ordering further.")
+                    elif hit_rate > 0:
+                        logger.info(f"❌ LOW cache performance ({hit_rate:.2f}% hit rate)")
+                        logger.info("   Limited prefix reuse - data may need better GGR ordering.")
+                    else:
+                        logger.info(f"📊 Cache metrics found but 0% hit rate (early in processing)")
+                        logger.info("   This is normal if not many requests have been processed yet.")
+                        
+            if not has_meaningful_cache_data:
+                logger.info("\n📊 CACHE METRICS STATUS:")
+                if key_metrics:
+                    available_cache_metrics = [k for k in key_metrics.keys() if 'cache' in k.lower()]
+                    if available_cache_metrics:
+                        logger.info(f"✅ Found cache metrics: {available_cache_metrics}")
+                        logger.info("⏳ Waiting for sufficient data to calculate meaningful hit rates...")
+                    else:
+                        logger.info("⚠️  No cache-specific metrics found in collected data")
                 else:
-                    logger.info(f"❌ LOW cache performance ({max_hit_rate:.1f}% hit rate)")
-                    logger.info("   Limited prefix reuse - data may need better ordering.")
+                    logger.info("⚠️  No meaningful cache performance data available yet")
+                    
+            logger.info(f"\n🔧 Collection summary: {len(key_metrics)} metrics via {stats['collection_methods_tried']}")
         
         return stats
     
@@ -2096,36 +2162,46 @@ class SimpleLLMExperiment:
                 elif 'gpu_cache_usage_sys' in key_metrics:
                     f.write(f"- **GPU Cache Usage (sys)**: {key_metrics['gpu_cache_usage_sys']}\n")
                 
-                # Prefix Cache Hit Rate - Multiple possible sources
+                # Prefix Cache Hit Rate - Multiple possible sources with validation
                 hit_rate_found = False
                 if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
                     hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
-                    hit_rate_found = True
                     
-                    # Show calculation details for V1 engine
-                    if 'gpu_prefix_cache_hits' in key_metrics and 'gpu_prefix_cache_queries' in key_metrics:
-                        hits = key_metrics['gpu_prefix_cache_hits']
-                        queries = key_metrics['gpu_prefix_cache_queries']
-                        f.write(f"- **GPU Prefix Cache Hit Rate**: {hit_rate:.1f}% ({hits:,} hits / {queries:,} queries)\n")
-                    else:
-                        f.write(f"- **GPU Prefix Cache Hit Rate**: {hit_rate:.1f}%\n")
+                    # Validate hit rate is reasonable (avoid showing 100% from tiny values)
+                    hits = key_metrics.get('gpu_prefix_cache_hits', 0)
+                    queries = key_metrics.get('gpu_prefix_cache_queries', 0)
                     
-                    # Provide GGR effectiveness analysis
-                    if hit_rate > 70:
-                        f.write(f"  - ✅ **EXCELLENT** - Very high hit rate indicates extremely effective GGR ordering!\n")
-                        f.write(f"  - The data ordering is providing substantial prefix reuse benefits.\n")
-                    elif hit_rate > 40:
-                        f.write(f"  - ✅ **GOOD** - High hit rate shows GGR providing significant benefits!\n")
-                        f.write(f"  - Clear evidence of effective prefix caching from data ordering.\n")
-                    elif hit_rate > 15:
-                        f.write(f"  - ⚠️ **MODERATE** - Some prefix reuse detected, room for optimization.\n")
-                        f.write(f"  - Consider further tuning of GGR parameters or data characteristics.\n")
-                    elif hit_rate > 5:
-                        f.write(f"  - ⚠️ **LOW** - Minimal prefix reuse, limited GGR effectiveness.\n")
-                        f.write(f"  - Data may have low prefix similarity or need better ordering.\n")
+                    # Only report hit rate if we have meaningful data
+                    if queries > 10 or hit_rate < 99:  # Avoid reporting 100% from tiny values
+                        hit_rate_found = True
+                        
+                        # Show calculation details for V1 engine
+                        if 'gpu_prefix_cache_hits' in key_metrics and 'gpu_prefix_cache_queries' in key_metrics:
+                            f.write(f"- **GPU Prefix Cache Hit Rate**: {hit_rate:.2f}% ({hits:,} hits / {queries:,} queries)\n")
+                        else:
+                            f.write(f"- **GPU Prefix Cache Hit Rate**: {hit_rate:.2f}%\n")
+                        
+                        # Provide GGR effectiveness analysis based on validated data
+                        if hit_rate > 70:
+                            f.write(f"  - ✅ **EXCELLENT** - Very high hit rate indicates extremely effective GGR ordering!\n")
+                            f.write(f"  - The data ordering is providing substantial prefix reuse benefits.\n")
+                        elif hit_rate > 40:
+                            f.write(f"  - ✅ **GOOD** - High hit rate shows GGR providing significant benefits!\n")
+                            f.write(f"  - Clear evidence of effective prefix caching from data ordering.\n")
+                        elif hit_rate > 15:
+                            f.write(f"  - ⚠️ **MODERATE** - Some prefix reuse detected, room for optimization.\n")
+                            f.write(f"  - Consider further tuning of GGR parameters or data characteristics.\n")
+                        elif hit_rate > 5:
+                            f.write(f"  - ⚠️ **LOW** - Minimal prefix reuse, limited GGR effectiveness.\n")
+                            f.write(f"  - Data may have low prefix similarity or need better ordering.\n")
+                        else:
+                            f.write(f"  - ❌ **VERY LOW** - Almost no prefix reuse detected.\n")
+                            f.write(f"  - Consider data characteristics or GGR algorithm tuning.\n")
                     else:
-                        f.write(f"  - ❌ **VERY LOW** - Almost no prefix reuse detected.\n")
-                        f.write(f"  - Consider data characteristics or GGR algorithm tuning.\n")
+                        # Invalid data - don't report hit rate
+                        f.write(f"- **GPU Prefix Cache Hit Rate**: Not available (insufficient data: {queries} queries)\n")
+                        f.write(f"  - Cache metrics detected but not enough requests processed yet\n")
+                        f.write(f"  - Try running with more data or longer experiment duration\n")
                 
                 # CPU prefix cache (if available)
                 if 'cpu_prefix_cache_hit_rate_percent' in key_metrics:
