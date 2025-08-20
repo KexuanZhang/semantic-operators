@@ -3,6 +3,22 @@
 Simple LLM Query Experiment Script with vLLM
 Uses predefined query templates to run experiments on datasets with GPU support
 Includes comprehensive resource monitoring and KV cache tracking
+
+Multi-GPU Usage Examples:
+  # Use multiple GPUs to handle large models (recommended for 7B+ models)
+  python run_experiment.py dataset.csv query_key --gpus "4,5,6,7"
+  
+  # Use with memory optimization for large sequence lengths
+  python run_experiment.py dataset.csv query_key --gpus "6,7" --max-model-len 8192 --gpu-memory 0.95
+  
+  # Single GPU usage (backward compatible)
+  python run_experiment.py dataset.csv query_key --gpu 0
+  
+Memory Optimization Tips:
+  - Use --gpus with multiple GPUs for models requiring >16GB memory
+  - Reduce --max-model-len to lower memory usage (e.g., 8192 instead of 32768)
+  - Increase --gpu-memory to use more available GPU memory (up to 0.98)
+  - Reduce --batch-size if running out of memory during inference
 """
 
 import argparse
@@ -41,20 +57,84 @@ def check_gpu_availability():
         logger.warning("CUDA not available! vLLM will fall back to CPU (very slow)")
         return False, 0
 
-def set_gpu_device(gpu_id: int):
-    """Set the GPU device to use"""
+def set_gpu_devices(gpu_ids: List[int]):
+    """Set multiple GPU devices to use"""
     if torch.cuda.is_available():
-        if gpu_id < torch.cuda.device_count():
-            torch.cuda.set_device(gpu_id)
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-            logger.info(f"Set CUDA device to GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
-            return True
-        else:
-            logger.error(f"GPU {gpu_id} not available. Available GPUs: 0-{torch.cuda.device_count()-1}")
-            return False
+        gpu_count = torch.cuda.device_count()
+        
+        # Validate all GPU IDs
+        for gpu_id in gpu_ids:
+            if gpu_id >= gpu_count:
+                logger.error(f"GPU {gpu_id} not available. Available GPUs: 0-{gpu_count-1}")
+                return False
+        
+        # Set CUDA_VISIBLE_DEVICES to include all specified GPUs
+        gpu_str = ','.join(map(str, gpu_ids))
+        os.environ['CUDA_VISIBLE_DEVICES'] = gpu_str
+        
+        logger.info(f"Set CUDA devices to GPUs: {gpu_ids}")
+        for gpu_id in gpu_ids:
+            gpu_name = torch.cuda.get_device_name(gpu_id)
+            gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+            logger.info(f"  - GPU {gpu_id}: {gpu_name} ({gpu_memory:.1f} GB)")
+        
+        return True
     else:
         logger.error("No CUDA GPUs available")
         return False
+
+def calculate_memory_requirements(model_path: str, max_seq_len: int = None) -> Dict[str, float]:
+    """Estimate memory requirements for a model"""
+    try:
+        # Try to read config.json to get model parameters
+        config_path = os.path.join(model_path, 'config.json') if os.path.isdir(model_path) else None
+        
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Extract key parameters
+            hidden_size = config.get('hidden_size', 4096)
+            num_layers = config.get('num_hidden_layers', config.get('num_layers', 32))
+            num_attention_heads = config.get('num_attention_heads', 32)
+            vocab_size = config.get('vocab_size', 151936)  # Qwen default
+            max_position_embeddings = config.get('max_position_embeddings', 32768)
+            
+            if max_seq_len is None:
+                max_seq_len = max_position_embeddings
+            
+            logger.info(f"Model config - Hidden size: {hidden_size}, Layers: {num_layers}, "
+                       f"Attention heads: {num_attention_heads}, Max seq len: {max_seq_len}")
+            
+            # Rough estimates (in GB)
+            # Model weights: approximately 2 bytes per parameter for FP16
+            approx_params = hidden_size * hidden_size * num_layers * 8  # Very rough estimate
+            model_memory_gb = (approx_params * 2) / 1e9
+            
+            # KV cache: 2 * layers * hidden_size * max_seq_len * batch_size * 2 bytes (for key + value)
+            # Assuming batch_size = 1 for base calculation
+            kv_cache_per_token = 2 * num_layers * hidden_size * 2 / 1e9  # GB per token
+            kv_cache_gb = kv_cache_per_token * max_seq_len
+            
+            return {
+                'model_memory_gb': model_memory_gb,
+                'kv_cache_gb': kv_cache_gb,
+                'total_estimated_gb': model_memory_gb + kv_cache_gb,
+                'max_seq_len': max_seq_len,
+                'kv_cache_per_token_gb': kv_cache_per_token
+            }
+            
+    except Exception as e:
+        logger.warning(f"Could not estimate memory requirements: {e}")
+    
+    # Return defaults if estimation fails
+    return {
+        'model_memory_gb': 7.0,  # Rough estimate for 7B model
+        'kv_cache_gb': 16.0,     # As mentioned in error
+        'total_estimated_gb': 23.0,
+        'max_seq_len': max_seq_len or 32768,
+        'kv_cache_per_token_gb': 0.0005
+    }
 
 try:
     from vllm import LLM, SamplingParams
@@ -408,17 +488,29 @@ class SimpleLLMExperiment:
     def __init__(self, 
                  model_name: str = "meta-llama/Llama-2-7b-hf",
                  output_dir: str = "llm_results",
-                 gpu_id: int = 0):
+                 gpu_ids: List[int] = None,
+                 gpu_id: int = None):  # Keep for backward compatibility
+        
+        # Handle GPU specification (backward compatible)
+        if gpu_ids is None:
+            if gpu_id is not None:
+                self.gpu_ids = [gpu_id]
+                self.gpu_id = gpu_id  # Primary GPU for monitoring
+            else:
+                self.gpu_ids = [0]  # Default to GPU 0
+                self.gpu_id = 0
+        else:
+            self.gpu_ids = gpu_ids
+            self.gpu_id = gpu_ids[0]  # Use first GPU as primary for monitoring
         
         # Resolve model path (local or HuggingFace)
         self.model_name = resolve_model_path(model_name)
         self.is_local_model = os.path.exists(self.model_name)
         
         self.output_dir = output_dir
-        self.gpu_id = gpu_id
         self.llm = None
         self.sampling_params = None
-        self.resource_monitor = ResourceMonitor(gpu_id=gpu_id)
+        self.resource_monitor = ResourceMonitor(gpu_id=self.gpu_id)
         
         # Validate local model if it's a local path
         if self.is_local_model:
@@ -430,17 +522,22 @@ class SimpleLLMExperiment:
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # Check and set GPU
+        # Check and set GPUs
         gpu_available, gpu_count = check_gpu_availability()
         if gpu_available:
-            if gpu_id < gpu_count:
-                if set_gpu_device(gpu_id):
-                    logger.info(f"Using GPU {gpu_id} for inference")
-                else:
-                    logger.error(f"Failed to set GPU {gpu_id}")
+            # Validate all requested GPUs are available
+            for gpu_id in self.gpu_ids:
+                if gpu_id >= gpu_count:
+                    logger.error(f"GPU {gpu_id} not available. Available GPUs: 0-{gpu_count-1}")
                     sys.exit(1)
+            
+            if set_gpu_devices(self.gpu_ids):
+                if len(self.gpu_ids) == 1:
+                    logger.info(f"Using single GPU {self.gpu_ids[0]} for inference")
+                else:
+                    logger.info(f"Using multi-GPU setup: {self.gpu_ids} for inference")
             else:
-                logger.error(f"GPU {gpu_id} not available. Available GPUs: 0-{gpu_count-1}")
+                logger.error(f"Failed to set GPUs {self.gpu_ids}")
                 sys.exit(1)
         else:
             logger.warning("No GPU available, will use CPU (very slow)")
@@ -481,11 +578,36 @@ class SimpleLLMExperiment:
                         temperature: float = 0.1,
                         top_p: float = 0.9,
                         gpu_memory_utilization: float = 0.85,
+                        max_model_len: int = None,
                         **kwargs):
-        """Initialize vLLM model with GPU configuration"""
+        """Initialize vLLM model with GPU configuration and memory optimization"""
         logger.info(f"Initializing vLLM model: {self.model_name}")
         logger.info(f"Model type: {'Local' if self.is_local_model else 'HuggingFace'}")
-        logger.info(f"Target GPU: {self.gpu_id}")
+        logger.info(f"Target GPUs: {self.gpu_ids}")
+        
+        # Calculate memory requirements if local model
+        if self.is_local_model:
+            memory_info = calculate_memory_requirements(self.model_name, max_model_len)
+            logger.info(f"Memory estimates - Model: {memory_info['model_memory_gb']:.1f}GB, "
+                       f"KV Cache: {memory_info['kv_cache_gb']:.1f}GB, "
+                       f"Total: {memory_info['total_estimated_gb']:.1f}GB")
+            
+            # Calculate total available GPU memory
+            if torch.cuda.is_available():
+                total_gpu_memory = sum(
+                    torch.cuda.get_device_properties(gpu_id).total_memory / 1e9 
+                    for gpu_id in self.gpu_ids
+                )
+                logger.info(f"Total available GPU memory: {total_gpu_memory:.1f}GB across {len(self.gpu_ids)} GPUs")
+                
+                # Auto-adjust max_model_len if not specified and memory is tight
+                if max_model_len is None and memory_info['total_estimated_gb'] > total_gpu_memory * gpu_memory_utilization:
+                    # Calculate a safer max_model_len based on available memory
+                    available_memory = total_gpu_memory * gpu_memory_utilization - memory_info['model_memory_gb']
+                    safe_max_len = int(available_memory / memory_info['kv_cache_per_token_gb'])
+                    safe_max_len = min(safe_max_len, memory_info['max_seq_len'])
+                    max_model_len = safe_max_len
+                    logger.info(f"Auto-adjusting max_model_len to {max_model_len} based on available memory")
         
         try:
             # vLLM configuration for GPU inference with prefix caching enabled
@@ -497,6 +619,16 @@ class SimpleLLMExperiment:
                 'seed': 42,
                 **kwargs
             }
+            
+            # Multi-GPU configuration
+            if len(self.gpu_ids) > 1:
+                llm_config['tensor_parallel_size'] = len(self.gpu_ids)
+                logger.info(f"Using tensor parallelism across {len(self.gpu_ids)} GPUs")
+            
+            # Set max_model_len if specified
+            if max_model_len is not None:
+                llm_config['max_model_len'] = max_model_len
+                logger.info(f"Setting max_model_len to {max_model_len}")
             
             # Add local model specific configurations if needed
             if self.is_local_model:
@@ -520,27 +652,51 @@ class SimpleLLMExperiment:
             
             # Log GPU memory usage after model loading
             if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated(self.gpu_id) / 1e9
-                reserved = torch.cuda.memory_reserved(self.gpu_id) / 1e9
-                total = torch.cuda.get_device_properties(self.gpu_id).total_memory / 1e9
-                logger.info(f"GPU {self.gpu_id} Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, {total:.1f}GB total")
+                for i, gpu_id in enumerate(self.gpu_ids):
+                    allocated = torch.cuda.memory_allocated(gpu_id) / 1e9
+                    reserved = torch.cuda.memory_reserved(gpu_id) / 1e9
+                    total = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+                    utilization = (allocated / total) * 100
+                    logger.info(f"GPU {gpu_id} Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, "
+                               f"{total:.1f}GB total ({utilization:.1f}% util)")
             
             logger.info("vLLM model initialized successfully!")
             return True
             
         except Exception as e:
             logger.error(f"Failed to initialize vLLM model: {e}")
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated(self.gpu_id) / 1e9
-                total = torch.cuda.get_device_properties(self.gpu_id).total_memory / 1e9
-                logger.error(f"GPU {self.gpu_id} Memory: {allocated:.1f}GB allocated, {total:.1f}GB total")
             
-            # Provide helpful error messages for local models
+            # Log memory usage on all GPUs for debugging
+            if torch.cuda.is_available():
+                for gpu_id in self.gpu_ids:
+                    try:
+                        allocated = torch.cuda.memory_allocated(gpu_id) / 1e9
+                        total = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+                        logger.error(f"GPU {gpu_id} Memory: {allocated:.1f}GB allocated, {total:.1f}GB total")
+                    except:
+                        pass
+            
+            # Provide helpful error messages and suggestions
             if self.is_local_model:
                 logger.error(f"Local model loading failed. Please check:")
                 logger.error(f"1. Model files exist in: {self.model_name}")
                 logger.error(f"2. Model format is compatible with vLLM")
                 logger.error(f"3. All required files (config.json, model weights) are present")
+            
+            # Memory-related suggestions
+            if "KV cache" in str(e) or "memory" in str(e).lower():
+                logger.error("Memory optimization suggestions:")
+                logger.error("1. Try using more GPUs: --gpus 4,5,6,7")
+                logger.error("2. Increase gpu_memory_utilization: --gpu-memory 0.95")
+                logger.error("3. Reduce max_model_len: --max-model-len 8192")
+                logger.error("4. Reduce batch size: --batch-size 4")
+                
+                if torch.cuda.is_available():
+                    total_memory = sum(
+                        torch.cuda.get_device_properties(gpu_id).total_memory / 1e9 
+                        for gpu_id in self.gpu_ids
+                    )
+                    logger.error(f"Total GPU memory available: {total_memory:.1f}GB across {len(self.gpu_ids)} GPUs")
             
             return False
     
@@ -1020,11 +1176,13 @@ def main():
     parser.add_argument("query_key", help="Query template key to use", 
                        choices=list(QUERY_TEMPLATES.keys()))
     
-    # Model configuration - Updated to support local paths
+    # Model configuration - Updated to support local paths and multi-GPU
     parser.add_argument("--model", default="meta-llama/Llama-2-7b-hf",
                        help="vLLM model name (HuggingFace) or local path to model directory")
     parser.add_argument("--gpu", type=int, default=0,
-                       help="GPU device to use (0, 1, 2, 3, etc.)")
+                       help="Single GPU device to use (0, 1, 2, 3, etc.) - for backward compatibility")
+    parser.add_argument("--gpus", type=str, 
+                       help="Multiple GPU devices to use (comma-separated, e.g., '4,5,6,7' or '6,7')")
     parser.add_argument("--gpu-memory", type=float, default=0.85,
                        help="GPU memory utilization fraction (0.0-1.0)")
     
@@ -1034,6 +1192,8 @@ def main():
     
     # LLM configuration
     parser.add_argument("--max-tokens", type=int, default=512, help="Maximum tokens to generate")
+    parser.add_argument("--max-model-len", type=int, 
+                       help="Maximum model sequence length (reduces memory usage)")
     parser.add_argument("--temperature", type=float, default=0.1, help="Sampling temperature")
     
     # Output configuration
@@ -1085,22 +1245,47 @@ def main():
             logger.info(f"🌐 HuggingFace model (will be downloaded if needed): {args.model}")
         return
     
-    # Initialize experiment
+    # Parse GPU configuration
+    gpu_ids = None
+    gpu_id = None
+    
+    if args.gpus:
+        # Parse comma-separated GPU list
+        try:
+            gpu_ids = [int(x.strip()) for x in args.gpus.split(',')]
+            logger.info(f"Using multi-GPU setup: {gpu_ids}")
+        except ValueError:
+            logger.error(f"Invalid GPU list format: {args.gpus}. Use comma-separated integers like '4,5,6,7'")
+            return
+    else:
+        # Use single GPU (backward compatibility)
+        gpu_id = args.gpu
+        logger.info(f"Using single GPU: {gpu_id}")
+    
+    # Initialize experiment with GPU configuration
     experiment = SimpleLLMExperiment(
         model_name=args.model,
         output_dir=args.output_dir,
-        gpu_id=args.gpu
+        gpu_ids=gpu_ids,
+        gpu_id=gpu_id
     )
     
     # Configure resource monitoring
     experiment.resource_monitor.sampling_interval = args.monitor_interval
     
     # Initialize model with custom parameters
-    if not experiment.initialize_model(
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        gpu_memory_utilization=args.gpu_memory
-    ):
+    model_kwargs = {
+        'max_tokens': args.max_tokens,
+        'temperature': args.temperature,
+        'gpu_memory_utilization': args.gpu_memory
+    }
+    
+    # Add max_model_len if specified
+    if args.max_model_len:
+        model_kwargs['max_model_len'] = args.max_model_len
+        logger.info(f"Setting max_model_len to {args.max_model_len}")
+    
+    if not experiment.initialize_model(**model_kwargs):
         logger.error("Failed to initialize model")
         return
     
