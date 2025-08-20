@@ -1094,6 +1094,12 @@ class SimpleLLMExperiment:
                 **kwargs
             }
             
+            # Force legacy engine mode if requested for better stats compatibility
+            if use_legacy_engine:
+                # Try to force legacy engine by setting environment variable
+                os.environ['VLLM_USE_V1'] = '0'
+                logger.info("🔧 Forcing vLLM legacy engine mode for better stats access")
+            
             # Multi-GPU configuration
             if len(self.gpu_ids) > 1:
                 llm_config['tensor_parallel_size'] = len(self.gpu_ids)
@@ -1249,12 +1255,94 @@ class SimpleLLMExperiment:
                 metrics_found = prometheus_stats.get('metrics_found', {})
                 histogram_data = prometheus_stats.get('histogram_data', {})
                 
-                # V1 engine uses counters - calculate hit rate from hits/queries
-                gpu_cache_hits = metrics_found.get('vllm:gpu_prefix_cache_hits', 0)
-                gpu_cache_queries = metrics_found.get('vllm:gpu_prefix_cache_queries', 0)
-                cpu_cache_hits = metrics_found.get('vllm:cpu_prefix_cache_hits', 0)
-                cpu_cache_queries = metrics_found.get('vllm:cpu_prefix_cache_queries', 0)
+                logger.info(f"🔍 Found {len(metrics_found)} Prometheus metrics")
+                logger.debug(f"Available metrics: {list(metrics_found.keys())}")
                 
+                # Try multiple possible metric names for cache hits/queries (vLLM version variations)
+                cache_hit_variants = [
+                    'vllm:gpu_prefix_cache_hits',
+                    'vllm_gpu_prefix_cache_hits_total', 
+                    'vllm_gpu_prefix_cache_hits',
+                    'gpu_prefix_cache_hits',
+                    'vllm:cache_hits',
+                    'vllm_cache_hits_total',
+                    'vllm:kv_cache_hits',
+                    'vllm_kv_cache_hits_total',
+                    'vllm:prefix_cache_hits',
+                    'vllm_prefix_cache_hits_total'
+                ]
+                cache_query_variants = [
+                    'vllm:gpu_prefix_cache_queries',
+                    'vllm_gpu_prefix_cache_queries_total',
+                    'vllm_gpu_prefix_cache_queries', 
+                    'gpu_prefix_cache_queries',
+                    'vllm:cache_queries',
+                    'vllm_cache_queries_total',
+                    'vllm:kv_cache_queries',
+                    'vllm_kv_cache_queries_total',
+                    'vllm:prefix_cache_queries',
+                    'vllm_prefix_cache_queries_total'
+                ]
+                
+                # Log all available cache-related metrics for debugging
+                all_cache_metrics = {k: v for k, v in metrics_found.items() 
+                                   if any(term in k.lower() for term in ['cache', 'hit', 'prefix'])}
+                if all_cache_metrics:
+                    logger.info(f"🔍 All cache-related metrics found: {all_cache_metrics}")
+                else:
+                    logger.info("⚠️  No cache-related metrics found in Prometheus registry")
+                    logger.info(f"Available metric names: {sorted(list(metrics_found.keys())[:10])}")
+                
+                gpu_cache_hits = 0
+                gpu_cache_queries = 0
+                cpu_cache_hits = 0
+                cpu_cache_queries = 0
+                
+                # Find GPU cache hits with extended search
+                for variant in cache_hit_variants:
+                    if variant in metrics_found:
+                        gpu_cache_hits = metrics_found[variant]
+                        logger.info(f"✅ Found GPU cache hits metric: {variant} = {gpu_cache_hits}")
+                        break
+                else:
+                    # Try partial matches
+                    for metric_name, value in metrics_found.items():
+                        if 'gpu' in metric_name and any(term in metric_name.lower() for term in ['hit', 'cache']):
+                            gpu_cache_hits = value
+                            logger.info(f"🔍 Using partial match for GPU cache hits: {metric_name} = {gpu_cache_hits}")
+                            break
+                
+                # Find GPU cache queries with extended search
+                for variant in cache_query_variants:
+                    if variant in metrics_found:
+                        gpu_cache_queries = metrics_found[variant]
+                        logger.info(f"✅ Found GPU cache queries metric: {variant} = {gpu_cache_queries}")
+                        break
+                else:
+                    # Try partial matches
+                    for metric_name, value in metrics_found.items():
+                        if 'gpu' in metric_name and any(term in metric_name.lower() for term in ['quer', 'request', 'cache']) and 'hit' not in metric_name:
+                            gpu_cache_queries = value
+                            logger.info(f"🔍 Using partial match for GPU cache queries: {metric_name} = {gpu_cache_queries}")
+                            break
+                
+                # Try CPU variants
+                cpu_hit_variants = [v.replace('gpu', 'cpu') for v in cache_hit_variants]
+                cpu_query_variants = [v.replace('gpu', 'cpu') for v in cache_query_variants]
+                
+                for variant in cpu_hit_variants:
+                    if variant in metrics_found:
+                        cpu_cache_hits = metrics_found[variant]
+                        logger.info(f"✅ Found CPU cache hits metric: {variant} = {cpu_cache_hits}")
+                        break
+                
+                for variant in cpu_query_variants:
+                    if variant in metrics_found:
+                        cpu_cache_queries = metrics_found[variant]
+                        logger.info(f"✅ Found CPU cache queries metric: {variant} = {cpu_cache_queries}")
+                        break
+                
+                # Calculate hit rates if we have the data
                 if gpu_cache_queries > 0:
                     gpu_hit_rate = gpu_cache_hits / gpu_cache_queries
                     key_metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
@@ -1291,13 +1379,96 @@ class SimpleLLMExperiment:
                     logger.info(f"🔥 GPU KV Cache Usage: {cache_usage * 100:.1f}%")
                     stats['vllm_stats_available'] = True
                 
-                # Direct hit rate metric (may exist in some versions)
+                # Also try direct hit rate metric (may exist in some versions)
                 if 'vllm:gpu_prefix_cache_hit_rate' in metrics_found:
                     hit_rate = metrics_found['vllm:gpu_prefix_cache_hit_rate']
                     key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate
                     key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
-                    logger.info(f"🎯 Prefix Cache Hit Rate (direct): {hit_rate * 100:.1f}%")
+                    logger.info(f"🎯 GPU Prefix Cache Hit Rate (direct): {hit_rate * 100:.1f}%")
                     stats['vllm_stats_available'] = True
+                elif 'gpu_prefix_cache_hit_rate' in metrics_found:
+                    hit_rate = metrics_found['gpu_prefix_cache_hit_rate']
+                    key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate
+                    key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
+                    logger.info(f"🎯 GPU Prefix Cache Hit Rate (direct): {hit_rate * 100:.1f}%")
+                    stats['vllm_stats_available'] = True
+                
+                # Check all available metrics to see what we have
+                logger.info("🔍 Available Prometheus metrics:")
+                for metric_name, value in metrics_found.items():
+                    if 'cache' in metric_name.lower():
+                        logger.info(f"  {metric_name}: {value}")
+                
+                # If we have no cache metrics yet, log guidance
+                if gpu_cache_queries == 0 and gpu_cache_hits == 0:
+                    logger.info("⚠️  No prefix cache metrics found yet. This could be due to:")
+                    logger.info("   1. vLLM hasn't processed enough requests yet (metrics accumulate over time)")
+                    logger.info("   2. Prefix caching is not enabled (check --enable-prefix-caching)")
+                    logger.info("   3. Your vLLM version uses different metric names")
+                    logger.info("   4. Running with VLLM_USE_V1=0 might expose legacy stats")
+                    logger.info(f"   Available cache-related metrics: {[m for m in metrics_found.keys() if 'cache' in m.lower()]}")
+                
+                # Also check for alternative metric patterns used in different vLLM versions
+                alternative_patterns = [
+                    'prefix_cache_hit_rate',
+                    'cache_hit_rate', 
+                    'kv_cache_hit_rate',
+                    'hit_rate',
+                    'cache_effectiveness',
+                    'reuse_rate',
+                    'prefix_reuse',
+                    'cache_efficiency'
+                ]
+                
+                found_alternative_metrics = False
+                for pattern in alternative_patterns:
+                    matching_metrics = [m for m in metrics_found.keys() if pattern in m.lower()]
+                    if matching_metrics:
+                        logger.info(f"🔍 Found potential hit rate metric pattern '{pattern}': {matching_metrics}")
+                        for metric in matching_metrics:
+                            value = metrics_found[metric]
+                            if isinstance(value, (int, float)):
+                                # Check if it looks like a hit rate (0-1 range or 0-100 range)
+                                if 0 <= value <= 1:
+                                    # Decimal hit rate
+                                    key_metrics[f'alternative_hit_rate_{pattern}'] = value
+                                    key_metrics[f'alternative_hit_rate_{pattern}_percent'] = value * 100
+                                    logger.info(f"📊 Alternative hit rate found ({pattern}): {value * 100:.1f}%")
+                                    stats['vllm_stats_available'] = True
+                                    found_alternative_metrics = True
+                                elif 0 <= value <= 100 and 'percent' in metric.lower():
+                                    # Percentage hit rate
+                                    key_metrics[f'alternative_hit_rate_{pattern}'] = value / 100
+                                    key_metrics[f'alternative_hit_rate_{pattern}_percent'] = value
+                                    logger.info(f"📊 Alternative hit rate found ({pattern}): {value:.1f}%")
+                                    stats['vllm_stats_available'] = True
+                                    found_alternative_metrics = True
+                
+                # If still no cache metrics, try any metric with "cache" in the name
+                if not found_alternative_metrics:
+                    cache_related_metrics = {k: v for k, v in metrics_found.items() 
+                                           if 'cache' in k.lower()}
+                    if cache_related_metrics:
+                        logger.info(f"🔍 Found cache-related metrics (might not be hit rates): {cache_related_metrics}")
+                        # Try to identify potential counters that could be used to calculate hit rates
+                        hits_metrics = {k: v for k, v in cache_related_metrics.items() 
+                                      if any(term in k.lower() for term in ['hit', 'success', 'found'])}
+                        total_metrics = {k: v for k, v in cache_related_metrics.items() 
+                                       if any(term in k.lower() for term in ['total', 'query', 'request', 'lookup'])}
+                        
+                        if hits_metrics and total_metrics:
+                            logger.info(f"💡 Potential hits metrics: {hits_metrics}")
+                            logger.info(f"💡 Potential total metrics: {total_metrics}")
+                            # Try to pair them up and calculate hit rates
+                            for hit_metric, hit_value in hits_metrics.items():
+                                for total_metric, total_value in total_metrics.items():
+                                    if total_value > 0 and hit_value <= total_value:
+                                        calculated_rate = hit_value / total_value
+                                        key_metrics[f'calculated_hit_rate_{hit_metric}'] = calculated_rate
+                                        key_metrics[f'calculated_hit_rate_{hit_metric}_percent'] = calculated_rate * 100
+                                        logger.info(f"🧮 Calculated hit rate from {hit_metric}/{total_metric}: {calculated_rate * 100:.1f}%")
+                                        stats['vllm_stats_available'] = True
+                                        found_alternative_metrics = True
                 
                 # Request Queue Status
                 for metric_key in ['vllm:num_requests_running', 'vllm:num_requests_waiting', 'vllm:num_requests_swapped']:
@@ -1355,7 +1526,40 @@ class SimpleLLMExperiment:
             logger.debug(f"Prometheus metrics collection failed: {e}")
             stats['collection_methods_tried'].append(f'prometheus_failed: {e}')
         
-        # Method 3: Try alternative engine stats access
+        # Method 3: Try LoggingStatLogger direct access (for serving mode compatibility)
+        try:
+            if hasattr(self.llm, 'llm_engine') and hasattr(self.llm.llm_engine, 'stat_loggers'):
+                stat_loggers = self.llm.llm_engine.stat_loggers
+                stats['collection_methods_tried'].append('stat_loggers_access')
+                
+                # Try to access LoggingStatLogger metrics directly
+                for logger_instance in stat_loggers:
+                    if hasattr(logger_instance, '__class__') and 'LoggingStatLogger' in logger_instance.__class__.__name__:
+                        # Found the LoggingStatLogger
+                        if hasattr(logger_instance, 'stats'):
+                            logging_stats = logger_instance.stats
+                            logger.info("Found LoggingStatLogger stats object")
+                            
+                            # Try to access recent stats
+                            for attr in ['gpu_prefix_cache_hit_rate', 'gpu_cache_usage_perc', 'num_requests_running']:
+                                if hasattr(logging_stats, attr):
+                                    value = getattr(logging_stats, attr)
+                                    key_metrics[attr] = value
+                                    stats['vllm_stats_available'] = True
+                                    
+                                    if attr == 'gpu_prefix_cache_hit_rate':
+                                        key_metrics['gpu_prefix_cache_hit_rate_percent'] = value * 100
+                                        logger.info(f"🎯 GPU Prefix Cache Hit Rate (LoggingStatLogger): {value * 100:.1f}%")
+                                    elif attr == 'gpu_cache_usage_perc':
+                                        key_metrics['gpu_cache_usage_percent'] = value * 100
+                                        logger.info(f"🔥 GPU KV Cache Usage (LoggingStatLogger): {value * 100:.1f}%")
+                        break
+                        
+        except Exception as e:
+            logger.debug(f"LoggingStatLogger access failed: {e}")
+            stats['collection_methods_tried'].append(f'stat_loggers_failed: {e}')
+        
+        # Method 4: Try alternative engine stats access
         try:
             if hasattr(self.llm, 'llm_engine') and hasattr(self.llm.llm_engine, 'scheduler'):
                 scheduler = self.llm.llm_engine.scheduler
@@ -1400,8 +1604,66 @@ class SimpleLLMExperiment:
             logger.info("2. Prefix caching not generating metrics yet (wait for more requests)")
             logger.info("3. prometheus_client not available")
             logger.info(f"Methods tried: {', '.join(stats['collection_methods_tried'])}")
+            
+            # Provide specific troubleshooting advice based on what we found
+            if 'prometheus_registry' in stats['collection_methods_tried']:
+                logger.info("\n🔧 DETAILED TROUBLESHOOTING:")
+                logger.info("• Prometheus metrics collection is working, but cache hit rate metrics are missing")
+                logger.info("• This indicates vLLM V1 engine metrics might use different naming conventions")
+                logger.info("\n💡 SOLUTIONS TO TRY:")
+                logger.info("1. Force legacy engine for better metrics compatibility:")
+                logger.info("   export VLLM_USE_V1=0 && python run_experiment.py ...")
+                logger.info("2. Run more inference requests to accumulate cache statistics")
+                logger.info("3. Check if you're using a compatible vLLM version (0.3+ recommended)")
+                logger.info("4. For testing purposes, try vLLM serving mode:")
+                logger.info("   vllm serve MODEL_NAME --enable-prefix-caching --port 8000")
+                logger.info("5. Install prometheus_client if not available:")
+                logger.info("   pip install prometheus_client")
+                
+                # Analyze what metrics we did find
+                prometheus_metrics = stats.get('prometheus_snapshot', {})
+                if prometheus_metrics and not prometheus_metrics.get('error'):
+                    available_metrics = list(prometheus_metrics.keys())
+                    cache_metrics = [m for m in available_metrics if 'cache' in m.lower()]
+                    if cache_metrics:
+                        logger.info(f"\n📊 Available cache-related metrics: {cache_metrics}")
+                    else:
+                        logger.info(f"\n📊 No cache metrics found among {len(available_metrics)} available metrics")
+                        logger.info(f"Sample metrics: {available_metrics[:5]}")
+                        
+            elif 'legacy_get_stats' in stats['collection_methods_tried']:
+                logger.info("\n🔧 LEGACY ENGINE DETECTED:")
+                logger.info("• vLLM legacy engine is being used but no stats available")
+                logger.info("• This may indicate the model hasn't processed enough requests yet")
+                logger.info("• Try processing more data to generate cache statistics")
+                
+            else:
+                logger.info("\n🔧 GENERAL TROUBLESHOOTING:")
+                logger.info("• No compatible metrics collection methods found")
+                logger.info("• Check vLLM installation: pip install vllm>=0.3.0")
+                logger.info("• Verify prometheus_client: pip install prometheus_client")
+                logger.info("• Try legacy mode: export VLLM_USE_V1=0")
+                
         else:
             logger.info(f"✅ vLLM metrics collected via: {', '.join(stats['collection_methods_tried'])}")
+            
+            # If we got metrics, provide performance feedback
+            hit_rate_metrics = [k for k in key_metrics.keys() if 'hit_rate_percent' in k]
+            if hit_rate_metrics:
+                max_hit_rate = max(key_metrics[k] for k in hit_rate_metrics)
+                logger.info(f"\n🎯 CACHE PERFORMANCE ANALYSIS:")
+                if max_hit_rate > 70:
+                    logger.info(f"🏆 EXCELLENT cache performance ({max_hit_rate:.1f}% hit rate)")
+                    logger.info("   Your data ordering is providing substantial efficiency gains!")
+                elif max_hit_rate > 40:
+                    logger.info(f"✅ GOOD cache performance ({max_hit_rate:.1f}% hit rate)")
+                    logger.info("   Clear benefits from data ordering and prefix reuse.")
+                elif max_hit_rate > 15:
+                    logger.info(f"⚠️  MODERATE cache performance ({max_hit_rate:.1f}% hit rate)")
+                    logger.info("   Some benefit visible, consider optimizing data ordering.")
+                else:
+                    logger.info(f"❌ LOW cache performance ({max_hit_rate:.1f}% hit rate)")
+                    logger.info("   Limited prefix reuse - data may need better ordering.")
         
         return stats
     
