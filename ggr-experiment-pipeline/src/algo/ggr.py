@@ -41,19 +41,24 @@ class FunctionalDependencyDiscoverer:
     
     def __init__(self, min_confidence: float = 0.95, max_lhs_size: int = 2):
         self.min_confidence = min_confidence
-        self.max_lhs_size = max_lhs_size
+        # Hard limit to 2 columns on left-hand side for efficiency
+        self.max_lhs_size = min(max_lhs_size, 2)
+        logger.info(f"FD Discovery configured: max_lhs_size={self.max_lhs_size}, min_confidence={self.min_confidence}")
     
     def discover_dependencies(self, df: pd.DataFrame) -> List[Tuple[str, str]]:
         """
         Discover functional dependencies in the dataset
-        Returns list of (source_column, target_column) tuples
+        Limited to at most 2 columns -> 1 column for efficiency
+        Returns list of (source_column(s), target_column) tuples
         """
         logger.info(f"Discovering functional dependencies with confidence >= {self.min_confidence}")
+        logger.info(f"Limited to max {self.max_lhs_size} columns on left-hand side")
         
         dependencies = []
         columns = df.columns.tolist()
         
         # Check single column dependencies (A -> B)
+        logger.info("Checking single-column dependencies (A -> B)...")
         for source in columns:
             for target in columns:
                 if source != target:
@@ -62,24 +67,29 @@ class FunctionalDependencyDiscoverer:
                         dependencies.append((source, target))
                         logger.info(f"Found FD: {source} -> {target} (confidence: {confidence:.3f})")
         
-        # Check multi-column dependencies if requested
-        if self.max_lhs_size > 1:
-            for lhs_size in range(2, min(self.max_lhs_size + 1, len(columns))):
-                for source_cols in combinations(columns, lhs_size):
-                    for target in columns:
-                        if target not in source_cols:
-                            confidence = self._calculate_confidence(df, list(source_cols), target)
-                            if confidence >= self.min_confidence:
-                                source_str = ",".join(source_cols)
-                                dependencies.append((source_str, target))
-                                logger.info(f"Found FD: {source_str} -> {target} (confidence: {confidence:.3f})")
+        # Check two-column dependencies (A,B -> C) only if max_lhs_size >= 2
+        if self.max_lhs_size >= 2:
+            logger.info("Checking two-column dependencies (A,B -> C)...")
+            for source_cols in combinations(columns, 2):
+                for target in columns:
+                    if target not in source_cols:
+                        confidence = self._calculate_confidence(df, list(source_cols), target)
+                        if confidence >= self.min_confidence:
+                            source_str = ",".join(source_cols)
+                            dependencies.append((source_str, target))
+                            logger.info(f"Found FD: {source_str} -> {target} (confidence: {confidence:.3f})")
         
-        logger.info(f"Discovered {len(dependencies)} functional dependencies")
+        logger.info(f"Discovered {len(dependencies)} functional dependencies (max 2->1 constraint)")
         return dependencies
     
     def _calculate_confidence(self, df: pd.DataFrame, source_cols: List[str], target_col: str) -> float:
         """Calculate confidence of functional dependency source_cols -> target_col"""
         try:
+            # Validate that we don't exceed the 2->1 limit
+            if len(source_cols) > 2:
+                logger.warning(f"Skipping FD with {len(source_cols)} source columns (exceeds limit of 2)")
+                return 0.0
+            
             # Group by source columns and check if target is unique
             grouped = df.groupby(source_cols)[target_col].nunique()
             
