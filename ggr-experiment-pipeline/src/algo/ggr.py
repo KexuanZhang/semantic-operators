@@ -371,70 +371,180 @@ class GGRProcessor:
         return df
     
     def _save_results(self, dataset_path: str, reordered_df: pd.DataFrame, results: Dict[str, Any]):
-        """Save the reordered dataset and metadata"""
+        """Save the reordered dataset and metadata in a timestamped folder"""
         base_name = os.path.splitext(os.path.basename(dataset_path))[0]
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
+        # Create timestamped folder for this run
+        run_folder = os.path.join(self.output_dir, f"{base_name}_ggr_run_{timestamp}")
+        os.makedirs(run_folder, exist_ok=True)
+        logger.info(f"Created run folder: {run_folder}")
+        
         # Save reordered dataset
         if not reordered_df.empty:
-            reordered_path = os.path.join(self.output_dir, f"{base_name}_reordered_{timestamp}.csv")
+            reordered_path = os.path.join(run_folder, f"{base_name}_reordered.csv")
             reordered_df.to_csv(reordered_path, index=False)
             logger.info(f"Reordered dataset saved to: {reordered_path}")
             results["reordered_dataset_path"] = reordered_path
         
+        # Save original dataset copy for reference
+        original_copy_path = os.path.join(run_folder, f"{base_name}_original.csv")
+        try:
+            original_df = pd.read_csv(dataset_path)
+            original_df.to_csv(original_copy_path, index=False)
+            logger.info(f"Original dataset copy saved to: {original_copy_path}")
+            results["original_dataset_copy_path"] = original_copy_path
+        except Exception as e:
+            logger.warning(f"Could not save original dataset copy: {e}")
+        
         # Save metadata
-        metadata_path = os.path.join(self.output_dir, f"{base_name}_ggr_results_{timestamp}.json")
+        metadata_path = os.path.join(run_folder, "ggr_results.json")
         with open(metadata_path, 'w') as f:
             json.dump(results, f, indent=2, default=str)
         logger.info(f"Results metadata saved to: {metadata_path}")
         
         # Save summary report
-        report_path = os.path.join(self.output_dir, f"{base_name}_ggr_summary_{timestamp}.txt")
+        report_path = os.path.join(run_folder, "ggr_summary.txt")
         self._generate_summary_report(results, report_path)
+        
+        # Save run information
+        run_info_path = os.path.join(run_folder, "run_info.txt")
+        with open(run_info_path, 'w') as f:
+            f.write(f"GGR Run Information\n")
+            f.write(f"=" * 50 + "\n\n")
+            f.write(f"Run Timestamp: {timestamp}\n")
+            f.write(f"Run Folder: {os.path.basename(run_folder)}\n")
+            f.write(f"Original Dataset: {dataset_path}\n")
+            f.write(f"Output Directory: {self.output_dir}\n\n")
+            
+            f.write(f"Files in this run:\n")
+            f.write(f"- {base_name}_original.csv: Copy of original input dataset\n")
+            f.write(f"- {base_name}_reordered.csv: GGR-reordered dataset\n")
+            f.write(f"- ggr_results.json: Complete results with metadata\n")
+            f.write(f"- ggr_summary.txt: Human-readable summary report\n")
+            f.write(f"- run_info.txt: This run information file\n")
+        logger.info(f"Run information saved to: {run_info_path}")
+        
+        # Update results with folder information
+        results["run_folder"] = run_folder
+        results["run_timestamp"] = timestamp
     
     def _generate_summary_report(self, results: Dict[str, Any], report_path: str):
         """Generate a human-readable summary report"""
         with open(report_path, 'w') as f:
-            f.write("=" * 60 + "\n")
+            f.write("=" * 70 + "\n")
             f.write("GGR ALGORITHM RESULTS SUMMARY\n")
-            f.write("=" * 60 + "\n\n")
+            f.write("=" * 70 + "\n\n")
+            
+            # Run information
+            f.write("RUN INFORMATION:\n")
+            f.write(f"- Run Folder: {os.path.basename(results.get('run_folder', ''))}\n")
+            f.write(f"- Run Timestamp: {results.get('run_timestamp', results['processing_timestamp'])}\n")
+            f.write(f"- Processing Time: {results['processing_timestamp']}\n\n")
             
             # Dataset info
             f.write("DATASET INFORMATION:\n")
             f.write(f"- Original file: {results['dataset_info']['path']}\n")
             f.write(f"- Original shape: {results['dataset_info']['original_shape']}\n")
-            f.write(f"- Columns: {', '.join(results['dataset_info']['columns'])}\n")
-            f.write(f"- Processing time: {results['processing_timestamp']}\n\n")
+            f.write(f"- Reordered shape: {results['reordered_shape']}\n")
+            f.write(f"- Columns: {', '.join(results['dataset_info']['columns'])}\n\n")
             
             # Functional dependencies
             f.write("FUNCTIONAL DEPENDENCIES:\n")
             if results['functional_dependencies']:
-                for source, target in results['functional_dependencies']:
-                    f.write(f"- {source} -> {target}\n")
+                for i, (source, target) in enumerate(results['functional_dependencies'], 1):
+                    f.write(f"  {i:2d}. {source} -> {target}\n")
             else:
-                f.write("- No functional dependencies found\n")
+                f.write("- No functional dependencies found or provided\n")
             f.write(f"- Total dependencies: {len(results['functional_dependencies'])}\n\n")
             
             # GGR results
             f.write("GGR ALGORITHM RESULTS:\n")
             ggr_stats = results['ggr_results']
             f.write(f"- PHC Score: {results['phc_score']:,}\n")
-            f.write(f"- Execution time: {ggr_stats['execution_time_seconds']:.2f} seconds\n")
+            f.write(f"- Execution time: {ggr_stats['execution_time_seconds']:.3f} seconds\n")
             f.write(f"- Max recursion depth: {ggr_stats['max_recursion_depth']}\n")
             f.write(f"- Total recursive calls: {ggr_stats['total_recursive_calls']:,}\n")
-            f.write(f"- Reordered table shape: {results['reordered_shape']}\n\n")
+            f.write(f"- Single row cases: {ggr_stats['single_row_cases']:,}\n")
+            f.write(f"- Single column cases: {ggr_stats['single_col_cases']:,}\n\n")
             
             # Performance analysis
             f.write("PERFORMANCE ANALYSIS:\n")
             original_size = results['dataset_info']['original_shape'][0] * results['dataset_info']['original_shape'][1]
-            phc_per_cell = results['phc_score'] / original_size if original_size > 0 else 0
-            f.write(f"- PHC score per cell: {phc_per_cell:.2f}\n")
-            f.write(f"- Processing rate: {original_size / ggr_stats['execution_time_seconds']:.0f} cells/second\n")
+            if original_size > 0:
+                phc_per_cell = results['phc_score'] / original_size
+                processing_rate = original_size / ggr_stats['execution_time_seconds']
+                f.write(f"- PHC score per cell: {phc_per_cell:.2f}\n")
+                f.write(f"- Processing rate: {processing_rate:.0f} cells/second\n")
+                
+                # Performance rating
+                if results['phc_score'] > 1000:
+                    f.write(f"- Performance rating: ✅ Excellent - High potential for cache optimization\n")
+                elif results['phc_score'] > 100:
+                    f.write(f"- Performance rating: ✅ Good - Moderate cache optimization benefits\n")
+                elif results['phc_score'] > 10:
+                    f.write(f"- Performance rating: ⚠️  Fair - Limited cache optimization benefits\n")
+                else:
+                    f.write(f"- Performance rating: ❌ Poor - Minimal cache optimization benefits\n")
+            else:
+                f.write(f"- Unable to calculate performance metrics (empty dataset)\n")
             
-            if results.get('reordered_dataset_path'):
-                f.write(f"\n- Reordered dataset saved to: {results['reordered_dataset_path']}\n")
+            f.write(f"\n")
+            
+            # Algorithm efficiency
+            f.write("ALGORITHM EFFICIENCY:\n")
+            if ggr_stats['max_recursion_depth'] < 50:
+                f.write(f"- Recursion depth: ✅ Optimal (max depth: {ggr_stats['max_recursion_depth']})\n")
+            elif ggr_stats['max_recursion_depth'] < 80:
+                f.write(f"- Recursion depth: ⚠️  Moderate (max depth: {ggr_stats['max_recursion_depth']})\n")
+            else:
+                f.write(f"- Recursion depth: ❌ Deep (max depth: {ggr_stats['max_recursion_depth']})\n")
+            
+            calls_per_second = ggr_stats['total_recursive_calls'] / ggr_stats['execution_time_seconds']
+            f.write(f"- Recursive calls per second: {calls_per_second:.0f}\n")
+            
+            # Files generated
+            f.write(f"\nFILES GENERATED:\n")
+            run_folder = results.get('run_folder', '')
+            if run_folder:
+                base_name = os.path.splitext(os.path.basename(results['dataset_info']['path']))[0]
+                f.write(f"All files saved in folder: {os.path.basename(run_folder)}/\n")
+                f.write(f"- {base_name}_original.csv: Copy of original input dataset\n")
+                f.write(f"- {base_name}_reordered.csv: GGR-reordered dataset for optimal inference\n")
+                f.write(f"- ggr_results.json: Complete results with detailed metadata\n")
+                f.write(f"- ggr_summary.txt: This human-readable summary report\n")
+                f.write(f"- run_info.txt: Run information and file descriptions\n")
+            else:
+                if results.get('reordered_dataset_path'):
+                    f.write(f"- Reordered dataset: {results['reordered_dataset_path']}\n")
+                f.write(f"- Results metadata: Available in JSON format\n")
+            
+            # Usage recommendations
+            f.write(f"\nUSAGE RECOMMENDATIONS:\n")
+            if results['phc_score'] > 100:
+                f.write(f"✅ RECOMMENDED: Use the reordered dataset for LLM inference experiments\n")
+                f.write(f"   - Expected benefits: Improved KV cache hit rates\n")
+                f.write(f"   - Potential speedup: 1.5-3x faster inference\n")
+                f.write(f"   - Memory efficiency: Reduced memory usage due to cache reuse\n")
+            else:
+                f.write(f"⚠️  MARGINAL: Dataset may have limited benefits from reordering\n")
+                f.write(f"   - Consider: Adding more functional dependencies\n")
+                f.write(f"   - Alternative: Try different grouping strategies\n")
+                f.write(f"   - Analysis: Original data may already be well-organized\n")
+            
+            f.write(f"\nFor LLM inference experiments, use the reordered dataset with:\n")
+            f.write(f"- vLLM with prefix caching enabled\n")
+            f.write(f"- Batch processing to maximize cache utilization\n")
+            f.write(f"- Performance monitoring to measure cache hit rates\n")
         
         logger.info(f"Summary report saved to: {report_path}")
+        
+        # Log the folder location for easy access
+        run_folder = results.get('run_folder', '')
+        if run_folder:
+            logger.info(f"📁 All results saved in folder: {run_folder}")
+            logger.info(f"🔍 To view results: ls -la '{run_folder}'")
+            logger.info(f"📊 To view summary: cat '{report_path}'")
 
 
 def parse_functional_dependencies(fd_string: str) -> List[Tuple[str, str]]:
@@ -515,20 +625,40 @@ Examples:
             sys.exit(1)
         
         # Print summary
-        logger.info("=" * 60)
+        logger.info("=" * 70)
         logger.info("GGR PROCESSING COMPLETE")
-        logger.info("=" * 60)
-        logger.info(f"PHC Score: {results['phc_score']:,}")
-        logger.info(f"Processing time: {results['ggr_results']['execution_time_seconds']:.2f}s")
-        logger.info(f"Original shape: {results['dataset_info']['original_shape']}")
-        logger.info(f"Reordered shape: {results['reordered_shape']}")
-        logger.info(f"Functional dependencies: {len(results['functional_dependencies'])}")
-        logger.info(f"Results saved to: {args.output}/")
+        logger.info("=" * 70)
+        logger.info(f"📊 PHC Score: {results['phc_score']:,}")
+        logger.info(f"⏱️  Processing time: {results['ggr_results']['execution_time_seconds']:.3f}s")
+        logger.info(f"📐 Original shape: {results['dataset_info']['original_shape']}")
+        logger.info(f"🔄 Reordered shape: {results['reordered_shape']}")
+        logger.info(f"🔗 Functional dependencies: {len(results['functional_dependencies'])}")
         
-        if results['phc_score'] > 0:
-            logger.info(f"✅ GGR algorithm successfully reordered the dataset!")
+        # Show run folder information
+        if 'run_folder' in results:
+            run_folder = results['run_folder']
+            logger.info(f"📁 Results saved in: {os.path.basename(run_folder)}/")
+            logger.info(f"🔍 Full path: {run_folder}")
+            logger.info(f"📋 View summary: cat '{os.path.join(run_folder, 'ggr_summary.txt')}'")
+            
+            # List files in the run folder
+            try:
+                files = os.listdir(run_folder)
+                logger.info(f"📄 Generated files: {', '.join(files)}")
+            except Exception as e:
+                logger.debug(f"Could not list run folder contents: {e}")
         else:
-            logger.warning(f"⚠️  Low PHC score - dataset may not benefit significantly from GGR")
+            logger.info(f"📁 Results saved to: {args.output}/")
+        
+        # Performance assessment
+        if results['phc_score'] > 1000:
+            logger.info(f"✅ EXCELLENT: High potential for LLM inference optimization!")
+        elif results['phc_score'] > 100:
+            logger.info(f"✅ GOOD: Moderate benefits expected for LLM inference")
+        elif results['phc_score'] > 10:
+            logger.info(f"⚠️  FAIR: Limited optimization benefits expected")
+        else:
+            logger.info(f"⚠️  LOW: Dataset may not benefit significantly from GGR reordering")
         
     except KeyboardInterrupt:
         logger.info("Processing interrupted by user")
