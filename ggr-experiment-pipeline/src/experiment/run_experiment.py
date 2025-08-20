@@ -389,9 +389,9 @@ def validate_local_model(model_path: str) -> bool:
     
     # Check for model weights (any format)
     has_weights = any(
-        f in dir_contents or any(f.startswith(pattern.split('*')[0]) for f in dir_contents)
+        pattern in dir_contents or any(filename.startswith(pattern.split('*')[0]) for filename in dir_contents)
         for pattern in model_files
-    ) or any(f.endswith('.safetensors') for f in dir_contents)
+    ) or any(file.endswith('.safetensors') for file in dir_contents)
     
     if has_config and has_weights:
         logger.info(f"Local model validation passed: {model_path}")
