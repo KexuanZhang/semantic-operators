@@ -140,9 +140,21 @@ try:
     from vllm import LLM, SamplingParams
     vllm_available = True
     logger.info("vLLM imported successfully")
+    
+    # Try to import modern vLLM metrics (optional)
+    try:
+        from vllm.engine.metrics import LoggingStatLogger, Stats
+        from vllm.engine.llm_engine import LLMEngine
+        modern_vllm_metrics = True
+        logger.info("Modern vLLM metrics support available")
+    except ImportError:
+        modern_vllm_metrics = False
+        logger.info("Using legacy vLLM metrics approach")
+        
 except ImportError:
     logger.error("vLLM not available. Install with: pip install vllm")
     vllm_available = False
+    modern_vllm_metrics = False
     sys.exit(1)
 
 # Try to import NVIDIA monitoring
@@ -428,6 +440,221 @@ class ResourceMonitor:
         return summary
 
 
+class VLLMMetricsCollector:
+    """Modern vLLM metrics collector using LoggingStatLogger and Stats dataclass"""
+    
+    def __init__(self, llm_instance=None):
+        self.llm = llm_instance
+        self.metrics_log = []
+        self.stat_logger = None
+        self.monitoring = False
+        self.monitor_thread = None
+        self.collection_interval = 1.0  # Collect stats every second
+        
+        # Initialize metrics storage
+        self.latest_stats = None
+        self.stats_history = []
+        
+    def initialize_logging(self):
+        """Initialize vLLM logging with modern approach"""
+        try:
+            if modern_vllm_metrics and self.llm is not None:
+                # Try to set up LoggingStatLogger for real-time metrics
+                if hasattr(self.llm, 'llm_engine'):
+                    engine = self.llm.llm_engine
+                    
+                    # Enable statistics logging if available
+                    if hasattr(engine, 'stat_logger'):
+                        logger.info("Modern vLLM stats logging enabled")
+                        return True
+                        
+                    # Try to initialize LoggingStatLogger if available
+                    elif 'LoggingStatLogger' in globals():
+                        try:
+                            self.stat_logger = LoggingStatLogger(local_interval=1.0)
+                            logger.info("LoggingStatLogger initialized successfully")
+                            return True
+                        except Exception as e:
+                            logger.warning(f"Failed to initialize LoggingStatLogger: {e}")
+                            
+            logger.info("Using legacy vLLM stats collection approach")
+            return False
+            
+        except Exception as e:
+            logger.warning(f"Error initializing vLLM metrics logging: {e}")
+            return False
+    
+    def start_monitoring(self):
+        """Start continuous metrics collection in background thread"""
+        if self.monitoring:
+            return
+            
+        self.monitoring = True
+        self.metrics_log = []
+        self.stats_history = []
+        
+        self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
+        self.monitor_thread.start()
+        logger.info("Started vLLM metrics monitoring")
+        
+    def stop_monitoring(self):
+        """Stop metrics collection"""
+        self.monitoring = False
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=5.0)
+        logger.info("Stopped vLLM metrics monitoring")
+        
+    def _monitoring_loop(self):
+        """Background loop for continuous metrics collection"""
+        while self.monitoring:
+            try:
+                stats = self.collect_current_stats()
+                if stats:
+                    self.stats_history.append({
+                        'timestamp': time.time(),
+                        'datetime': datetime.now().isoformat(),
+                        **stats
+                    })
+                    self.latest_stats = stats
+                    
+            except Exception as e:
+                logger.warning(f"Error in vLLM metrics collection loop: {e}")
+                
+            time.sleep(self.collection_interval)
+    
+    def collect_current_stats(self) -> Dict[str, Any]:
+        """Collect current vLLM statistics using modern or legacy approach"""
+        stats = {}
+        
+        if not self.llm:
+            return stats
+            
+        try:
+            # Modern approach: Try to use Stats dataclass
+            if modern_vllm_metrics and hasattr(self.llm, 'llm_engine'):
+                engine = self.llm.llm_engine
+                
+                # Method 1: Try to access stats via engine.model_executor
+                if hasattr(engine, 'model_executor') and hasattr(engine.model_executor, 'driver_worker'):
+                    worker = engine.model_executor.driver_worker
+                    if hasattr(worker, 'model_runner') and hasattr(worker.model_runner, 'kv_cache'):
+                        kv_cache = worker.model_runner.kv_cache
+                        if hasattr(kv_cache, 'get_cache_block_size'):
+                            try:
+                                cache_block_size = kv_cache.get_cache_block_size()
+                                stats['cache_block_size'] = cache_block_size
+                            except:
+                                pass
+                
+                # Method 2: Try to access scheduler stats
+                if hasattr(engine, 'scheduler') and hasattr(engine.scheduler, 'get_num_unfinished_seq_groups'):
+                    try:
+                        stats['num_unfinished_sequences'] = engine.scheduler.get_num_unfinished_seq_groups()
+                    except:
+                        pass
+                
+                # Method 3: Try to get cache utilization via model_executor
+                if hasattr(engine, 'model_executor'):
+                    try:
+                        # Try to get cache usage information
+                        cache_info = getattr(engine.model_executor, 'cache_manager', None)
+                        if cache_info and hasattr(cache_info, 'get_cache_usage'):
+                            cache_usage = cache_info.get_cache_usage()
+                            stats['cache_usage'] = cache_usage
+                    except:
+                        pass
+                        
+            # Legacy approach: Try internal _get_stats method
+            if hasattr(self.llm, 'llm_engine') and hasattr(self.llm.llm_engine, '_get_stats'):
+                legacy_stats = self.llm.llm_engine._get_stats()
+                
+                # Extract standard metrics
+                if legacy_stats:
+                    stats.update({
+                        'gpu_cache_usage_sys': getattr(legacy_stats, 'gpu_cache_usage_sys', None),
+                        'gpu_prefix_cache_hit_rate': getattr(legacy_stats, 'gpu_prefix_cache_hit_rate', None),
+                        'num_requests_running': getattr(legacy_stats, 'num_requests_running', None),
+                        'num_requests_waiting': getattr(legacy_stats, 'num_requests_waiting', None),
+                        'num_requests_swapped': getattr(legacy_stats, 'num_requests_swapped', None),
+                    })
+            
+            # Add timestamp and metadata
+            stats.update({
+                'collection_method': 'modern' if modern_vllm_metrics else 'legacy',
+                'stats_available': len(stats) > 0
+            })
+            
+        except Exception as e:
+            logger.warning(f"Error collecting vLLM stats: {e}")
+            stats = {
+                'error': str(e),
+                'stats_available': False
+            }
+        
+        return stats
+    
+    def get_comprehensive_stats(self) -> Dict[str, Any]:
+        """Get comprehensive statistics including history summary"""
+        current_stats = self.collect_current_stats()
+        
+        summary = {
+            'latest_stats': current_stats,
+            'monitoring_active': self.monitoring,
+            'total_collections': len(self.stats_history),
+            'collection_interval': self.collection_interval
+        }
+        
+        # Add historical summaries if we have data
+        if self.stats_history:
+            history_df = pd.DataFrame(self.stats_history)
+            
+            # KV Cache utilization summary
+            if 'gpu_cache_usage_sys' in history_df.columns:
+                cache_usage = history_df['gpu_cache_usage_sys'].dropna()
+                if len(cache_usage) > 0:
+                    summary.update({
+                        'cache_usage_mean': cache_usage.mean(),
+                        'cache_usage_max': cache_usage.max(),
+                        'cache_usage_min': cache_usage.min(),
+                        'cache_usage_std': cache_usage.std()
+                    })
+            
+            # Prefix cache hit rate summary
+            if 'gpu_prefix_cache_hit_rate' in history_df.columns:
+                hit_rate = history_df['gpu_prefix_cache_hit_rate'].dropna()
+                if len(hit_rate) > 0:
+                    summary.update({
+                        'prefix_cache_hit_rate_mean': hit_rate.mean(),
+                        'prefix_cache_hit_rate_max': hit_rate.max(),
+                        'prefix_cache_hit_rate_min': hit_rate.min()
+                    })
+            
+            # Request queue summary
+            for metric in ['num_requests_running', 'num_requests_waiting', 'num_requests_swapped']:
+                if metric in history_df.columns:
+                    values = history_df[metric].dropna()
+                    if len(values) > 0:
+                        summary.update({
+                            f'{metric}_mean': values.mean(),
+                            f'{metric}_max': values.max()
+                        })
+        
+        return summary
+    
+    def get_metrics_history(self) -> List[Dict[str, Any]]:
+        """Get full metrics history"""
+        return self.stats_history.copy()
+    
+    def save_metrics(self, filepath: str):
+        """Save metrics history to file"""
+        if self.stats_history:
+            df = pd.DataFrame(self.stats_history)
+            df.to_csv(filepath, index=False)
+            logger.info(f"vLLM metrics saved to {filepath}")
+        else:
+            logger.warning("No vLLM metrics to save")
+
+
 def resolve_model_path(model_name: str) -> str:
     """Resolve model path, supporting local directories and HF model names"""
     
@@ -511,6 +738,7 @@ class SimpleLLMExperiment:
         self.llm = None
         self.sampling_params = None
         self.resource_monitor = ResourceMonitor(gpu_id=self.gpu_id)
+        self.vllm_metrics_collector = VLLMMetricsCollector(llm_instance=None)  # Will be updated after model init
         
         # Validate local model if it's a local path
         if self.is_local_model:
@@ -616,6 +844,7 @@ class SimpleLLMExperiment:
                 'gpu_memory_utilization': gpu_memory_utilization,
                 'max_num_seqs': 16,
                 'enable_prefix_caching': True,  # Enable for KV cache reuse
+                'disable_log_stats': False,     # Enable statistics logging for modern metrics
                 'seed': 42,
                 **kwargs
             }
@@ -661,6 +890,15 @@ class SimpleLLMExperiment:
                                f"{total:.1f}GB total ({utilization:.1f}% util)")
             
             logger.info("vLLM model initialized successfully!")
+            
+            # Update and initialize the vLLM metrics collector
+            self.vllm_metrics_collector.llm = self.llm
+            metrics_init_success = self.vllm_metrics_collector.initialize_logging()
+            if metrics_init_success:
+                logger.info("Modern vLLM metrics collection enabled")
+            else:
+                logger.info("Using legacy vLLM metrics collection")
+            
             return True
             
         except Exception as e:
@@ -701,38 +939,22 @@ class SimpleLLMExperiment:
             return False
     
     def get_vllm_stats(self) -> Dict[str, Any]:
-        """Try to extract vLLM internal statistics"""
-        vllm_stats = {}
-        
-        try:
-            # Try to access internal stats (may not work in all vLLM versions)
-            if hasattr(self.llm, 'llm_engine') and hasattr(self.llm.llm_engine, '_get_stats'):
-                stats = self.llm.llm_engine._get_stats()
-                
-                # Extract relevant metrics
-                vllm_stats.update({
-                    'vllm_stats_available': True,
-                    'gpu_cache_usage_sys': getattr(stats, 'gpu_cache_usage_sys', None),
-                    'gpu_prefix_cache_hit_rate': getattr(stats, 'gpu_prefix_cache_hit_rate', None),
-                    'prompt_tokens': getattr(stats, 'prompt_tokens', None),
-                    'generation_tokens': getattr(stats, 'generation_tokens', None),
-                    'num_requests_running': getattr(stats, 'num_requests_running', None),
-                    'num_requests_waiting': getattr(stats, 'num_requests_waiting', None)
-                })
-                
-                logger.info(f"vLLM Stats - KV Cache Usage: {vllm_stats.get('gpu_cache_usage_sys', 'N/A')}")
-                logger.info(f"vLLM Stats - Prefix Cache Hit Rate: {vllm_stats.get('gpu_prefix_cache_hit_rate', 'N/A')}")
-                
-            else:
-                vllm_stats['vllm_stats_available'] = False
-                logger.warning("vLLM internal stats not accessible in this version")
-                
-        except Exception as e:
-            vllm_stats['vllm_stats_available'] = False
-            vllm_stats['vllm_stats_error'] = str(e)
-            logger.warning(f"Could not access vLLM internal stats: {e}")
+        """Get vLLM internal statistics using modern metrics collector"""
+        if self.vllm_metrics_collector:
+            stats = self.vllm_metrics_collector.collect_current_stats()
             
-        return vllm_stats
+            # Log key metrics if available
+            if stats.get('stats_available', False):
+                if stats.get('gpu_cache_usage_sys') is not None:
+                    logger.info(f"vLLM KV Cache Usage: {stats['gpu_cache_usage_sys']}")
+                if stats.get('gpu_prefix_cache_hit_rate') is not None:
+                    hit_rate = stats['gpu_prefix_cache_hit_rate'] * 100
+                    logger.info(f"vLLM Prefix Cache Hit Rate: {hit_rate:.1f}%")
+            
+            return stats
+        else:
+            logger.warning("vLLM metrics collector not available")
+            return {'vllm_stats_available': False, 'error': 'Metrics collector not initialized'}
     
     def format_row_data(self, row: pd.Series, query_key: str) -> Dict[str, Any]:
         """Format row data based on query type"""
@@ -845,6 +1067,9 @@ class SimpleLLMExperiment:
         # Start resource monitoring
         self.resource_monitor.start_monitoring()
         
+        # Start vLLM metrics monitoring
+        self.vllm_metrics_collector.start_monitoring()
+        
         # Get initial vLLM stats
         initial_vllm_stats = self.get_vllm_stats()
         
@@ -929,8 +1154,12 @@ class SimpleLLMExperiment:
         # Stop resource monitoring
         self.resource_monitor.stop_monitoring()
         
-        # Get final vLLM stats
+        # Stop vLLM metrics monitoring
+        self.vllm_metrics_collector.stop_monitoring()
+        
+        # Get final vLLM stats and comprehensive metrics
         final_vllm_stats = self.get_vllm_stats()
+        comprehensive_vllm_stats = self.vllm_metrics_collector.get_comprehensive_stats()
         
         # Calculate summary metrics
         total_output_chars = sum(len(r['response']) for r in results)
@@ -970,7 +1199,9 @@ class SimpleLLMExperiment:
             'vllm_metrics': {
                 'initial_stats': initial_vllm_stats,
                 'final_stats': final_vllm_stats,
-                'prefix_caching_enabled': True
+                'comprehensive_stats': comprehensive_vllm_stats,
+                'prefix_caching_enabled': True,
+                'modern_metrics_enabled': modern_vllm_metrics
             },
             'resource_monitoring': resource_summary,
             'batch_metrics': batch_metrics,
@@ -1024,6 +1255,12 @@ class SimpleLLMExperiment:
             resource_df.to_csv(resource_csv, index=False)
             logger.info(f"Resource metrics saved to: {resource_csv}")
         
+        # Save vLLM metrics history if available
+        if self.vllm_metrics_collector.stats_history:
+            vllm_csv = os.path.join(run_folder, "vllm_metrics.csv")
+            self.vllm_metrics_collector.save_metrics(vllm_csv)
+            logger.info(f"vLLM metrics saved to: {vllm_csv}")
+        
         # Save a summary file with key metrics
         summary_file = os.path.join(run_folder, "experiment_summary.txt")
         with open(summary_file, 'w') as f:
@@ -1067,6 +1304,7 @@ class SimpleLLMExperiment:
             f.write(f"- query_results.csv: Query responses and metadata\n")
             f.write(f"- batch_metrics.csv: Per-batch performance data\n")
             f.write(f"- resource_metrics.csv: System resource monitoring\n")
+            f.write(f"- vllm_metrics.csv: vLLM inference metrics and KV cache stats\n")
             f.write(f"- performance_report.md: Detailed analysis report\n")
             f.write(f"- experiment_summary.txt: This summary file\n")
         
@@ -1136,6 +1374,43 @@ class SimpleLLMExperiment:
                 f.write(f"- **vLLM Internal Stats**: Not available in this version\n")
                 if 'vllm_stats_error' in initial_stats:
                     f.write(f"  - Error: {initial_stats['vllm_stats_error']}\n")
+            f.write(f"\n")
+            
+            # Add comprehensive vLLM metrics if available
+            if 'comprehensive_stats' in vllm_metrics:
+                comp_stats = vllm_metrics['comprehensive_stats']
+                f.write(f"\n### Modern vLLM Metrics Summary\n\n")
+                f.write(f"- **Monitoring Active**: {comp_stats.get('monitoring_active', False)}\n")
+                f.write(f"- **Total Collections**: {comp_stats.get('total_collections', 0)}\n")
+                f.write(f"- **Collection Interval**: {comp_stats.get('collection_interval', 1.0)}s\n")
+                f.write(f"- **Modern Metrics Enabled**: {vllm_metrics.get('modern_metrics_enabled', False)}\n")
+                
+                # Cache utilization stats
+                if comp_stats.get('cache_usage_mean') is not None:
+                    f.write(f"\n#### KV Cache Utilization\n")
+                    f.write(f"- **Average Usage**: {comp_stats['cache_usage_mean']:.3f}\n")
+                    f.write(f"- **Peak Usage**: {comp_stats['cache_usage_max']:.3f}\n")
+                    f.write(f"- **Usage Standard Deviation**: {comp_stats.get('cache_usage_std', 0):.3f}\n")
+                
+                # Prefix cache hit rate stats
+                if comp_stats.get('prefix_cache_hit_rate_mean') is not None:
+                    f.write(f"\n#### Prefix Cache Performance\n")
+                    f.write(f"- **Average Hit Rate**: {comp_stats['prefix_cache_hit_rate_mean']*100:.1f}%\n")
+                    f.write(f"- **Peak Hit Rate**: {comp_stats['prefix_cache_hit_rate_max']*100:.1f}%\n")
+                    f.write(f"- **Minimum Hit Rate**: {comp_stats.get('prefix_cache_hit_rate_min', 0)*100:.1f}%\n")
+                
+                # Request queue stats
+                for metric in ['num_requests_running', 'num_requests_waiting', 'num_requests_swapped']:
+                    mean_key = f'{metric}_mean'
+                    max_key = f'{metric}_max'
+                    if comp_stats.get(mean_key) is not None:
+                        if 'Request Queue' not in locals():
+                            f.write(f"\n#### Request Queue Statistics\n")
+                            locals()['Request Queue'] = True
+                        metric_name = metric.replace('_', ' ').title()
+                        f.write(f"- **{metric_name} (Avg)**: {comp_stats[mean_key]:.1f}\n")
+                        f.write(f"- **{metric_name} (Max)**: {comp_stats[max_key]:.1f}\n")
+            
             f.write(f"\n")
             
             # Resource utilization
