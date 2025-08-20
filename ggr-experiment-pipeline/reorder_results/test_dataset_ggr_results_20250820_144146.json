@@ -1,0 +1,34 @@
+{
+  "dataset_info": {
+    "path": "test_dataset.csv",
+    "original_shape": [
+      15,
+      1
+    ],
+    "columns": [
+      "query"
+    ]
+  },
+  "functional_dependencies": [],
+  "ggr_results": {
+    "phc_score": 16988,
+    "execution_time_seconds": 0.001483917236328125,
+    "original_table_shape": [
+      15,
+      1
+    ],
+    "reordered_table_length": 15,
+    "max_recursion_depth": 0,
+    "total_recursive_calls": 1,
+    "single_row_cases": 0,
+    "single_col_cases": 1,
+    "functional_dependencies_count": 0
+  },
+  "phc_score": 16988,
+  "reordered_shape": [
+    15,
+    1
+  ],
+  "processing_timestamp": "2025-08-20T14:41:46.450843",
+  "reordered_dataset_path": "reorder_results/test_dataset_reordered_20250820_144146.csv"
+}

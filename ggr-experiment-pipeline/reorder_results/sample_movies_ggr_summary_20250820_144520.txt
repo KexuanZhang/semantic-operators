@@ -1,0 +1,82 @@
+============================================================
+GGR ALGORITHM RESULTS SUMMARY
+============================================================
+
+DATASET INFORMATION:
+- Original file: sample_movies.csv
+- Original shape: (12, 6)
+- Columns: movie_id, movie_title, director, genre, review_content, rating
+- Processing time: 2025-08-20T14:45:20.260206
+
+FUNCTIONAL DEPENDENCIES:
+- movie_id -> movie_title
+- movie_id -> director
+- movie_id -> genre
+- movie_id -> rating
+- movie_title -> movie_id
+- movie_title -> director
+- movie_title -> genre
+- movie_title -> rating
+- review_content -> movie_id
+- review_content -> movie_title
+- review_content -> director
+- review_content -> genre
+- review_content -> rating
+- movie_id,movie_title -> director
+- movie_id,movie_title -> genre
+- movie_id,movie_title -> rating
+- movie_id,director -> movie_title
+- movie_id,director -> genre
+- movie_id,director -> rating
+- movie_id,genre -> movie_title
+- movie_id,genre -> director
+- movie_id,genre -> rating
+- movie_id,review_content -> movie_title
+- movie_id,review_content -> director
+- movie_id,review_content -> genre
+- movie_id,review_content -> rating
+- movie_id,rating -> movie_title
+- movie_id,rating -> director
+- movie_id,rating -> genre
+- movie_title,director -> movie_id
+- movie_title,director -> genre
+- movie_title,director -> rating
+- movie_title,genre -> movie_id
+- movie_title,genre -> director
+- movie_title,genre -> rating
+- movie_title,review_content -> movie_id
+- movie_title,review_content -> director
+- movie_title,review_content -> genre
+- movie_title,review_content -> rating
+- movie_title,rating -> movie_id
+- movie_title,rating -> director
+- movie_title,rating -> genre
+- director,review_content -> movie_id
+- director,review_content -> movie_title
+- director,review_content -> genre
+- director,review_content -> rating
+- genre,review_content -> movie_id
+- genre,review_content -> movie_title
+- genre,review_content -> director
+- genre,review_content -> rating
+- genre,rating -> movie_id
+- genre,rating -> movie_title
+- genre,rating -> director
+- review_content,rating -> movie_id
+- review_content,rating -> movie_title
+- review_content,rating -> director
+- review_content,rating -> genre
+- Total dependencies: 57
+
+GGR ALGORITHM RESULTS:
+- PHC Score: 18,842
+- Execution time: 0.02 seconds
+- Max recursion depth: 5
+- Total recursive calls: 19
+- Reordered table shape: (27, 4)
+
+PERFORMANCE ANALYSIS:
+- PHC score per cell: 261.69
+- Processing rate: 3087 cells/second
+
+- Reordered dataset saved to: reorder_results/sample_movies_reordered_20250820_144520.csv

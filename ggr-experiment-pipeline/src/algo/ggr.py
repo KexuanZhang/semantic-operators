@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""
+Greedy Group Recursion (GGR) Algorithm Implementation
+
+This script applies the GGR algorithm to reorder datasets for improved prefix cache hit rates
+in LLM inference. It can automatically discover functional dependencies or use provided ones.
+
+Usage:
+    python ggr.py dataset.csv [--fds "col1->col2,col1->col3"] [--output results/] [--max-depth 100]
+
+Features:
+- Automatic functional dependency discovery
+- GGR algorithm implementation with configurable depth
+- PHC (Prefix Hit Count) score calculation
+- Result saving with metadata
+- Comprehensive logging and analysis
+"""
+
+import argparse
+import os
+import sys
+import json
+import math
+import time
+from datetime import datetime
+from typing import List, Tuple, Dict, Any, Optional
+import logging
+
+import pandas as pd
+import numpy as np
+from itertools import combinations
+from collections import defaultdict
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class FunctionalDependencyDiscoverer:
+    """Discover functional dependencies in a dataset using statistical analysis"""
+    
+    def __init__(self, min_confidence: float = 0.95, max_lhs_size: int = 2):
+        self.min_confidence = min_confidence
+        self.max_lhs_size = max_lhs_size
+    
+    def discover_dependencies(self, df: pd.DataFrame) -> List[Tuple[str, str]]:
+        """
+        Discover functional dependencies in the dataset
+        Returns list of (source_column, target_column) tuples
+        """
+        logger.info(f"Discovering functional dependencies with confidence >= {self.min_confidence}")
+        
+        dependencies = []
+        columns = df.columns.tolist()
+        
+        # Check single column dependencies (A -> B)
+        for source in columns:
+            for target in columns:
+                if source != target:
+                    confidence = self._calculate_confidence(df, [source], target)
+                    if confidence >= self.min_confidence:
+                        dependencies.append((source, target))
+                        logger.info(f"Found FD: {source} -> {target} (confidence: {confidence:.3f})")
+        
+        # Check multi-column dependencies if requested
+        if self.max_lhs_size > 1:
+            for lhs_size in range(2, min(self.max_lhs_size + 1, len(columns))):
+                for source_cols in combinations(columns, lhs_size):
+                    for target in columns:
+                        if target not in source_cols:
+                            confidence = self._calculate_confidence(df, list(source_cols), target)
+                            if confidence >= self.min_confidence:
+                                source_str = ",".join(source_cols)
+                                dependencies.append((source_str, target))
+                                logger.info(f"Found FD: {source_str} -> {target} (confidence: {confidence:.3f})")
+        
+        logger.info(f"Discovered {len(dependencies)} functional dependencies")
+        return dependencies
+    
+    def _calculate_confidence(self, df: pd.DataFrame, source_cols: List[str], target_col: str) -> float:
+        """Calculate confidence of functional dependency source_cols -> target_col"""
+        try:
+            # Group by source columns and check if target is unique
+            grouped = df.groupby(source_cols)[target_col].nunique()
+            
+            # Count how many groups have exactly one unique target value
+            valid_groups = (grouped == 1).sum()
+            total_groups = len(grouped)
+            
+            if total_groups == 0:
+                return 0.0
+            
+            confidence = valid_groups / total_groups
+            return confidence
+        except Exception as e:
+            logger.debug(f"Error calculating confidence for {source_cols} -> {target_col}: {e}")
+            return 0.0
+
+
+class GGRAlgorithm:
+    """Implementation of the Greedy Group Recursion algorithm"""
+    
+    def __init__(self, max_depth: int = 100):
+        self.max_depth = max_depth
+        self.total_phc_score = 0
+        self.recursion_stats = {
+            'max_depth_reached': 0,
+            'total_calls': 0,
+            'single_row_cases': 0,
+            'single_col_cases': 0
+        }
+    
+    def apply_ggr(self, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]]) -> Tuple[int, List[List[str]], Dict[str, Any]]:
+        """
+        Apply GGR algorithm to reorder the table
+        Returns (total_phc_score, reordered_table, statistics)
+        """
+        logger.info(f"Applying GGR algorithm to table with shape {table.shape}")
+        logger.info(f"Using {len(functional_dependencies)} functional dependencies")
+        
+        # Reset statistics
+        self.total_phc_score = 0
+        self.recursion_stats = {
+            'max_depth_reached': 0,
+            'total_calls': 0,
+            'single_row_cases': 0,
+            'single_col_cases': 0
+        }
+        
+        start_time = time.time()
+        phc_score, reordered_table = self._ggr_recursive(table, functional_dependencies, depth=0)
+        end_time = time.time()
+        
+        # Compile statistics
+        stats = {
+            'phc_score': phc_score,
+            'execution_time_seconds': end_time - start_time,
+            'original_table_shape': table.shape,
+            'reordered_table_length': len(reordered_table),
+            'max_recursion_depth': self.recursion_stats['max_depth_reached'],
+            'total_recursive_calls': self.recursion_stats['total_calls'],
+            'single_row_cases': self.recursion_stats['single_row_cases'],
+            'single_col_cases': self.recursion_stats['single_col_cases'],
+            'functional_dependencies_count': len(functional_dependencies)
+        }
+        
+        logger.info(f"GGR completed: PHC Score = {phc_score}, Time = {stats['execution_time_seconds']:.2f}s")
+        
+        return phc_score, reordered_table, stats
+    
+    def _ggr_recursive(self, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]], depth: int = 0) -> Tuple[int, List[List[str]]]:
+        """Recursive GGR implementation"""
+        self.recursion_stats['total_calls'] += 1
+        self.recursion_stats['max_depth_reached'] = max(self.recursion_stats['max_depth_reached'], depth)
+        
+        logger.debug(f"GGR: Depth {depth}, Table Size: {table.shape}")
+        
+        # Base conditions
+        if table.shape[0] == 1:  # Single row case
+            self.recursion_stats['single_row_cases'] += 1
+            return 0, table.iloc[0].tolist()
+        
+        if table.shape[1] == 1:  # Single column case
+            self.recursion_stats['single_col_cases'] += 1
+            sorted_table = table.sort_values(by=table.columns[0])
+            phc_score = sum(
+                9 if pd.isna(value)  # 'nan' represented as 3^2
+                else len(str(value))**2
+                for value in sorted_table.iloc[:, 0]
+            )
+            return phc_score, sorted_table.values.tolist()
+        
+        # Prevent excessive recursion
+        if depth >= self.max_depth:
+            logger.warning(f"Maximum recursion depth {self.max_depth} reached")
+            return 0, []
+        
+        # Find the best field and value combination
+        max_hit_count, best_value, best_field, best_cols = -1, None, None, []
+        
+        for field in table.columns:
+            unique_values = table[field].unique()
+            for value in unique_values:
+                hit_count, cols = self._calculate_hit_count(value, field, table, functional_dependencies)
+                if hit_count > max_hit_count:
+                    max_hit_count, best_value, best_field, best_cols = hit_count, value, field, cols
+        
+        if best_field is None:  # No valid field found
+            logger.warning("No valid field found, returning empty result")
+            return 0, []
+        
+        logger.debug(f"Best choice: field={best_field}, value={best_value}, hit_count={max_hit_count}")
+        
+        # Split the table
+        if pd.isna(best_value):
+            rows_with_value = table[table[best_field].isna()]
+            remaining_rows = table[~table[best_field].isna()]
+        else:
+            rows_with_value = table[table[best_field] == best_value]
+            remaining_rows = table[table[best_field] != best_value]
+        
+        # Recursive calls
+        hit_count_A, reordered_A = self._ggr_recursive(remaining_rows, functional_dependencies, depth + 1)
+        
+        # Remove the columns that are functionally determined
+        remaining_cols = [col for col in rows_with_value.columns if col not in best_cols]
+        if remaining_cols:
+            rows_subset = rows_with_value[remaining_cols]
+            hit_count_B, reordered_B = self._ggr_recursive(rows_subset, functional_dependencies, depth + 1)
+        else:
+            hit_count_B, reordered_B = 0, []
+        
+        # Combine results
+        total_hit_count = hit_count_A + hit_count_B + max_hit_count
+        
+        # Create the reordered result list
+        reordered_list = []
+        
+        # Handle best_value rows (with functional dependencies removed)
+        if len(reordered_B) == 0:
+            # Single value case - create a row with just the best value
+            reordered_list.append([str(best_value)])
+        else:
+            # Multiple rows case - prepend best_value to each row in reordered_B  
+            for row in reordered_B:
+                if isinstance(row, list):
+                    reordered_list.append([str(best_value)] + [str(item) for item in row])
+                else:
+                    reordered_list.append([str(best_value), str(row)])
+        
+        # Add the remaining rows (reordered_A)
+        if isinstance(reordered_A, list):
+            for row in reordered_A:
+                if isinstance(row, list):
+                    reordered_list.append([str(item) for item in row])
+                else:
+                    reordered_list.append([str(row)])
+        
+        return total_hit_count, reordered_list
+    
+    def _calculate_hit_count(self, value: Any, field: str, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]]) -> Tuple[int, List[str]]:
+        """Calculate hit count for a value in a field"""
+        try:
+            # Get rows with this value
+            if pd.isna(value):
+                rows_with_value = table[table[field].isna()]
+            else:
+                rows_with_value = table[table[field] == value]
+            
+            if len(rows_with_value) == 0:
+                return 0, [field]
+            
+            # Find functionally dependent columns
+            inferred_columns = []
+            for source, target in functional_dependencies:
+                if source == field and target in table.columns:
+                    inferred_columns.append(target)
+            
+            # Calculate total length contribution
+            value_length = 9 if pd.isna(value) else len(str(value))**2
+            
+            inferred_length = 0
+            for col in inferred_columns:
+                if col in rows_with_value.columns:
+                    col_lengths = rows_with_value[col].apply(lambda x: 9 if pd.isna(x) else len(str(x)))
+                    if len(col_lengths) > 0:
+                        inferred_length += col_lengths.sum() / len(rows_with_value)
+            
+            total_length = value_length + inferred_length
+            hit_count = total_length * (len(rows_with_value) - 1)
+            
+            return int(hit_count), [field] + inferred_columns
+            
+        except Exception as e:
+            logger.debug(f"Error calculating hit count for {field}={value}: {e}")
+            return 0, [field]
+
+
+class GGRProcessor:
+    """Main processor for GGR algorithm with dataset handling"""
+    
+    def __init__(self, output_dir: str = "reorder_results"):
+        self.output_dir = output_dir
+        self.fd_discoverer = FunctionalDependencyDiscoverer()
+        self.ggr_algorithm = GGRAlgorithm()
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+    
+    def process_dataset(self, dataset_path: str, functional_dependencies: Optional[List[Tuple[str, str]]] = None, max_depth: int = 100) -> Dict[str, Any]:
+        """
+        Process a dataset with GGR algorithm
+        Returns comprehensive results dictionary
+        """
+        logger.info(f"Processing dataset: {dataset_path}")
+        
+        # Load dataset
+        try:
+            df = pd.read_csv(dataset_path)
+            logger.info(f"Loaded dataset with shape: {df.shape}")
+        except Exception as e:
+            logger.error(f"Failed to load dataset: {e}")
+            return {"error": str(e)}
+        
+        # Preprocess dataset
+        df = self._preprocess_data(df)
+        
+        # Discover or use provided functional dependencies
+        if functional_dependencies is None:
+            logger.info("No functional dependencies provided, discovering automatically...")
+            functional_dependencies = self.fd_discoverer.discover_dependencies(df)
+        else:
+            logger.info(f"Using provided functional dependencies: {functional_dependencies}")
+        
+        # Apply GGR algorithm
+        self.ggr_algorithm.max_depth = max_depth
+        phc_score, reordered_table, ggr_stats = self.ggr_algorithm.apply_ggr(df, functional_dependencies)
+        
+        # Convert reordered table back to DataFrame
+        if reordered_table:
+            # Determine the appropriate number of columns
+            max_cols = max(len(row) for row in reordered_table) if reordered_table else 0
+            
+            # Pad rows to have the same length
+            padded_rows = []
+            for row in reordered_table:
+                padded_row = row + [''] * (max_cols - len(row))
+                padded_rows.append(padded_row)
+            
+            # Create column names
+            original_cols = df.columns.tolist()
+            col_names = original_cols + [f"col_{i}" for i in range(len(original_cols), max_cols)]
+            
+            reordered_df = pd.DataFrame(padded_rows, columns=col_names[:max_cols])
+        else:
+            reordered_df = pd.DataFrame()
+        
+        # Prepare results
+        results = {
+            "dataset_info": {
+                "path": dataset_path,
+                "original_shape": df.shape,
+                "columns": df.columns.tolist()
+            },
+            "functional_dependencies": functional_dependencies,
+            "ggr_results": ggr_stats,
+            "phc_score": phc_score,
+            "reordered_shape": reordered_df.shape,
+            "processing_timestamp": datetime.now().isoformat()
+        }
+        
+        # Save results
+        self._save_results(dataset_path, reordered_df, results)
+        
+        return results
+    
+    def _preprocess_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Preprocess the dataset for GGR algorithm"""
+        logger.info("Preprocessing dataset...")
+        
+        original_shape = df.shape
+        
+        # Convert all columns to string type for consistent processing
+        for col in df.columns:
+            df[col] = df[col].astype(str)
+        
+        # Handle missing values (convert to NaN for proper handling)
+        df = df.replace(['nan', 'None', ''], np.nan)
+        
+        logger.info(f"Preprocessing complete: {original_shape} -> {df.shape}")
+        return df
+    
+    def _save_results(self, dataset_path: str, reordered_df: pd.DataFrame, results: Dict[str, Any]):
+        """Save the reordered dataset and metadata"""
+        base_name = os.path.splitext(os.path.basename(dataset_path))[0]
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Save reordered dataset
+        if not reordered_df.empty:
+            reordered_path = os.path.join(self.output_dir, f"{base_name}_reordered_{timestamp}.csv")
+            reordered_df.to_csv(reordered_path, index=False)
+            logger.info(f"Reordered dataset saved to: {reordered_path}")
+            results["reordered_dataset_path"] = reordered_path
+        
+        # Save metadata
+        metadata_path = os.path.join(self.output_dir, f"{base_name}_ggr_results_{timestamp}.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(results, f, indent=2, default=str)
+        logger.info(f"Results metadata saved to: {metadata_path}")
+        
+        # Save summary report
+        report_path = os.path.join(self.output_dir, f"{base_name}_ggr_summary_{timestamp}.txt")
+        self._generate_summary_report(results, report_path)
+    
+    def _generate_summary_report(self, results: Dict[str, Any], report_path: str):
+        """Generate a human-readable summary report"""
+        with open(report_path, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("GGR ALGORITHM RESULTS SUMMARY\n")
+            f.write("=" * 60 + "\n\n")
+            
+            # Dataset info
+            f.write("DATASET INFORMATION:\n")
+            f.write(f"- Original file: {results['dataset_info']['path']}\n")
+            f.write(f"- Original shape: {results['dataset_info']['original_shape']}\n")
+            f.write(f"- Columns: {', '.join(results['dataset_info']['columns'])}\n")
+            f.write(f"- Processing time: {results['processing_timestamp']}\n\n")
+            
+            # Functional dependencies
+            f.write("FUNCTIONAL DEPENDENCIES:\n")
+            if results['functional_dependencies']:
+                for source, target in results['functional_dependencies']:
+                    f.write(f"- {source} -> {target}\n")
+            else:
+                f.write("- No functional dependencies found\n")
+            f.write(f"- Total dependencies: {len(results['functional_dependencies'])}\n\n")
+            
+            # GGR results
+            f.write("GGR ALGORITHM RESULTS:\n")
+            ggr_stats = results['ggr_results']
+            f.write(f"- PHC Score: {results['phc_score']:,}\n")
+            f.write(f"- Execution time: {ggr_stats['execution_time_seconds']:.2f} seconds\n")
+            f.write(f"- Max recursion depth: {ggr_stats['max_recursion_depth']}\n")
+            f.write(f"- Total recursive calls: {ggr_stats['total_recursive_calls']:,}\n")
+            f.write(f"- Reordered table shape: {results['reordered_shape']}\n\n")
+            
+            # Performance analysis
+            f.write("PERFORMANCE ANALYSIS:\n")
+            original_size = results['dataset_info']['original_shape'][0] * results['dataset_info']['original_shape'][1]
+            phc_per_cell = results['phc_score'] / original_size if original_size > 0 else 0
+            f.write(f"- PHC score per cell: {phc_per_cell:.2f}\n")
+            f.write(f"- Processing rate: {original_size / ggr_stats['execution_time_seconds']:.0f} cells/second\n")
+            
+            if results.get('reordered_dataset_path'):
+                f.write(f"\n- Reordered dataset saved to: {results['reordered_dataset_path']}\n")
+        
+        logger.info(f"Summary report saved to: {report_path}")
+
+
+def parse_functional_dependencies(fd_string: str) -> List[Tuple[str, str]]:
+    """Parse functional dependencies from command line string"""
+    dependencies = []
+    if fd_string:
+        for fd in fd_string.split(','):
+            fd = fd.strip()
+            if '->' in fd:
+                source, target = fd.split('->', 1)
+                dependencies.append((source.strip(), target.strip()))
+    return dependencies
+
+
+def main():
+    """Main entry point"""
+    parser = argparse.ArgumentParser(
+        description="Apply GGR algorithm to reorder datasets for improved LLM inference performance",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python ggr.py data.csv
+  python ggr.py data.csv --fds "movie_id->title,movie_id->genre"
+  python ggr.py data.csv --output results/ --max-depth 50 --verbose
+        """
+    )
+    
+    parser.add_argument('dataset', help='Path to the CSV dataset file')
+    parser.add_argument('--fds', '--functional-dependencies', 
+                       help='Functional dependencies as comma-separated list (e.g., "col1->col2,col1->col3")')
+    parser.add_argument('--output', '-o', default='reorder_results',
+                       help='Output directory for results (default: reorder_results)')
+    parser.add_argument('--max-depth', type=int, default=100,
+                       help='Maximum recursion depth for GGR algorithm (default: 100)')
+    parser.add_argument('--fd-confidence', type=float, default=0.95,
+                       help='Confidence threshold for automatic FD discovery (default: 0.95)')
+    parser.add_argument('--fd-max-lhs', type=int, default=2,
+                       help='Maximum left-hand side size for FD discovery (default: 2)')
+    parser.add_argument('--verbose', '-v', action='store_true',
+                       help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    
+    # Set logging level
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Validate input file
+    if not os.path.exists(args.dataset):
+        logger.error(f"Dataset file not found: {args.dataset}")
+        sys.exit(1)
+    
+    # Parse functional dependencies
+    functional_dependencies = None
+    if args.fds:
+        functional_dependencies = parse_functional_dependencies(args.fds)
+        logger.info(f"Parsed {len(functional_dependencies)} functional dependencies")
+    
+    # Create processor with configuration
+    processor = GGRProcessor(output_dir=args.output)
+    processor.fd_discoverer.min_confidence = args.fd_confidence
+    processor.fd_discoverer.max_lhs_size = args.fd_max_lhs
+    
+    # Process dataset
+    try:
+        logger.info("=" * 60)
+        logger.info("STARTING GGR PROCESSING")
+        logger.info("=" * 60)
+        
+        results = processor.process_dataset(
+            dataset_path=args.dataset,
+            functional_dependencies=functional_dependencies,
+            max_depth=args.max_depth
+        )
+        
+        if "error" in results:
+            logger.error(f"Processing failed: {results['error']}")
+            sys.exit(1)
+        
+        # Print summary
+        logger.info("=" * 60)
+        logger.info("GGR PROCESSING COMPLETE")
+        logger.info("=" * 60)
+        logger.info(f"PHC Score: {results['phc_score']:,}")
+        logger.info(f"Processing time: {results['ggr_results']['execution_time_seconds']:.2f}s")
+        logger.info(f"Original shape: {results['dataset_info']['original_shape']}")
+        logger.info(f"Reordered shape: {results['reordered_shape']}")
+        logger.info(f"Functional dependencies: {len(results['functional_dependencies'])}")
+        logger.info(f"Results saved to: {args.output}/")
+        
+        if results['phc_score'] > 0:
+            logger.info(f"✅ GGR algorithm successfully reordered the dataset!")
+        else:
+            logger.warning(f"⚠️  Low PHC score - dataset may not benefit significantly from GGR")
+        
+    except KeyboardInterrupt:
+        logger.info("Processing interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        if args.verbose:
+            import traceback
+            traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

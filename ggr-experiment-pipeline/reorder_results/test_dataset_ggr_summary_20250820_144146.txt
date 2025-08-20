@@ -1,0 +1,26 @@
+============================================================
+GGR ALGORITHM RESULTS SUMMARY
+============================================================
+
+DATASET INFORMATION:
+- Original file: test_dataset.csv
+- Original shape: (15, 1)
+- Columns: query
+- Processing time: 2025-08-20T14:41:46.450843
+
+FUNCTIONAL DEPENDENCIES:
+- No functional dependencies found
+- Total dependencies: 0
+
+GGR ALGORITHM RESULTS:
+- PHC Score: 16,988
+- Execution time: 0.00 seconds
+- Max recursion depth: 0
+- Total recursive calls: 1
+- Reordered table shape: (15, 1)
+
+PERFORMANCE ANALYSIS:
+- PHC score per cell: 1132.53
+- Processing rate: 10108 cells/second
+
+- Reordered dataset saved to: reorder_results/test_dataset_reordered_20250820_144146.csv

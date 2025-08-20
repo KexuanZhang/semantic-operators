@@ -1,0 +1,27 @@
+============================================================
+GGR ALGORITHM RESULTS SUMMARY
+============================================================
+
+DATASET INFORMATION:
+- Original file: sample_movies.csv
+- Original shape: (12, 6)
+- Columns: movie_id, movie_title, director, genre, review_content, rating
+- Processing time: 2025-08-20T14:46:49.148579
+
+FUNCTIONAL DEPENDENCIES:
+- director -> genre
+- movie_title -> rating
+- Total dependencies: 2
+
+GGR ALGORITHM RESULTS:
+- PHC Score: 18,851
+- Execution time: 0.02 seconds
+- Max recursion depth: 5
+- Total recursive calls: 25
+- Reordered table shape: (27, 4)
+
+PERFORMANCE ANALYSIS:
+- PHC score per cell: 261.82
+- Processing rate: 3045 cells/second
+
+- Reordered dataset saved to: reorder_results/sample_movies_reordered_20250820_144649.csv

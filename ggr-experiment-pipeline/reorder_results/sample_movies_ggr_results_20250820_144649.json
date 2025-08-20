@@ -1,0 +1,48 @@
+{
+  "dataset_info": {
+    "path": "sample_movies.csv",
+    "original_shape": [
+      12,
+      6
+    ],
+    "columns": [
+      "movie_id",
+      "movie_title",
+      "director",
+      "genre",
+      "review_content",
+      "rating"
+    ]
+  },
+  "functional_dependencies": [
+    [
+      "director",
+      "genre"
+    ],
+    [
+      "movie_title",
+      "rating"
+    ]
+  ],
+  "ggr_results": {
+    "phc_score": 18851,
+    "execution_time_seconds": 0.02364206314086914,
+    "original_table_shape": [
+      12,
+      6
+    ],
+    "reordered_table_length": 27,
+    "max_recursion_depth": 5,
+    "total_recursive_calls": 25,
+    "single_row_cases": 6,
+    "single_col_cases": 3,
+    "functional_dependencies_count": 2
+  },
+  "phc_score": 18851,
+  "reordered_shape": [
+    27,
+    4
+  ],
+  "processing_timestamp": "2025-08-20T14:46:49.148579",
+  "reordered_dataset_path": "reorder_results/sample_movies_reordered_20250820_144649.csv"
+}
