@@ -34,6 +34,15 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 import logging
 
+# Try to import prometheus_client for accessing vLLM metrics
+try:
+    import prometheus_client
+    from prometheus_client import CollectorRegistry, REGISTRY
+    prometheus_available = True
+except ImportError:
+    logger.warning("prometheus_client not available. vLLM metrics will be limited.")
+    prometheus_available = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -441,87 +450,191 @@ class ResourceMonitor:
 
 
 class VLLMMetricsCollector:
-    """Modern vLLM metrics collector using LoggingStatLogger and Prometheus-style metrics"""
+    """Enhanced vLLM metrics collector using official Prometheus metrics"""
     
     def __init__(self, llm_instance=None):
         self.llm = llm_instance
-        self.logger = None
         self.stats_history = []
-        self.collection_interval = 1.0  # seconds
+        self.collection_interval = 1.0
         self.monitoring = False
         self.monitor_thread = None
         self.modern_logging_available = False
+        self.last_stats = {}
         
-        # Prometheus-style metric tracking
+        # Official vLLM Prometheus metrics names from documentation
+        self.vllm_metric_names = {
+            # System stats - Scheduler State
+            'num_requests_running': 'vllm:num_requests_running',
+            'num_requests_waiting': 'vllm:num_requests_waiting',
+            'num_requests_swapped': 'vllm:num_requests_swapped',  # Deprecated but may exist
+            
+            # KV Cache Usage - MOST IMPORTANT METRICS
+            'gpu_cache_usage_perc': 'vllm:gpu_cache_usage_perc',
+            'cpu_cache_usage_perc': 'vllm:cpu_cache_usage_perc',  # Deprecated but may exist
+            
+            # Prefix Cache Hit Rates - KEY PERFORMANCE INDICATORS
+            'gpu_prefix_cache_hit_rate': 'vllm:gpu_prefix_cache_hit_rate',  # Deprecated but may exist
+            'cpu_prefix_cache_hit_rate': 'vllm:cpu_prefix_cache_hit_rate',  # Deprecated but may exist
+            
+            # Token counters
+            'prompt_tokens_total': 'vllm:prompt_tokens_total',
+            'generation_tokens_total': 'vllm:generation_tokens_total',
+            'num_preemptions_total': 'vllm:num_preemptions_total',
+            
+            # Request success
+            'request_success_total': 'vllm:request_success_total',
+            
+            # Speculative decoding (if available)
+            'spec_decode_draft_acceptance_rate': 'vllm:spec_decode_draft_acceptance_rate',
+            'spec_decode_efficiency': 'vllm:spec_decode_efficiency',
+            'spec_decode_num_accepted_tokens_total': 'vllm:spec_decode_num_accepted_tokens_total',
+            'spec_decode_num_draft_tokens_total': 'vllm:spec_decode_num_draft_tokens_total',
+            'spec_decode_num_emitted_tokens_total': 'vllm:spec_decode_num_emitted_tokens_total'
+        }
+        
+        # Histogram metrics for detailed analysis
+        self.vllm_histogram_names = {
+            'iteration_tokens_total': 'vllm:iteration_tokens_total',
+            'time_to_first_token_seconds': 'vllm:time_to_first_token_seconds',
+            'time_per_output_token_seconds': 'vllm:time_per_output_token_seconds',
+            'e2e_request_latency_seconds': 'vllm:e2e_request_latency_seconds',
+            'request_queue_time_seconds': 'vllm:request_queue_time_seconds',
+            'request_inference_time_seconds': 'vllm:request_inference_time_seconds',
+            'request_prefill_time_seconds': 'vllm:request_prefill_time_seconds',
+            'request_decode_time_seconds': 'vllm:request_decode_time_seconds',
+            'request_prompt_tokens': 'vllm:request_prompt_tokens',
+            'request_generation_tokens': 'vllm:request_generation_tokens',
+            'request_max_num_generation_tokens': 'vllm:request_max_num_generation_tokens'
+        }
+        
+        # Cache for metrics
         self.metrics_cache = {
-            # KV Cache metrics
-            'gpu_cache_usage_perc': [],
-            'gpu_cache_usage_sys': [],
-            
-            # Request queue metrics
-            'num_requests_running': [],
-            'num_requests_waiting': [],
-            'num_requests_swapped': [],
-            
-            # Token processing counters
-            'prompt_tokens_total': 0,
-            'generation_tokens_total': 0,
-            'iteration_tokens_total': [],
-            
-            # Latency histograms (stored as lists for analysis)
-            'time_to_first_token_seconds': [],
-            'time_per_output_token_seconds': [],
-            'e2e_request_latency_seconds': [],
-            'request_queue_time_seconds': [],
-            'request_inference_time_seconds': [],
-            
-            # Request metadata
-            'request_prompt_tokens': [],
-            'request_generation_tokens': [],
-            'request_success_total': 0,
-            'num_preemptions_total': 0
+            'prometheus_metrics': {},
+            'histogram_metrics': {},
+            'collection_timestamps': []
         }
         
     def initialize_logging(self):
-        """Initialize modern vLLM logging if available"""
+        """Initialize vLLM metrics collection"""
         if not self.llm:
             logger.warning("No LLM instance available for metrics initialization")
             return False
             
         try:
-            if modern_vllm_metrics:
-                # Try to access the LLMEngine from vLLM instance
-                if hasattr(self.llm, 'llm_engine'):
-                    engine = self.llm.llm_engine
-                elif hasattr(self.llm, '_engine'):
-                    engine = self.llm._engine
-                else:
-                    logger.warning("Could not access LLMEngine from vLLM instance")
-                    return False
+            # Check if we can access the engine and its metrics
+            if hasattr(self.llm, 'llm_engine'):
+                engine = self.llm.llm_engine
+                logger.info("Found llm_engine attribute")
                 
-                # Initialize LoggingStatLogger if available
-                self.logger = LoggingStatLogger(labels={})
-                self.modern_logging_available = True
-                logger.info("Modern vLLM metrics logging initialized successfully")
-                return True
+                # Try to access engine metrics or stat_loggers
+                if hasattr(engine, 'metrics') or hasattr(engine, 'stat_loggers'):
+                    self.modern_logging_available = True
+                    logger.info("vLLM Prometheus metrics should be available")
+                    return True
+                else:
+                    logger.info("Engine found but metrics access uncertain")
+                    self.modern_logging_available = True  # Try anyway
+                    return True
+                    
             else:
-                logger.info("Modern vLLM metrics not available, falling back to legacy")
+                logger.warning("Could not access llm_engine from vLLM instance")
                 return False
                 
         except Exception as e:
-            logger.warning(f"Failed to initialize modern vLLM logging: {e}")
+            logger.warning(f"Failed to initialize vLLM metrics: {e}")
             return False
     
+    def collect_prometheus_metrics(self) -> Dict[str, Any]:
+        """Collect current Prometheus metrics from the global registry"""
+        if not prometheus_available:
+            return {
+                'stats_available': False,
+                'collection_method': 'prometheus_unavailable',
+                'error': 'prometheus_client not available'
+            }
+            
+        metrics_data = {
+            'stats_available': False,
+            'collection_method': 'prometheus_registry',
+            'collection_time': time.time(),
+            'metrics_found': {},
+            'histogram_data': {}
+        }
+        
+        try:
+            # Get all metric families from the global Prometheus registry
+            metric_families = list(REGISTRY.collect())
+            
+            found_vllm_metrics = {}
+            found_histograms = {}
+            
+            for family in metric_families:
+                metric_name = family.name
+                
+                # Check if this is a vLLM metric we're interested in
+                if metric_name.startswith('vllm:'):
+                    
+                    # Handle gauge and counter metrics
+                    if family.type in ['gauge', 'counter']:
+                        for sample in family.samples:
+                            # Extract the metric value (usually the first sample)
+                            if sample.name == metric_name:
+                                found_vllm_metrics[metric_name] = sample.value
+                                logger.debug(f"Found metric {metric_name}: {sample.value}")
+                                break
+                    
+                    # Handle histogram metrics
+                    elif family.type == 'histogram':
+                        histogram_data = {'buckets': {}, 'count': 0, 'sum': 0}
+                        
+                        for sample in family.samples:
+                            if sample.name == f"{metric_name}_bucket":
+                                le_value = sample.labels.get('le', 'unknown')
+                                histogram_data['buckets'][le_value] = sample.value
+                            elif sample.name == f"{metric_name}_count":
+                                histogram_data['count'] = sample.value
+                            elif sample.name == f"{metric_name}_sum":
+                                histogram_data['sum'] = sample.value
+                        
+                        if histogram_data['count'] > 0 or histogram_data['sum'] > 0:
+                            found_histograms[metric_name] = histogram_data
+                            logger.debug(f"Found histogram {metric_name}: count={histogram_data['count']}, sum={histogram_data['sum']}")
+            
+            # Update metrics data
+            if found_vllm_metrics or found_histograms:
+                metrics_data.update({
+                    'stats_available': True,
+                    'metrics_found': found_vllm_metrics,
+                    'histogram_data': found_histograms,
+                    'total_metrics_found': len(found_vllm_metrics),
+                    'total_histograms_found': len(found_histograms)
+                })
+                
+                logger.debug(f"Collected {len(found_vllm_metrics)} metrics and {len(found_histograms)} histograms")
+            else:
+                metrics_data['error'] = 'No vLLM metrics found in Prometheus registry'
+                logger.debug("No vLLM metrics found in Prometheus registry")
+                
+        except Exception as e:
+            metrics_data['error'] = f'Error collecting Prometheus metrics: {str(e)}'
+            logger.debug(f"Error collecting Prometheus metrics: {e}")
+        
+        return metrics_data
+    
     def start_monitoring(self):
-        """Start background monitoring of vLLM metrics"""
+        """Start background monitoring"""
         if self.monitoring:
             logger.info("vLLM metrics monitoring already active")
             return
             
+        # Force initialization if not done
+        if not self.modern_logging_available:
+            self.initialize_logging()
+            
         self.monitoring = True
         self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
         self.monitor_thread.start()
-        logger.info("Started vLLM metrics monitoring thread")
+        logger.info("Started vLLM Prometheus metrics monitoring thread")
         
     def stop_monitoring(self):
         """Stop background monitoring"""
@@ -530,280 +643,249 @@ class VLLMMetricsCollector:
             
         self.monitoring = False
         if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=2.0)
+            self.monitor_thread.join(timeout=3.0)
         logger.info("Stopped vLLM metrics monitoring")
         
     def _monitoring_loop(self):
-        """Background monitoring loop"""
+        """Enhanced monitoring loop collecting Prometheus metrics"""
+        consecutive_failures = 0
+        max_failures = 10
+        
         while self.monitoring:
             try:
-                stats = self.collect_current_stats()
+                stats = self.collect_prometheus_metrics()
+                
                 if stats.get('stats_available', False):
                     stats['timestamp'] = time.time()
                     self.stats_history.append(stats)
+                    self.last_stats = stats.copy()
                     
-                    # Update Prometheus-style metrics cache
+                    # Update cache
                     self._update_metrics_cache(stats)
                     
-                    # Keep only last 1000 entries to avoid memory issues
-                    if len(self.stats_history) > 1000:
-                        self.stats_history = self.stats_history[-500:]
+                    # Reset failure counter on success
+                    consecutive_failures = 0
+                    
+                    # Log key metrics periodically
+                    if len(self.stats_history) % 10 == 0:
+                        self._log_key_prometheus_metrics(stats)
                         
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures == 1:
+                        logger.debug("vLLM Prometheus metrics collection failed, will retry")
+                    elif consecutive_failures >= max_failures:
+                        logger.warning(f"vLLM Prometheus metrics collection failed {max_failures} times")
+                        consecutive_failures = 0  # Reset to avoid spam
+                
+                # Keep history manageable
+                if len(self.stats_history) > 1000:
+                    self.stats_history = self.stats_history[-500:]
+                    
             except Exception as e:
-                logger.debug(f"Error in vLLM monitoring loop: {e}")
+                consecutive_failures += 1
+                if consecutive_failures == 1:
+                    logger.debug(f"Error in vLLM Prometheus monitoring loop: {e}")
                 
             time.sleep(self.collection_interval)
     
-    def _update_metrics_cache(self, stats: Dict[str, Any]):
-        """Update Prometheus-style metrics cache"""
+    def _log_key_prometheus_metrics(self, stats):
+        """Log key Prometheus metrics for debugging"""
         try:
-            # KV Cache usage percentage (convert to 0-1 range)
-            if 'gpu_cache_usage_sys' in stats:
-                cache_usage = stats['gpu_cache_usage_sys']
-                if isinstance(cache_usage, (int, float)) and 0 <= cache_usage <= 1:
-                    self.metrics_cache['gpu_cache_usage_perc'].append(cache_usage)
-                    self.metrics_cache['gpu_cache_usage_sys'].append(cache_usage)
+            metrics_found = stats.get('metrics_found', {})
             
-            # Request queue metrics
-            for metric in ['num_requests_running', 'num_requests_waiting', 'num_requests_swapped']:
-                if metric in stats:
-                    value = stats[metric]
-                    if isinstance(value, (int, float)) and value >= 0:
-                        self.metrics_cache[metric].append(value)
+            # KV Cache Usage
+            if 'vllm:gpu_cache_usage_perc' in metrics_found:
+                cache_pct = metrics_found['vllm:gpu_cache_usage_perc'] * 100
+                logger.debug(f"GPU KV Cache Usage: {cache_pct:.1f}%")
             
-            # Token counters (cumulative)
-            if 'prompt_tokens' in stats:
-                self.metrics_cache['prompt_tokens_total'] += stats.get('prompt_tokens', 0)
-            if 'generation_tokens' in stats:
-                self.metrics_cache['generation_tokens_total'] += stats.get('generation_tokens', 0)
+            # Prefix Cache Hit Rate (may be deprecated)
+            if 'vllm:gpu_prefix_cache_hit_rate' in metrics_found:
+                hit_rate = metrics_found['vllm:gpu_prefix_cache_hit_rate'] * 100
+                logger.debug(f"GPU Prefix Cache Hit Rate: {hit_rate:.1f}%")
+            
+            # Request queue status
+            if 'vllm:num_requests_running' in metrics_found:
+                logger.debug(f"Running requests: {metrics_found['vllm:num_requests_running']}")
+            if 'vllm:num_requests_waiting' in metrics_found:
+                logger.debug(f"Waiting requests: {metrics_found['vllm:num_requests_waiting']}")
+            
+            # Token processing
+            if 'vllm:prompt_tokens_total' in metrics_found:
+                logger.debug(f"Total prompt tokens: {metrics_found['vllm:prompt_tokens_total']}")
+            if 'vllm:generation_tokens_total' in metrics_found:
+                logger.debug(f"Total generation tokens: {metrics_found['vllm:generation_tokens_total']}")
                 
-            # Iteration tokens
-            if 'iteration_tokens' in stats:
-                self.metrics_cache['iteration_tokens_total'].append(stats['iteration_tokens'])
+        except Exception as e:
+            logger.debug(f"Error logging Prometheus metrics: {e}")
+    
+    def collect_current_stats(self) -> Dict[str, Any]:
+        """Collect current vLLM statistics using Prometheus metrics"""
+        return self.collect_prometheus_metrics()
+    
+    def _update_metrics_cache(self, stats: Dict[str, Any]):
+        """Update metrics cache with latest Prometheus data"""
+        try:
+            if 'metrics_found' in stats:
+                self.metrics_cache['prometheus_metrics'] = stats['metrics_found']
             
-            # Latency metrics (if available from stats)
-            latency_metrics = [
-                'time_to_first_token_seconds',
-                'time_per_output_token_seconds', 
-                'e2e_request_latency_seconds',
-                'request_queue_time_seconds',
-                'request_inference_time_seconds'
-            ]
-            
-            for metric in latency_metrics:
-                if metric in stats:
-                    value = stats[metric]
-                    if isinstance(value, (int, float)) and value >= 0:
-                        self.metrics_cache[metric].append(value)
-            
-            # Request metadata
-            if 'request_prompt_tokens' in stats:
-                self.metrics_cache['request_prompt_tokens'].append(stats['request_prompt_tokens'])
-            if 'request_generation_tokens' in stats:
-                self.metrics_cache['request_generation_tokens'].append(stats['request_generation_tokens'])
+            if 'histogram_data' in stats:
+                self.metrics_cache['histogram_metrics'] = stats['histogram_data']
                 
-            # Success and preemption counters
-            if 'request_success' in stats:
-                self.metrics_cache['request_success_total'] += stats.get('request_success', 0)
-            if 'num_preemptions' in stats:
-                self.metrics_cache['num_preemptions_total'] += stats.get('num_preemptions', 0)
+            if 'timestamp' in stats:
+                self.metrics_cache['collection_timestamps'].append(stats['timestamp'])
                 
+                # Keep only recent timestamps
+                if len(self.metrics_cache['collection_timestamps']) > 1000:
+                    self.metrics_cache['collection_timestamps'] = \
+                        self.metrics_cache['collection_timestamps'][-500:]
+                        
         except Exception as e:
             logger.debug(f"Error updating metrics cache: {e}")
     
-    def collect_current_stats(self) -> Dict[str, Any]:
-        """Collect current vLLM statistics with Prometheus-style metrics"""
-        stats = {
-            'stats_available': False,
-            'modern_metrics': self.modern_logging_available,
-            'collection_time': time.time()
-        }
-        
-        if not self.llm:
-            stats['error'] = 'No LLM instance available'
-            return stats
-            
-        try:
-            # Try modern approach first
-            if self.modern_logging_available and self.logger:
-                try:
-                    # This would depend on the specific implementation of LoggingStatLogger
-                    # For now, we'll fall back to legacy approach
-                    pass
-                except Exception as e:
-                    logger.debug(f"Modern metrics collection failed: {e}")
-            
-            # Legacy approach using internal _get_stats method
-            if hasattr(self.llm, 'llm_engine') and hasattr(self.llm.llm_engine, '_get_stats'):
-                engine_stats = self.llm.llm_engine._get_stats()
-                if engine_stats:
-                    # Map legacy stats to Prometheus-style metrics
-                    prometheus_stats = self._map_to_prometheus_metrics(engine_stats)
-                    stats.update({
-                        'stats_available': True,
-                        'engine_stats': engine_stats,
-                        **engine_stats,  # Keep original stats
-                        **prometheus_stats  # Add Prometheus-style metrics
-                    })
-            elif hasattr(self.llm, '_engine') and hasattr(self.llm._engine, '_get_stats'):
-                engine_stats = self.llm._engine._get_stats()
-                if engine_stats:
-                    prometheus_stats = self._map_to_prometheus_metrics(engine_stats)
-                    stats.update({
-                        'stats_available': True,
-                        'engine_stats': engine_stats,
-                        **engine_stats,
-                        **prometheus_stats
-                    })
-            else:
-                stats['error'] = 'No accessible _get_stats method found'
-                
-        except Exception as e:
-            stats['error'] = f'Error collecting vLLM stats: {str(e)}'
-            logger.debug(f"vLLM stats collection error: {e}")
-        
-        return stats
-    
-    def _map_to_prometheus_metrics(self, engine_stats: Dict[str, Any]) -> Dict[str, Any]:
-        """Map legacy vLLM stats to Prometheus-style metric names"""
-        prometheus_metrics = {}
-        
-        try:
-            # KV Cache usage (ensure it's a percentage 0-1)
-            if 'gpu_cache_usage' in engine_stats:
-                cache_usage = engine_stats['gpu_cache_usage']
-                if isinstance(cache_usage, (int, float)):
-                    # If cache_usage > 1, assume it's already a percentage and convert to 0-1
-                    if cache_usage > 1:
-                        prometheus_metrics['gpu_cache_usage_perc'] = cache_usage / 100.0
-                    else:
-                        prometheus_metrics['gpu_cache_usage_perc'] = cache_usage
-            
-            # Request queue metrics
-            request_mapping = {
-                'num_requests_running': 'num_requests_running',
-                'num_requests_waiting': 'num_requests_waiting', 
-                'num_requests_swapped': 'num_requests_swapped'
-            }
-            
-            for legacy_key, prometheus_key in request_mapping.items():
-                if legacy_key in engine_stats:
-                    prometheus_metrics[prometheus_key] = engine_stats[legacy_key]
-            
-            # Token metrics
-            if 'num_batched_tokens' in engine_stats:
-                prometheus_metrics['iteration_tokens_total'] = engine_stats['num_batched_tokens']
-            
-            # Additional mappings for other available metrics
-            metric_mappings = {
-                'gpu_prefix_cache_hit_rate': 'gpu_prefix_cache_hit_rate',
-                'gpu_watermark_blocks': 'gpu_watermark_blocks',
-                'gpu_kv_cache_usage': 'gpu_kv_cache_usage',
-                'num_batched_tokens': 'num_batched_tokens'
-            }
-            
-            for legacy_key, prometheus_key in metric_mappings.items():
-                if legacy_key in engine_stats:
-                    prometheus_metrics[prometheus_key] = engine_stats[legacy_key]
-                    
-        except Exception as e:
-            logger.debug(f"Error mapping to Prometheus metrics: {e}")
-        
-        return prometheus_metrics
-    
     def get_comprehensive_stats(self) -> Dict[str, Any]:
-        """Get comprehensive statistics including Prometheus-style metrics and history summary"""
-        current_stats = self.collect_current_stats()
+        """Get comprehensive statistics with Prometheus metrics analysis"""
+        current_stats = self.collect_prometheus_metrics()
         
         summary = {
             'latest_stats': current_stats,
             'monitoring_active': self.monitoring,
             'total_collections': len(self.stats_history),
             'collection_interval': self.collection_interval,
-            'modern_metrics_enabled': self.modern_logging_available
+            'modern_metrics_enabled': self.modern_logging_available,
+            'last_successful_collection': self.last_stats.get('collection_time', 0),
+            'collection_method': current_stats.get('collection_method', 'prometheus_registry')
         }
         
-        # Add Prometheus-style metrics summary
-        summary['prometheus_metrics'] = {
-            'gpu_cache_usage_perc': {
-                'values_count': len(self.metrics_cache['gpu_cache_usage_perc']),
-                'mean': sum(self.metrics_cache['gpu_cache_usage_perc']) / len(self.metrics_cache['gpu_cache_usage_perc']) if self.metrics_cache['gpu_cache_usage_perc'] else 0,
-                'max': max(self.metrics_cache['gpu_cache_usage_perc']) if self.metrics_cache['gpu_cache_usage_perc'] else 0
-            },
-            'request_queue_stats': {
-                'running_requests_count': len(self.metrics_cache['num_requests_running']),
-                'waiting_requests_count': len(self.metrics_cache['num_requests_waiting']),
-                'swapped_requests_count': len(self.metrics_cache['num_requests_swapped'])
-            },
-            'token_counters': {
-                'prompt_tokens_total': self.metrics_cache['prompt_tokens_total'],
-                'generation_tokens_total': self.metrics_cache['generation_tokens_total'],
-                'iteration_tokens_samples': len(self.metrics_cache['iteration_tokens_total'])
-            }
-        }
-        
-        # Add historical summaries if we have data
-        if self.stats_history:
-            history_df = pd.DataFrame(self.stats_history)
+        # Prometheus metrics analysis
+        if current_stats.get('stats_available', False):
+            metrics_found = current_stats.get('metrics_found', {})
+            histogram_data = current_stats.get('histogram_data', {})
             
-            # KV Cache utilization summary
-            if 'gpu_cache_usage_sys' in history_df.columns:
-                cache_usage = history_df['gpu_cache_usage_sys'].dropna()
-                if len(cache_usage) > 0:
-                    summary.update({
-                        'cache_usage_mean': cache_usage.mean(),
-                        'cache_usage_max': cache_usage.max(),
-                        'cache_usage_min': cache_usage.min(),
-                        'cache_usage_std': cache_usage.std()
-                    })
+            # Key metrics summary
+            summary['key_metrics'] = {}
             
-            # Prefix cache hit rate summary
-            if 'gpu_prefix_cache_hit_rate' in history_df.columns:
-                hit_rate = history_df['gpu_prefix_cache_hit_rate'].dropna()
-                if len(hit_rate) > 0:
-                    summary.update({
-                        'prefix_cache_hit_rate_mean': hit_rate.mean(),
-                        'prefix_cache_hit_rate_max': hit_rate.max(),
-                        'prefix_cache_hit_rate_min': hit_rate.min()
-                    })
+            # KV Cache Usage
+            if 'vllm:gpu_cache_usage_perc' in metrics_found:
+                cache_usage = metrics_found['vllm:gpu_cache_usage_perc']
+                summary['key_metrics']['gpu_cache_usage_percent'] = cache_usage * 100
+                summary['key_metrics']['gpu_cache_usage_raw'] = cache_usage
             
-            # Request queue summary
-            for metric in ['num_requests_running', 'num_requests_waiting', 'num_requests_swapped']:
-                if metric in history_df.columns:
-                    values = history_df[metric].dropna()
-                    if len(values) > 0:
-                        summary.update({
-                            f'{metric}_mean': values.mean(),
-                            f'{metric}_max': values.max()
-                        })
+            # Prefix Cache Hit Rate (if available - may be deprecated)
+            if 'vllm:gpu_prefix_cache_hit_rate' in metrics_found:
+                hit_rate = metrics_found['vllm:gpu_prefix_cache_hit_rate']
+                summary['key_metrics']['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
+                summary['key_metrics']['gpu_prefix_cache_hit_rate_raw'] = hit_rate
+            
+            # Request Queue Status
+            for metric_key in ['vllm:num_requests_running', 'vllm:num_requests_waiting', 'vllm:num_requests_swapped']:
+                if metric_key in metrics_found:
+                    clean_key = metric_key.replace('vllm:', '').replace('num_', '')
+                    summary['key_metrics'][clean_key] = metrics_found[metric_key]
+            
+            # Token Counters
+            if 'vllm:prompt_tokens_total' in metrics_found:
+                summary['key_metrics']['prompt_tokens_total'] = metrics_found['vllm:prompt_tokens_total']
+            if 'vllm:generation_tokens_total' in metrics_found:
+                summary['key_metrics']['generation_tokens_total'] = metrics_found['vllm:generation_tokens_total']
+            
+            # Speculative Decoding (if available)
+            if 'vllm:spec_decode_draft_acceptance_rate' in metrics_found:
+                summary['key_metrics']['spec_decode_acceptance_rate'] = metrics_found['vllm:spec_decode_draft_acceptance_rate']
+            if 'vllm:spec_decode_efficiency' in metrics_found:
+                summary['key_metrics']['spec_decode_efficiency'] = metrics_found['vllm:spec_decode_efficiency']
+            
+            # Histogram analysis
+            if histogram_data:
+                summary['histogram_analysis'] = {}
+                
+                # Time to First Token analysis
+                if 'vllm:time_to_first_token_seconds' in histogram_data:
+                    ttft_data = histogram_data['vllm:time_to_first_token_seconds']
+                    if ttft_data['count'] > 0:
+                        avg_ttft = ttft_data['sum'] / ttft_data['count']
+                        summary['histogram_analysis']['avg_time_to_first_token_seconds'] = avg_ttft
+                        summary['histogram_analysis']['total_ttft_requests'] = ttft_data['count']
+                
+                # Time per Output Token analysis
+                if 'vllm:time_per_output_token_seconds' in histogram_data:
+                    tpot_data = histogram_data['vllm:time_per_output_token_seconds']
+                    if tpot_data['count'] > 0:
+                        avg_tpot = tpot_data['sum'] / tpot_data['count']
+                        summary['histogram_analysis']['avg_time_per_output_token_seconds'] = avg_tpot
+                        summary['histogram_analysis']['total_tpot_samples'] = tpot_data['count']
+                
+                # E2E Request Latency analysis  
+                if 'vllm:e2e_request_latency_seconds' in histogram_data:
+                    e2e_data = histogram_data['vllm:e2e_request_latency_seconds']
+                    if e2e_data['count'] > 0:
+                        avg_e2e = e2e_data['sum'] / e2e_data['count']
+                        summary['histogram_analysis']['avg_e2e_latency_seconds'] = avg_e2e
+                        summary['histogram_analysis']['total_e2e_requests'] = e2e_data['count']
         
         return summary
     
     def get_prometheus_metrics(self) -> Dict[str, Any]:
-        """Get current Prometheus-style metrics snapshot"""
-        return {
-            'vllm:gpu_cache_usage_perc': self.metrics_cache['gpu_cache_usage_perc'][-1] if self.metrics_cache['gpu_cache_usage_perc'] else 0,
-            'vllm:num_requests_running': self.metrics_cache['num_requests_running'][-1] if self.metrics_cache['num_requests_running'] else 0,
-            'vllm:num_requests_waiting': self.metrics_cache['num_requests_waiting'][-1] if self.metrics_cache['num_requests_waiting'] else 0,
-            'vllm:num_requests_swapped': self.metrics_cache['num_requests_swapped'][-1] if self.metrics_cache['num_requests_swapped'] else 0,
-            'vllm:prompt_tokens_total': self.metrics_cache['prompt_tokens_total'],
-            'vllm:generation_tokens_total': self.metrics_cache['generation_tokens_total'],
-            'vllm:request_success_total': self.metrics_cache['request_success_total'],
-            'vllm:num_preemptions_total': self.metrics_cache['num_preemptions_total']
-        }
-    
-    def get_metrics_history(self) -> List[Dict[str, Any]]:
-        """Get full metrics history"""
-        return self.stats_history.copy()
-    
-    def save_metrics(self, filepath: str):
-        """Save metrics history to file"""
-        if self.stats_history:
-            df = pd.DataFrame(self.stats_history)
-            df.to_csv(filepath, index=False)
-            logger.info(f"vLLM metrics saved to {filepath}")
+        """Get current Prometheus metrics snapshot"""
+        current_stats = self.collect_prometheus_metrics()
+        
+        if current_stats.get('stats_available', False):
+            # Return the found metrics with vllm: prefix preserved
+            return current_stats.get('metrics_found', {})
         else:
-            logger.warning("No vLLM metrics to save")
+            return {
+                'error': current_stats.get('error', 'No metrics available'),
+                'collection_method': 'prometheus_registry'
+            }
+    
+    def save_metrics(self, csv_path: str):
+        """Save metrics history to CSV"""
+        if not self.stats_history:
+            logger.warning("No vLLM metrics history to save")
+            return
+            
+        try:
+            # Flatten the metrics history for CSV export
+            flattened_data = []
+            
+            for entry in self.stats_history:
+                row = {
+                    'timestamp': entry.get('timestamp', 0),
+                    'collection_time': entry.get('collection_time', 0),
+                    'stats_available': entry.get('stats_available', False),
+                    'total_metrics_found': entry.get('total_metrics_found', 0),
+                    'total_histograms_found': entry.get('total_histograms_found', 0)
+                }
+                
+                # Add individual metrics
+                metrics_found = entry.get('metrics_found', {})
+                for metric_name, value in metrics_found.items():
+                    # Clean the metric name for CSV column
+                    clean_name = metric_name.replace('vllm:', '').replace(':', '_')
+                    row[clean_name] = value
+                
+                # Add histogram summaries
+                histogram_data = entry.get('histogram_data', {})
+                for hist_name, hist_info in histogram_data.items():
+                    clean_hist_name = hist_name.replace('vllm:', '').replace(':', '_')
+                    row[f'{clean_hist_name}_count'] = hist_info.get('count', 0)
+                    row[f'{clean_hist_name}_sum'] = hist_info.get('sum', 0)
+                    if hist_info.get('count', 0) > 0:
+                        row[f'{clean_hist_name}_avg'] = hist_info.get('sum', 0) / hist_info.get('count', 1)
+                
+                flattened_data.append(row)
+            
+            # Save to CSV
+            df = pd.DataFrame(flattened_data)
+            df.to_csv(csv_path, index=False)
+            logger.info(f"Saved {len(flattened_data)} vLLM metrics records to {csv_path}")
+            
+        except Exception as e:
+            logger.error(f"Error saving vLLM metrics to CSV: {e}")
+
+    def get_metrics_history(self) -> List[Dict[str, Any]]:
+        """Get the complete metrics collection history"""
+        return self.stats_history.copy()
 
 
 def resolve_model_path(model_name: str) -> str:
@@ -1090,37 +1172,105 @@ class SimpleLLMExperiment:
             return False
     
     def get_vllm_stats(self) -> Dict[str, Any]:
-        """Get vLLM internal statistics using modern metrics collector with Prometheus-style metrics"""
-        if self.vllm_metrics_collector:
-            stats = self.vllm_metrics_collector.collect_current_stats()
-            
-            # Log key metrics if available
-            if stats.get('stats_available', False):
-                if stats.get('gpu_cache_usage_sys') is not None:
-                    logger.info(f"vLLM KV Cache Usage: {stats['gpu_cache_usage_sys']}")
-                if stats.get('gpu_prefix_cache_hit_rate') is not None:
-                    hit_rate = stats['gpu_prefix_cache_hit_rate'] * 100
-                    logger.info(f"vLLM Prefix Cache Hit Rate: {hit_rate:.1f}%")
-                
-                # Log Prometheus-style metrics if available
-                if stats.get('gpu_cache_usage_perc') is not None:
-                    cache_perc = stats['gpu_cache_usage_perc'] * 100
-                    logger.info(f"vLLM GPU Cache Usage Percentage: {cache_perc:.1f}%")
-                if stats.get('num_requests_running') is not None:
-                    logger.info(f"vLLM Running Requests: {stats['num_requests_running']}")
-                if stats.get('num_requests_waiting') is not None:
-                    logger.info(f"vLLM Waiting Requests: {stats['num_requests_waiting']}")
-            
-            # Add current Prometheus metrics snapshot
-            prometheus_snapshot = self.vllm_metrics_collector.get_prometheus_metrics()
-            if prometheus_snapshot:
-                stats['prometheus_snapshot'] = prometheus_snapshot
-                logger.debug(f"Prometheus metrics snapshot: {prometheus_snapshot}")
-            
-            return stats
-        else:
+        """Get vLLM internal statistics using modern Prometheus metrics collector"""
+        if not self.vllm_metrics_collector:
             logger.warning("vLLM metrics collector not available")
             return {'vllm_stats_available': False, 'error': 'Metrics collector not initialized'}
+        
+        # Collect current Prometheus metrics
+        stats = self.vllm_metrics_collector.collect_prometheus_metrics()
+        
+        # Extract key metrics for easy access and logging
+        key_metrics = {}
+        if stats.get('stats_available', False):
+            metrics_found = stats.get('metrics_found', {})
+            histogram_data = stats.get('histogram_data', {})
+            
+            # KV Cache Usage - Most Important for GGR evaluation
+            if 'vllm:gpu_cache_usage_perc' in metrics_found:
+                cache_usage = metrics_found['vllm:gpu_cache_usage_perc']
+                key_metrics['gpu_cache_usage_perc'] = cache_usage
+                key_metrics['gpu_cache_usage_percent'] = cache_usage * 100
+                logger.info(f"🔥 GPU KV Cache Usage: {cache_usage * 100:.1f}%")
+            
+            # Prefix Cache Hit Rate - Key GGR Performance Indicator
+            if 'vllm:gpu_prefix_cache_hit_rate' in metrics_found:
+                hit_rate = metrics_found['vllm:gpu_prefix_cache_hit_rate']
+                key_metrics['gpu_prefix_cache_hit_rate'] = hit_rate
+                key_metrics['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
+                logger.info(f"🎯 Prefix Cache Hit Rate: {hit_rate * 100:.1f}%")
+                
+                # Provide GGR effectiveness feedback
+                if hit_rate > 0.7:
+                    logger.info("✅ HIGH prefix cache hit rate - GGR ordering is effective!")
+                elif hit_rate > 0.3:
+                    logger.info("⚠️  Moderate prefix cache hit rate - GGR showing some benefit")
+                else:
+                    logger.info("❌ Low prefix cache hit rate - consider optimizing data ordering")
+            
+            # Request Queue Status
+            for metric_key in ['vllm:num_requests_running', 'vllm:num_requests_waiting', 'vllm:num_requests_swapped']:
+                if metric_key in metrics_found:
+                    clean_key = metric_key.replace('vllm:', '').replace('num_', '')
+                    key_metrics[clean_key] = metrics_found[metric_key]
+                    if metric_key == 'vllm:num_requests_running':
+                        logger.info(f"🏃 Running Requests: {metrics_found[metric_key]}")
+                    elif metric_key == 'vllm:num_requests_waiting':
+                        logger.info(f"⏳ Waiting Requests: {metrics_found[metric_key]}")
+            
+            # Token Processing Counters
+            if 'vllm:prompt_tokens_total' in metrics_found:
+                key_metrics['prompt_tokens_total'] = metrics_found['vllm:prompt_tokens_total']
+                logger.info(f"📝 Total Prompt Tokens: {metrics_found['vllm:prompt_tokens_total']}")
+            
+            if 'vllm:generation_tokens_total' in metrics_found:
+                key_metrics['generation_tokens_total'] = metrics_found['vllm:generation_tokens_total']
+                logger.info(f"🔤 Total Generation Tokens: {metrics_found['vllm:generation_tokens_total']}")
+            
+            # Performance Histograms Analysis
+            if histogram_data:
+                histogram_summary = {}
+                
+                # Time to First Token
+                if 'vllm:time_to_first_token_seconds' in histogram_data:
+                    ttft_data = histogram_data['vllm:time_to_first_token_seconds']
+                    if ttft_data.get('count', 0) > 0:
+                        avg_ttft = ttft_data['sum'] / ttft_data['count']
+                        histogram_summary['avg_time_to_first_token_seconds'] = avg_ttft
+                        logger.info(f"⚡ Avg Time to First Token: {avg_ttft:.3f}s")
+                
+                # Time per Output Token
+                if 'vllm:time_per_output_token_seconds' in histogram_data:
+                    tpot_data = histogram_data['vllm:time_per_output_token_seconds']
+                    if tpot_data.get('count', 0) > 0:
+                        avg_tpot = tpot_data['sum'] / tpot_data['count']
+                        histogram_summary['avg_time_per_output_token_seconds'] = avg_tpot
+                        logger.info(f"🔄 Avg Time per Output Token: {avg_tpot:.4f}s")
+                
+                # E2E Request Latency
+                if 'vllm:e2e_request_latency_seconds' in histogram_data:
+                    e2e_data = histogram_data['vllm:e2e_request_latency_seconds']
+                    if e2e_data.get('count', 0) > 0:
+                        avg_e2e = e2e_data['sum'] / e2e_data['count']
+                        histogram_summary['avg_e2e_latency_seconds'] = avg_e2e
+                        logger.info(f"🏁 Avg E2E Request Latency: {avg_e2e:.3f}s")
+                
+                key_metrics['histogram_summary'] = histogram_summary
+        
+        # Enhance stats with easy-to-access key metrics
+        stats['key_metrics'] = key_metrics
+        stats['prefix_caching_enabled'] = True  # We enable this in model config
+        
+        # Get comprehensive stats for detailed analysis
+        comprehensive_stats = self.vllm_metrics_collector.get_comprehensive_stats()
+        stats['comprehensive_analysis'] = comprehensive_stats
+        
+        # Add Prometheus metrics snapshot for backward compatibility
+        prometheus_snapshot = self.vllm_metrics_collector.get_prometheus_metrics()
+        if prometheus_snapshot:
+            stats['prometheus_snapshot'] = prometheus_snapshot
+        
+        return stats
     
     def format_row_data(self, row: pd.Series, query_key: str) -> Dict[str, Any]:
         """Format row data based on query type"""
@@ -1531,12 +1681,61 @@ class SimpleLLMExperiment:
             # vLLM metrics
             f.write(f"## vLLM Engine Metrics\n\n")
             vllm_metrics = experiment_results['vllm_metrics']
-            f.write(f"- **Prefix Caching Enabled**: {vllm_metrics['prefix_caching_enabled']}\n")
+            f.write(f"- **Prefix Caching Enabled**: {vllm_metrics.get('prefix_caching_enabled', True)}\n")
             
             initial_stats = vllm_metrics['initial_stats']
             final_stats = vllm_metrics['final_stats']
             
-            if initial_stats.get('vllm_stats_available', False):
+            # Check if we have new Prometheus-style metrics
+            if final_stats.get('stats_available', False):
+                # New Prometheus metrics structure
+                key_metrics = final_stats.get('key_metrics', {})
+                
+                f.write(f"### KV Cache Performance\n")
+                if 'gpu_cache_usage_percent' in key_metrics:
+                    f.write(f"- **GPU Cache Usage**: {key_metrics['gpu_cache_usage_percent']:.1f}%\n")
+                    
+                if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                    hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                    f.write(f"- **Prefix Cache Hit Rate**: {hit_rate:.1f}%\n")
+                    
+                    # Provide GGR effectiveness analysis
+                    if hit_rate > 70:
+                        f.write(f"  - ✅ **EXCELLENT** - High hit rate indicates very effective GGR ordering!\n")
+                    elif hit_rate > 40:
+                        f.write(f"  - ⚠️ **GOOD** - Moderate hit rate shows GGR providing benefits\n")
+                    elif hit_rate > 15:
+                        f.write(f"  - 📈 **FAIR** - Some prefix reuse, room for optimization\n")
+                    else:
+                        f.write(f"  - ❌ **POOR** - Low hit rate, consider data ordering optimization\n")
+                else:
+                    f.write(f"- **Prefix Cache Hit Rate**: Not available (may be deprecated in this vLLM version)\n")
+                
+                f.write(f"\n### Request Processing\n")
+                if 'requests_running' in key_metrics:
+                    f.write(f"- **Running Requests**: {key_metrics['requests_running']}\n")
+                if 'requests_waiting' in key_metrics:
+                    f.write(f"- **Waiting Requests**: {key_metrics['requests_waiting']}\n")
+                
+                f.write(f"\n### Token Statistics\n")
+                if 'prompt_tokens_total' in key_metrics:
+                    f.write(f"- **Total Prompt Tokens**: {key_metrics['prompt_tokens_total']:,}\n")
+                if 'generation_tokens_total' in key_metrics:
+                    f.write(f"- **Total Generation Tokens**: {key_metrics['generation_tokens_total']:,}\n")
+                
+                # Performance histograms
+                histogram_summary = key_metrics.get('histogram_summary', {})
+                if histogram_summary:
+                    f.write(f"\n### Performance Latencies\n")
+                    if 'avg_time_to_first_token_seconds' in histogram_summary:
+                        f.write(f"- **Average Time to First Token**: {histogram_summary['avg_time_to_first_token_seconds']:.3f}s\n")
+                    if 'avg_time_per_output_token_seconds' in histogram_summary:
+                        f.write(f"- **Average Time per Output Token**: {histogram_summary['avg_time_per_output_token_seconds']:.4f}s\n")
+                    if 'avg_e2e_latency_seconds' in histogram_summary:
+                        f.write(f"- **Average E2E Request Latency**: {histogram_summary['avg_e2e_latency_seconds']:.3f}s\n")
+                        
+            elif initial_stats.get('stats_available', False) or final_stats.get('stats_available', False):
+                # Legacy or partial metrics available
                 f.write(f"- **Initial KV Cache Usage**: {initial_stats.get('gpu_cache_usage_sys', 'N/A')}\n")
                 f.write(f"- **Final KV Cache Usage**: {final_stats.get('gpu_cache_usage_sys', 'N/A')}\n")
                 f.write(f"- **Prefix Cache Hit Rate**: {final_stats.get('gpu_prefix_cache_hit_rate', 'N/A')}\n")
@@ -1545,65 +1744,53 @@ class SimpleLLMExperiment:
                     hit_rate = final_stats['gpu_prefix_cache_hit_rate'] * 100
                     f.write(f"  - **Hit Rate Percentage**: {hit_rate:.1f}%\n")
             else:
-                f.write(f"- **vLLM Internal Stats**: Not available in this version\n")
-                if 'vllm_stats_error' in initial_stats:
-                    f.write(f"  - Error: {initial_stats['vllm_stats_error']}\n")
+                f.write(f"- **vLLM Prometheus Metrics**: Not available\n")
+                f.write(f"  - This may be due to vLLM version compatibility or prometheus_client unavailability\n")
+                if 'error' in initial_stats:
+                    f.write(f"  - Error: {initial_stats['error']}\n")
+            
             f.write(f"\n")
             
-            # Add comprehensive vLLM metrics if available
-            if 'comprehensive_stats' in vllm_metrics:
-                comp_stats = vllm_metrics['comprehensive_stats']
-                f.write(f"\n### Modern vLLM Metrics Summary\n\n")
-                f.write(f"- **Monitoring Active**: {comp_stats.get('monitoring_active', False)}\n")
-                f.write(f"- **Total Collections**: {comp_stats.get('total_collections', 0)}\n")
-                f.write(f"- **Collection Interval**: {comp_stats.get('collection_interval', 1.0)}s\n")
-                f.write(f"- **Modern Metrics Enabled**: {comp_stats.get('modern_metrics_enabled', False)}\n")
+            # Add comprehensive vLLM metrics analysis if available
+            comprehensive_analysis = final_stats.get('comprehensive_analysis', {})
+            if comprehensive_analysis and comprehensive_analysis.get('monitoring_active', False):
+                f.write(f"### Detailed Prometheus Metrics Analysis\n\n")
+                f.write(f"- **Monitoring Active**: {comprehensive_analysis.get('monitoring_active', False)}\n")
+                f.write(f"- **Total Collections**: {comprehensive_analysis.get('total_collections', 0)}\n")
+                f.write(f"- **Collection Interval**: {comprehensive_analysis.get('collection_interval', 1.0)}s\n")
+                f.write(f"- **Modern Metrics Enabled**: {comprehensive_analysis.get('modern_metrics_enabled', False)}\n")
                 
-                # Prometheus-style metrics summary
-                if 'prometheus_metrics' in comp_stats:
-                    prom_metrics = comp_stats['prometheus_metrics']
-                    f.write(f"\n#### Prometheus-Style Metrics\n")
+                # Key metrics summary from comprehensive analysis
+                key_metrics_comp = comprehensive_analysis.get('key_metrics', {})
+                if key_metrics_comp:
+                    f.write(f"\n#### Key Performance Indicators\n")
                     
-                    # GPU Cache metrics
-                    gpu_cache = prom_metrics.get('gpu_cache_usage_perc', {})
-                    if gpu_cache.get('values_count', 0) > 0:
-                        f.write(f"- **GPU Cache Usage**: {gpu_cache.get('mean', 0)*100:.1f}% avg, {gpu_cache.get('max', 0)*100:.1f}% peak ({gpu_cache['values_count']} samples)\n")
+                    if 'gpu_cache_usage_percent' in key_metrics_comp:
+                        f.write(f"- **GPU Cache Usage**: {key_metrics_comp['gpu_cache_usage_percent']:.1f}%\n")
                     
-                    # Token counters
-                    token_stats = prom_metrics.get('token_counters', {})
-                    if token_stats.get('prompt_tokens_total', 0) > 0 or token_stats.get('generation_tokens_total', 0) > 0:
-                        f.write(f"- **Tokens Processed**: {token_stats.get('prompt_tokens_total', 0):,} prompt, {token_stats.get('generation_tokens_total', 0):,} generation\n")
+                    if 'gpu_prefix_cache_hit_rate_percent' in key_metrics_comp:
+                        f.write(f"- **Prefix Cache Hit Rate**: {key_metrics_comp['gpu_prefix_cache_hit_rate_percent']:.1f}%\n")
                     
-                    # Request queue metrics
-                    queue_stats = prom_metrics.get('request_queue_stats', {})
-                    f.write(f"- **Request Queue Samples**: {queue_stats.get('running_requests_count', 0)} running, {queue_stats.get('waiting_requests_count', 0)} waiting, {queue_stats.get('swapped_requests_count', 0)} swapped\n")
+                    for metric_key in ['requests_running', 'requests_waiting']:
+                        if metric_key in key_metrics_comp:
+                            metric_name = metric_key.replace('_', ' ').title()
+                            f.write(f"- **{metric_name}**: {key_metrics_comp[metric_key]}\n")
                 
-                # Cache utilization stats
-                if comp_stats.get('cache_usage_mean') is not None:
-                    f.write(f"\n#### KV Cache Utilization\n")
-                    f.write(f"- **Average Usage**: {comp_stats['cache_usage_mean']:.3f}\n")
-                    f.write(f"- **Peak Usage**: {comp_stats['cache_usage_max']:.3f}\n")
-                    f.write(f"- **Usage Standard Deviation**: {comp_stats.get('cache_usage_std', 0):.3f}\n")
-                
-                # Prefix cache hit rate stats
-                if comp_stats.get('prefix_cache_hit_rate_mean') is not None:
-                    f.write(f"\n#### Prefix Cache Performance\n")
-                    f.write(f"- **Average Hit Rate**: {comp_stats['prefix_cache_hit_rate_mean']*100:.1f}%\n")
-                    f.write(f"- **Peak Hit Rate**: {comp_stats['prefix_cache_hit_rate_max']*100:.1f}%\n")
-                    f.write(f"- **Minimum Hit Rate**: {comp_stats.get('prefix_cache_hit_rate_min', 0)*100:.1f}%\n")
-                
-                # Request queue stats
-                request_queue_written = False
-                for metric in ['num_requests_running', 'num_requests_waiting', 'num_requests_swapped']:
-                    mean_key = f'{metric}_mean'
-                    max_key = f'{metric}_max'
-                    if comp_stats.get(mean_key) is not None:
-                        if not request_queue_written:
-                            f.write(f"\n#### Request Queue Statistics\n")
-                            request_queue_written = True
-                        metric_name = metric.replace('_', ' ').title()
-                        f.write(f"- **{metric_name} (Avg)**: {comp_stats[mean_key]:.1f}\n")
-                        f.write(f"- **{metric_name} (Max)**: {comp_stats[max_key]:.1f}\n")
+                # Histogram analysis from comprehensive stats
+                histogram_analysis = comprehensive_analysis.get('histogram_analysis', {})
+                if histogram_analysis:
+                    f.write(f"\n#### Performance Histogram Analysis\n")
+                    if 'avg_time_to_first_token_seconds' in histogram_analysis:
+                        f.write(f"- **TTFT Average**: {histogram_analysis['avg_time_to_first_token_seconds']:.3f}s\n")
+                        f.write(f"- **TTFT Samples**: {histogram_analysis.get('total_ttft_requests', 0)}\n")
+                    
+                    if 'avg_time_per_output_token_seconds' in histogram_analysis:
+                        f.write(f"- **TPOT Average**: {histogram_analysis['avg_time_per_output_token_seconds']:.4f}s\n")
+                        f.write(f"- **TPOT Samples**: {histogram_analysis.get('total_tpot_samples', 0)}\n")
+                    
+                    if 'avg_e2e_latency_seconds' in histogram_analysis:
+                        f.write(f"- **E2E Latency Average**: {histogram_analysis['avg_e2e_latency_seconds']:.3f}s\n")
+                        f.write(f"- **E2E Requests**: {histogram_analysis.get('total_e2e_requests', 0)}\n")
             
             f.write(f"\n")
             
