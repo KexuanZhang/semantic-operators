@@ -110,10 +110,10 @@ class GGRAlgorithm:
             'single_col_cases': 0
         }
     
-    def apply_ggr(self, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]]) -> Tuple[int, List[List[str]], Dict[str, Any]]:
+    def apply_ggr(self, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]]) -> Tuple[int, pd.DataFrame, Dict[str, Any]]:
         """
         Apply GGR algorithm to reorder the table
-        Returns (total_phc_score, reordered_table, statistics)
+        Returns (total_phc_score, reordered_dataframe, statistics)
         """
         logger.info(f"Applying GGR algorithm to table with shape {table.shape}")
         logger.info(f"Using {len(functional_dependencies)} functional dependencies")
@@ -136,7 +136,7 @@ class GGRAlgorithm:
             'phc_score': phc_score,
             'execution_time_seconds': end_time - start_time,
             'original_table_shape': table.shape,
-            'reordered_table_length': len(reordered_table),
+            'reordered_table_shape': reordered_table.shape,
             'max_recursion_depth': self.recursion_stats['max_depth_reached'],
             'total_recursive_calls': self.recursion_stats['total_calls'],
             'single_row_cases': self.recursion_stats['single_row_cases'],
@@ -145,20 +145,21 @@ class GGRAlgorithm:
         }
         
         logger.info(f"GGR completed: PHC Score = {phc_score}, Time = {stats['execution_time_seconds']:.2f}s")
+        logger.info(f"Original shape: {table.shape} -> Reordered shape: {reordered_table.shape}")
         
         return phc_score, reordered_table, stats
     
-    def _ggr_recursive(self, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]], depth: int = 0) -> Tuple[int, List[List[str]]]:
-        """Recursive GGR implementation"""
+    def _ggr_recursive(self, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]], depth: int = 0) -> Tuple[int, pd.DataFrame]:
+        """Recursive GGR implementation that preserves original rows"""
         self.recursion_stats['total_calls'] += 1
         self.recursion_stats['max_depth_reached'] = max(self.recursion_stats['max_depth_reached'], depth)
         
         logger.debug(f"GGR: Depth {depth}, Table Size: {table.shape}")
         
         # Base conditions
-        if table.shape[0] == 1:  # Single row case
+        if table.shape[0] <= 1:  # Single row or empty case
             self.recursion_stats['single_row_cases'] += 1
-            return 0, table.iloc[0].tolist()
+            return 0, table.copy()
         
         if table.shape[1] == 1:  # Single column case
             self.recursion_stats['single_col_cases'] += 1
@@ -168,12 +169,12 @@ class GGRAlgorithm:
                 else len(str(value))**2
                 for value in sorted_table.iloc[:, 0]
             )
-            return phc_score, sorted_table.values.tolist()
+            return phc_score, sorted_table.copy()
         
         # Prevent excessive recursion
         if depth >= self.max_depth:
             logger.warning(f"Maximum recursion depth {self.max_depth} reached")
-            return 0, []
+            return 0, table.copy()
         
         # Find the best field and value combination
         max_hit_count, best_value, best_field, best_cols = -1, None, None, []
@@ -186,57 +187,72 @@ class GGRAlgorithm:
                     max_hit_count, best_value, best_field, best_cols = hit_count, value, field, cols
         
         if best_field is None:  # No valid field found
-            logger.warning("No valid field found, returning empty result")
-            return 0, []
+            logger.warning("No valid field found, returning original table")
+            return 0, table.copy()
         
         logger.debug(f"Best choice: field={best_field}, value={best_value}, hit_count={max_hit_count}")
         
-        # Split the table
+        # Split the table while preserving row indices
         if pd.isna(best_value):
-            rows_with_value = table[table[best_field].isna()]
-            remaining_rows = table[~table[best_field].isna()]
+            rows_with_value = table[table[best_field].isna()].copy()
+            remaining_rows = table[~table[best_field].isna()].copy()
         else:
-            rows_with_value = table[table[best_field] == best_value]
-            remaining_rows = table[table[best_field] != best_value]
+            rows_with_value = table[table[best_field] == best_value].copy()
+            remaining_rows = table[table[best_field] != best_value].copy()
         
         # Recursive calls
         hit_count_A, reordered_A = self._ggr_recursive(remaining_rows, functional_dependencies, depth + 1)
         
-        # Remove the columns that are functionally determined
-        remaining_cols = [col for col in rows_with_value.columns if col not in best_cols]
-        if remaining_cols:
-            rows_subset = rows_with_value[remaining_cols]
-            hit_count_B, reordered_B = self._ggr_recursive(rows_subset, functional_dependencies, depth + 1)
-        else:
-            hit_count_B, reordered_B = 0, []
+        # For rows with the same value, we don't need to recurse if they have functional dependencies
+        # Just group them together since they share the prefix
+        hit_count_B = 0
+        reordered_B = rows_with_value.copy()
         
-        # Combine results
+        # Only recurse on the subset if there are remaining columns after removing functional dependencies
+        remaining_cols = [col for col in rows_with_value.columns if col not in best_cols]
+        if len(remaining_cols) > 1 and len(rows_with_value) > 1:
+            # Create a subset for recursion, but we'll merge results back properly
+            rows_subset = rows_with_value[remaining_cols].copy()
+            hit_count_B, reordered_subset = self._ggr_recursive(rows_subset, functional_dependencies, depth + 1)
+            
+            # Reconstruct the full rows by mapping the reordered subset back to original rows
+            if not reordered_subset.empty and len(reordered_subset) == len(rows_with_value):
+                # Create a mapping from subset to original rows
+                subset_to_original = {}
+                for i, (_, subset_row) in enumerate(reordered_subset.iterrows()):
+                    for j, (orig_idx, orig_row) in enumerate(rows_with_value.iterrows()):
+                        # Check if this original row matches the subset row
+                        match = True
+                        for col in remaining_cols:
+                            if col in subset_row and col in orig_row:
+                                if str(subset_row[col]) != str(orig_row[col]):
+                                    match = False
+                                    break
+                        if match and j not in subset_to_original.values():
+                            subset_to_original[i] = orig_idx
+                            break
+                
+                # Reorder the original rows based on the subset ordering
+                if len(subset_to_original) == len(rows_with_value):
+                    reordered_indices = [subset_to_original[i] for i in range(len(reordered_subset))]
+                    reordered_B = rows_with_value.loc[reordered_indices].copy()
+        
+        # Combine results: rows with best_value first, then remaining rows
         total_hit_count = hit_count_A + hit_count_B + max_hit_count
         
-        # Create the reordered result list
-        reordered_list = []
+        # Concatenate the reordered sections
+        result_frames = []
+        if not reordered_B.empty:
+            result_frames.append(reordered_B)
+        if not reordered_A.empty:
+            result_frames.append(reordered_A)
         
-        # Handle best_value rows (with functional dependencies removed)
-        if len(reordered_B) == 0:
-            # Single value case - create a row with just the best value
-            reordered_list.append([str(best_value)])
+        if result_frames:
+            combined_result = pd.concat(result_frames, ignore_index=True)
         else:
-            # Multiple rows case - prepend best_value to each row in reordered_B  
-            for row in reordered_B:
-                if isinstance(row, list):
-                    reordered_list.append([str(best_value)] + [str(item) for item in row])
-                else:
-                    reordered_list.append([str(best_value), str(row)])
+            combined_result = pd.DataFrame(columns=table.columns)
         
-        # Add the remaining rows (reordered_A)
-        if isinstance(reordered_A, list):
-            for row in reordered_A:
-                if isinstance(row, list):
-                    reordered_list.append([str(item) for item in row])
-                else:
-                    reordered_list.append([str(row)])
-        
-        return total_hit_count, reordered_list
+        return total_hit_count, combined_result
     
     def _calculate_hit_count(self, value: Any, field: str, table: pd.DataFrame, functional_dependencies: List[Tuple[str, str]]) -> Tuple[int, List[str]]:
         """Calculate hit count for a value in a field"""
@@ -314,26 +330,7 @@ class GGRProcessor:
         
         # Apply GGR algorithm
         self.ggr_algorithm.max_depth = max_depth
-        phc_score, reordered_table, ggr_stats = self.ggr_algorithm.apply_ggr(df, functional_dependencies)
-        
-        # Convert reordered table back to DataFrame
-        if reordered_table:
-            # Determine the appropriate number of columns
-            max_cols = max(len(row) for row in reordered_table) if reordered_table else 0
-            
-            # Pad rows to have the same length
-            padded_rows = []
-            for row in reordered_table:
-                padded_row = row + [''] * (max_cols - len(row))
-                padded_rows.append(padded_row)
-            
-            # Create column names
-            original_cols = df.columns.tolist()
-            col_names = original_cols + [f"col_{i}" for i in range(len(original_cols), max_cols)]
-            
-            reordered_df = pd.DataFrame(padded_rows, columns=col_names[:max_cols])
-        else:
-            reordered_df = pd.DataFrame()
+        phc_score, reordered_df, ggr_stats = self.ggr_algorithm.apply_ggr(df, functional_dependencies)
         
         # Prepare results
         results = {
