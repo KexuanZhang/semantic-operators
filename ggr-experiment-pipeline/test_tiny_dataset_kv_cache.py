@@ -26,11 +26,15 @@ logger = logging.getLogger(__name__)
 class TinyDatasetKVCacheTest:
     """Test KV cache stats with a tiny dataset during actual inference"""
     
-    def __init__(self):
+    def __init__(self, gpu_id: int = 0):
         self.model_name = "microsoft/DialoGPT-small"  # Small model for fast testing
+        self.gpu_id = gpu_id  # GPU device to use
         self.llm = None
         self.metrics_collector = None
         self.test_results = {}
+        
+        # Set GPU device via environment variable (most reliable method)
+        self.set_gpu_device(gpu_id)
         
         # Tiny test dataset - designed to trigger cache hits with shared prefixes
         self.tiny_dataset = [
@@ -50,6 +54,33 @@ class TinyDatasetKVCacheTest:
             "Rate this product review: 'The quality surpassed my expectations.'"
         ]
     
+    def set_gpu_device(self, gpu_id: int):
+        """Set GPU device for vLLM to use"""
+        import os
+        import torch
+        
+        if torch.cuda.is_available():
+            gpu_count = torch.cuda.device_count()
+            if gpu_id >= gpu_count:
+                print(f"⚠️  Warning: GPU {gpu_id} not available. Available GPUs: 0-{gpu_count-1}")
+                print(f"   Falling back to GPU 0")
+                gpu_id = 0
+            
+            # Set CUDA_VISIBLE_DEVICES to specify which GPU to use
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+            
+            print(f"🎯 GPU device set to: GPU {gpu_id}")
+            if gpu_count > 0:
+                try:
+                    gpu_name = torch.cuda.get_device_name(gpu_id)
+                    gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+                    print(f"   GPU {gpu_id}: {gpu_name} ({gpu_memory:.1f} GB)")
+                except:
+                    print(f"   GPU {gpu_id}: Available")
+        else:
+            print(f"❌ CUDA not available - will use CPU (very slow)")
+            self.gpu_id = -1  # Indicate CPU usage
+    
     def setup_vllm(self) -> bool:
         """Set up vLLM with optimal settings for KV cache testing"""
         print("🚀 Setting up vLLM for KV cache testing...")
@@ -64,7 +95,14 @@ class TinyDatasetKVCacheTest:
                 enable_prefix_caching=True,  # Essential for KV cache hit testing
                 gpu_memory_utilization=0.5,  # Conservative for testing
                 tensor_parallel_size=1,
-                disable_log_stats=False  # Enable internal stats
+                disable_log_stats=False,  # Enable internal stats
+                # GPU device selection - MODIFY THIS LINE TO SET YOUR GPU
+                # Option 1: Single GPU (replace 0 with your desired GPU ID)
+                # device="cuda:0",  # Use GPU 0
+                # Option 2: Multiple GPUs  
+                # device="cuda:0,1",  # Use GPUs 0 and 1
+                # Option 3: Auto-detect (default)
+                # device="auto",  # Let vLLM choose
                 # Note: disable_log_requests removed for compatibility
             )
             
@@ -493,11 +531,20 @@ class TinyDatasetKVCacheTest:
 
 def main():
     """Main function to run tiny dataset KV cache test"""
+    import argparse
+    
+    # Add command line argument for GPU selection
+    parser = argparse.ArgumentParser(description='Test KV cache stats with tiny dataset')
+    parser.add_argument('--gpu', type=int, default=0, 
+                       help='GPU device ID to use (default: 0)')
+    args = parser.parse_args()
+    
     print("🚀 Tiny Dataset KV Cache Stats Validation")
     print("Testing real KV cache values with shared prefixes")
     print("=" * 60)
+    print(f"🎯 Using GPU: {args.gpu}")
     
-    test_suite = TinyDatasetKVCacheTest()
+    test_suite = TinyDatasetKVCacheTest(gpu_id=args.gpu)
     
     try:
         results = test_suite.run_complete_test()
