@@ -557,6 +557,190 @@ class VLLMMetricsCollector:
             logger.warning(f"Failed to initialize vLLM metrics: {e}")
             return False
     
+    def collect_internal_stats(self) -> Dict[str, Any]:
+        """Access vLLM's internal Stats object directly using private _get_stats() method"""
+        stats_data = {
+            'stats_available': False,
+            'collection_method': 'internal_stats',
+            'collection_time': time.time(),
+            'metrics_found': {},
+            'debug_info': {}
+        }
+        
+        try:
+            if not self.llm or not hasattr(self.llm, 'llm_engine'):
+                stats_data['error'] = 'No LLM engine available'
+                return stats_data
+            
+            engine = self.llm.llm_engine
+            stats_data['debug_info']['engine_type'] = type(engine).__name__
+            
+            # Method 1: Try to access _get_stats() directly (V0 and some V1 engines)
+            if hasattr(engine, '_get_stats'):
+                try:
+                    # Call the private _get_stats method
+                    stats = engine._get_stats(scheduler_outputs=None)
+                    stats_data['debug_info']['stats_method'] = '_get_stats()'
+                    
+                    if stats:
+                        # Extract all available metrics from Stats object
+                        metrics = {}
+                        
+                        # KV Cache metrics - MOST IMPORTANT
+                        if hasattr(stats, 'gpu_cache_usage_sys'):
+                            metrics['gpu_cache_usage_sys'] = stats.gpu_cache_usage_sys
+                        if hasattr(stats, 'gpu_prefix_cache_hit_rate'):
+                            metrics['gpu_prefix_cache_hit_rate'] = stats.gpu_prefix_cache_hit_rate
+                        if hasattr(stats, 'cpu_cache_usage_sys'):
+                            metrics['cpu_cache_usage_sys'] = stats.cpu_cache_usage_sys
+                        if hasattr(stats, 'cpu_prefix_cache_hit_rate'):
+                            metrics['cpu_prefix_cache_hit_rate'] = stats.cpu_prefix_cache_hit_rate
+                        
+                        # Scheduler state
+                        if hasattr(stats, 'num_running_sys'):
+                            metrics['num_running_sys'] = stats.num_running_sys
+                        if hasattr(stats, 'num_waiting_sys'):
+                            metrics['num_waiting_sys'] = stats.num_waiting_sys
+                        if hasattr(stats, 'num_swapped_sys'):
+                            metrics['num_swapped_sys'] = stats.num_swapped_sys
+                        
+                        # Token processing
+                        if hasattr(stats, 'num_prompt_tokens_iter'):
+                            metrics['prompt_tokens_total'] = stats.num_prompt_tokens_iter
+                        if hasattr(stats, 'num_generation_tokens_iter'):
+                            metrics['generation_tokens_total'] = stats.num_generation_tokens_iter
+                        if hasattr(stats, 'num_tokens_iter'):
+                            metrics['tokens_total'] = stats.num_tokens_iter
+                        
+                        # Performance metrics
+                        if hasattr(stats, 'time_to_first_tokens_iter') and stats.time_to_first_tokens_iter:
+                            avg_ttft = sum(stats.time_to_first_tokens_iter) / len(stats.time_to_first_tokens_iter)
+                            metrics['avg_time_to_first_token_seconds'] = avg_ttft
+                        if hasattr(stats, 'time_per_output_tokens_iter') and stats.time_per_output_tokens_iter:
+                            avg_tpot = sum(stats.time_per_output_tokens_iter) / len(stats.time_per_output_tokens_iter)
+                            metrics['avg_time_per_output_token_seconds'] = avg_tpot
+                        
+                        # Request metrics  
+                        if hasattr(stats, 'num_preemption_iter'):
+                            metrics['num_preemptions'] = stats.num_preemption_iter
+                        if hasattr(stats, 'time_e2e_requests') and stats.time_e2e_requests:
+                            metrics['avg_e2e_latency_seconds'] = sum(stats.time_e2e_requests) / len(stats.time_e2e_requests)
+                        
+                        stats_data['metrics_found'] = metrics
+                        stats_data['stats_available'] = True
+                        stats_data['debug_info']['metrics_extracted'] = len(metrics)
+                        
+                        logger.debug(f"✅ Extracted {len(metrics)} metrics from internal Stats object")
+                        if 'gpu_cache_usage_sys' in metrics:
+                            logger.debug(f"🗄️ GPU Cache Usage: {metrics['gpu_cache_usage_sys']*100:.1f}%")
+                        if 'gpu_prefix_cache_hit_rate' in metrics:
+                            logger.debug(f"🎯 GPU Prefix Cache Hit Rate: {metrics['gpu_prefix_cache_hit_rate']*100:.1f}%")
+                        
+                        return stats_data
+                    else:
+                        stats_data['debug_info']['stats_result'] = 'None returned from _get_stats()'
+                        
+                except Exception as e:
+                    stats_data['debug_info']['_get_stats_error'] = str(e)
+                    logger.debug(f"Error calling _get_stats(): {e}")
+            
+            # Method 2: Try to access scheduler's cache manager directly
+            if hasattr(engine, 'scheduler'):
+                try:
+                    schedulers = engine.scheduler if isinstance(engine.scheduler, list) else [engine.scheduler]
+                    stats_data['debug_info']['scheduler_access'] = 'found_schedulers'
+                    
+                    metrics = {}
+                    for i, scheduler in enumerate(schedulers):
+                        if hasattr(scheduler, 'block_manager'):
+                            block_manager = scheduler.block_manager
+                            
+                            # Get KV cache usage directly from block manager
+                            if hasattr(block_manager, 'get_num_free_gpu_blocks'):
+                                free_gpu = block_manager.get_num_free_gpu_blocks()
+                                if hasattr(engine, 'cache_config') and engine.cache_config.num_gpu_blocks:
+                                    total_gpu = engine.cache_config.num_gpu_blocks
+                                    gpu_usage = 1.0 - (free_gpu / total_gpu)
+                                    metrics['gpu_cache_usage_sys'] = gpu_usage
+                                    logger.debug(f"📊 Direct GPU cache usage: {gpu_usage*100:.1f}%")
+                            
+                            # Get CPU cache usage if available
+                            if hasattr(block_manager, 'get_num_free_cpu_blocks'):
+                                free_cpu = block_manager.get_num_free_cpu_blocks()
+                                if hasattr(engine, 'cache_config') and engine.cache_config.num_cpu_blocks:
+                                    total_cpu = engine.cache_config.num_cpu_blocks
+                                    cpu_usage = 1.0 - (free_cpu / total_cpu)
+                                    metrics['cpu_cache_usage_sys'] = cpu_usage
+                        
+                        # Try to get prefix cache hit rates
+                        if hasattr(scheduler, 'get_prefix_cache_hit_rate'):
+                            try:
+                                # Try different ways to access Device enum
+                                try:
+                                    # Method 1: Try vllm.utils.Device
+                                    from vllm.utils import Device
+                                    gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
+                                    cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
+                                    metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                    metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
+                                    logger.debug(f"🎯 Direct prefix cache hit rates: GPU {gpu_hit_rate*100:.1f}%, CPU {cpu_hit_rate*100:.1f}%")
+                                except (ImportError, AttributeError):
+                                    try:
+                                        # Method 2: Try vllm.executor.executor_base.Device
+                                        from vllm.executor.executor_base import Device
+                                        gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
+                                        cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
+                                        metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                        metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
+                                        logger.debug(f"🎯 Direct prefix cache hit rates: GPU {gpu_hit_rate*100:.1f}%, CPU {cpu_hit_rate*100:.1f}%")
+                                    except (ImportError, AttributeError):
+                                        try:
+                                            # Method 3: Fallback - try with string values or int values
+                                            gpu_hit_rate = scheduler.get_prefix_cache_hit_rate("gpu")
+                                            cpu_hit_rate = scheduler.get_prefix_cache_hit_rate("cpu")
+                                            metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                            metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
+                                        except:
+                                            # Try with integer values (0=GPU, 1=CPU)
+                                            try:
+                                                gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(0)
+                                                cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(1)
+                                                metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                                metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
+                                            except:
+                                                pass
+                            except Exception as e:
+                                stats_data['debug_info']['cache_hit_rate_error'] = str(e)
+                    
+                    if metrics:
+                        stats_data['metrics_found'] = metrics
+                        stats_data['stats_available'] = True
+                        stats_data['debug_info']['metrics_extracted'] = len(metrics)
+                        stats_data['debug_info']['extraction_method'] = 'direct_scheduler_access'
+                        logger.debug(f"✅ Extracted {len(metrics)} metrics via direct scheduler access")
+                        return stats_data
+                        
+                except Exception as e:
+                    stats_data['debug_info']['scheduler_access_error'] = str(e)
+                    
+            # Method 3: Try to access model execution stats
+            if hasattr(engine, 'model_executor'):
+                try:
+                    stats_data['debug_info']['model_executor_access'] = 'attempting'
+                    # This is more complex and engine-version dependent
+                    # Could potentially access worker stats here
+                except Exception as e:
+                    stats_data['debug_info']['model_executor_error'] = str(e)
+            
+            stats_data['error'] = 'No accessible internal stats methods found'
+            return stats_data
+            
+        except Exception as e:
+            stats_data['error'] = f'Error accessing internal stats: {str(e)}'
+            stats_data['debug_info']['exception'] = str(e)
+            logger.debug(f"Error in collect_internal_stats: {e}")
+            return stats_data
+
     def collect_prometheus_metrics(self) -> Dict[str, Any]:
         """Enhanced Prometheus metrics collection with better debugging and fallback methods"""
         if not prometheus_available:
@@ -569,6 +753,49 @@ class VLLMMetricsCollector:
         metrics_data = {
             'stats_available': False,
             'collection_method': 'prometheus_registry',
+            'collection_time': time.time(),
+            'metrics_found': {},
+            'histogram_data': {},
+            'debug_info': {}
+        }
+        
+        try:
+            # First, try internal stats collection (preferred method for offline inference)
+            internal_stats = self.collect_internal_stats()
+            if internal_stats.get('stats_available', False):
+                # Merge internal stats with prometheus structure
+                metrics_data.update(internal_stats)
+                metrics_data['collection_method'] = 'internal_stats_primary'
+                logger.debug("🎯 Using internal stats as primary collection method")
+                
+                # Still try to get Prometheus metrics as supplementary data
+                try:
+                    prometheus_stats = self._collect_prometheus_registry_only()
+                    if prometheus_stats.get('stats_available', False):
+                        # Merge with internal stats (internal takes priority)
+                        prometheus_metrics = prometheus_stats.get('metrics_found', {})
+                        for key, value in prometheus_metrics.items():
+                            if key not in metrics_data['metrics_found']:
+                                metrics_data['metrics_found'][key] = value
+                        metrics_data['debug_info']['prometheus_supplement'] = len(prometheus_metrics)
+                except Exception as e:
+                    metrics_data['debug_info']['prometheus_supplement_error'] = str(e)
+                
+                return metrics_data
+            
+            # Fallback to Prometheus-only collection
+            return self._collect_prometheus_registry_only()
+            
+        except Exception as e:
+            metrics_data['error'] = f'Error in metrics collection: {str(e)}'
+            metrics_data['debug_info']['exception'] = str(e)
+            return metrics_data
+    
+    def _collect_prometheus_registry_only(self) -> Dict[str, Any]:
+        """Original Prometheus registry collection method"""
+        metrics_data = {
+            'stats_available': False,
+            'collection_method': 'prometheus_registry_only',
             'collection_time': time.time(),
             'metrics_found': {},
             'histogram_data': {},
@@ -673,38 +900,33 @@ class VLLMMetricsCollector:
                 logger.debug(f"Could not access stat loggers: {e}")
                 metrics_data['debug_info']['stat_logger_error'] = str(e)
             
-            # Update metrics data
+            # Update metrics data with findings
+            metrics_data['metrics_found'] = found_vllm_metrics
+            metrics_data['histogram_data'] = found_histograms
+            metrics_data['total_metrics_found'] = len(found_vllm_metrics)
+            metrics_data['total_histograms_found'] = len(found_histograms)
+            
             if found_vllm_metrics or found_histograms:
-                metrics_data.update({
-                    'stats_available': True,
-                    'metrics_found': found_vllm_metrics,
-                    'histogram_data': found_histograms,
-                    'total_metrics_found': len(found_vllm_metrics),
-                    'total_histograms_found': len(found_histograms)
-                })
-                
-                logger.debug(f"✅ Collected {len(found_vllm_metrics)} metrics and {len(found_histograms)} histograms")
-                
-                # Log some key findings
-                cache_metrics = [k for k in found_vllm_metrics.keys() if 'cache' in k.lower()]
-                if cache_metrics:
-                    logger.debug(f"🗄️ Found cache metrics: {cache_metrics}")
-                
-                prefix_metrics = [k for k in found_vllm_metrics.keys() if 'prefix' in k.lower()]
-                if prefix_metrics:
-                    logger.debug(f"🎯 Found prefix metrics: {prefix_metrics}")
-                    
+                metrics_data['stats_available'] = True
+                logger.debug(f"✅ Prometheus registry collection: {len(found_vllm_metrics)} metrics, {len(found_histograms)} histograms")
             else:
-                metrics_data['error'] = 'No vLLM metrics found in any collection method'
-                logger.debug(f"❌ No vLLM metrics found. Scanned {len(all_metric_names)} total metrics")
-                logger.debug(f"Sample metric names: {all_metric_names[:10]}")
+                logger.debug("❌ No vLLM metrics found in Prometheus registry")
+                
+            # Log key findings for debugging
+            key_cache_metrics = [k for k in found_vllm_metrics.keys() if 'cache' in k.lower()]
+            if key_cache_metrics:
+                logger.debug(f"🗄️  Found cache metrics: {key_cache_metrics}")
+            
+            key_request_metrics = [k for k in found_vllm_metrics.keys() if any(term in k.lower() for term in ['running', 'waiting', 'queue'])]
+            if key_request_metrics:
+                logger.debug(f"⏳ Found request metrics: {key_request_metrics}")
                 
         except Exception as e:
-            metrics_data['error'] = f'Error collecting Prometheus metrics: {str(e)}'
-            logger.debug(f"Error collecting Prometheus metrics: {e}")
-            import traceback
-            metrics_data['debug_info']['exception_traceback'] = traceback.format_exc()
-        
+            logger.debug(f"Error in Prometheus registry collection: {e}")
+            metrics_data['stats_available'] = False
+            metrics_data['error'] = str(e)
+            metrics_data['debug_info']['exception'] = str(e)
+            
         return metrics_data
     
     def simulate_metrics_for_testing(self, duration_seconds: int = 30, interval: float = 1.0):
