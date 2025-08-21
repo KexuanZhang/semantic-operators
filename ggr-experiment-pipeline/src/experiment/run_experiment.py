@@ -1922,3 +1922,512 @@ class SimpleLLMExperiment:
         f.write(f"**Tool**: vLLM Experiment Pipeline with GGR Algorithm  \n")
         f.write(f"**Version**: Enhanced Metrics Collection  \n")
 
+    def create_prompt(self, template: Dict[str, str], data_fields: str, query: str = None) -> str:
+        """Create prompt from template and data"""
+        if query:
+            # Use custom query
+            prompt = template.get("prompt", SYSTEM_PROMPT.replace("{QUERY}", query))
+        else:
+            # Use template prompt
+            prompt = template.get("prompt", "Process the following data:")
+        
+        # Format with data fields  
+        if "{fields}" in SYSTEM_PROMPT:
+            full_prompt = SYSTEM_PROMPT.replace("{QUERY}", prompt).replace("{fields}", data_fields)
+        else:
+            full_prompt = f"{prompt}\n\nData: {data_fields}"
+            
+        return full_prompt
+    
+    def format_data_fields(self, row: pd.Series, max_length: int = 2000) -> str:
+        """Format data fields from DataFrame row"""
+        fields = {}
+        for col, val in row.items():
+            if pd.notna(val):
+                # Truncate long text fields
+                str_val = str(val)
+                if len(str_val) > max_length:
+                    str_val = str_val[:max_length] + "..."
+                fields[col] = str_val
+        
+        return json.dumps(fields, indent=2)
+    
+    def run_batch_inference(self, prompts: List[str], batch_size: int = 8) -> List[str]:
+        """Run inference on a batch of prompts"""
+        if not self.llm:
+            logger.error("Model not initialized!")
+            return []
+        
+        try:
+            # vLLM handles batching internally, but we can limit the batch size
+            results = self.llm.generate(prompts, self.sampling_params, use_tqdm=True)
+            
+            # Extract generated text from results
+            outputs = []
+            for result in results:
+                if result.outputs:
+                    # Get the first (and typically only) output
+                    generated_text = result.outputs[0].text.strip()
+                    outputs.append(generated_text)
+                else:
+                    outputs.append("")
+            
+            return outputs
+            
+        except Exception as e:
+            logger.error(f"Error in batch inference: {e}")
+            return [""] * len(prompts)
+    
+    def estimate_tokens(self, text: str) -> int:
+        """Rough token estimation (4 characters ≈ 1 token)"""
+        return len(text) // 4
+    
+    def run_experiment(self, 
+                      dataset_path: str, 
+                      query_key: str,
+                      custom_query: str = None,
+                      max_rows: int = None,
+                      batch_size: int = 8,
+                      output_prefix: str = None) -> Dict[str, Any]:
+        """Run complete experiment with comprehensive monitoring and reporting"""
+        
+        # Experiment setup
+        experiment_start_time = time.time()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if output_prefix:
+            output_folder = os.path.join(self.output_dir, f"{output_prefix}_{timestamp}")
+        else:
+            output_folder = os.path.join(self.output_dir, f"experiment_{timestamp}")
+        os.makedirs(output_folder, exist_ok=True)
+        
+        logger.info(f"🚀 Starting experiment: {query_key}")
+        logger.info(f"📁 Output folder: {output_folder}")
+        logger.info(f"🔧 Batch size: {batch_size}")
+        
+        try:
+            # Load dataset
+            logger.info("📊 Loading dataset...")
+            df = self.load_dataset(dataset_path, max_rows=max_rows)
+            if df.empty:
+                raise ValueError("Failed to load dataset or dataset is empty")
+            
+            # Get query template or use custom query
+            if query_key in QUERY_TEMPLATES:
+                template = QUERY_TEMPLATES[query_key]
+                logger.info(f"📝 Using template query: {query_key} ({template['type']})")
+            else:
+                if custom_query:
+                    template = {"prompt": custom_query, "type": "custom"}
+                    logger.info(f"📝 Using custom query: {custom_query[:100]}...")
+                else:
+                    raise ValueError(f"Query key '{query_key}' not found and no custom query provided")
+            
+            # Start monitoring
+            logger.info("🔍 Starting resource monitoring...")
+            self.resource_monitor.start_monitoring()
+            
+            # Start vLLM metrics monitoring
+            if self.vllm_metrics_collector:
+                logger.info("📊 Starting vLLM metrics collection...")
+                initial_vllm_stats = self.vllm_metrics_collector.collect_current_stats()
+                self.vllm_metrics_collector.start_monitoring()
+                
+                # Log initial metrics availability
+                if initial_vllm_stats.get('stats_available', False):
+                    metrics_count = len(initial_vllm_stats.get('metrics_found', {}))
+                    logger.info(f"✅ vLLM metrics collection active ({metrics_count} metrics available)")
+                else:
+                    logger.warning("⚠️ vLLM metrics collection limited - some features may not be available")
+                    logger.info("💡 Try setting VLLM_USE_V1=0 for better legacy metrics compatibility")
+            
+            # Prepare prompts
+            logger.info("🔤 Creating prompts...")
+            prompt_start_time = time.time()
+            prompts = []
+            
+            for idx, row in df.iterrows():
+                data_fields = self.format_data_fields(row)
+                prompt = self.create_prompt(template, data_fields, custom_query)
+                prompts.append(prompt)
+            
+            prompt_creation_time = time.time() - prompt_start_time
+            logger.info(f"✅ Created {len(prompts)} prompts in {prompt_creation_time:.2f}s")
+            
+            # Run inference in batches
+            logger.info("🧠 Starting inference...")
+            inference_start_time = time.time()
+            
+            all_results = []
+            batch_metrics = []
+            successful_batches = 0
+            failed_batches = 0
+            
+            # Process in batches
+            for i in range(0, len(prompts), batch_size):
+                batch_idx = i // batch_size
+                batch_prompts = prompts[i:i + batch_size]
+                batch_start_time = time.time()
+                
+                logger.info(f"Processing batch {batch_idx + 1}/{(len(prompts) + batch_size - 1) // batch_size} "
+                           f"({len(batch_prompts)} prompts)...")
+                
+                try:
+                    batch_results = self.run_batch_inference(batch_prompts, batch_size)
+                    
+                    if len(batch_results) == len(batch_prompts):
+                        all_results.extend(batch_results)
+                        successful_batches += 1
+                        
+                        # Calculate batch metrics
+                        batch_duration = time.time() - batch_start_time
+                        batch_input_tokens = sum(self.estimate_tokens(p) for p in batch_prompts)
+                        batch_output_tokens = sum(self.estimate_tokens(r) for r in batch_results)
+                        batch_throughput = (batch_input_tokens + batch_output_tokens) / batch_duration
+                        
+                        batch_metrics.append({
+                            'batch_idx': batch_idx,
+                            'batch_size': len(batch_prompts),
+                            'batch_duration': batch_duration,
+                            'batch_input_tokens': batch_input_tokens,
+                            'batch_output_tokens': batch_output_tokens,
+                            'batch_throughput_tokens_per_sec': batch_throughput
+                        })
+                        
+                        logger.info(f"✅ Batch {batch_idx + 1} completed in {batch_duration:.2f}s "
+                                   f"({batch_throughput:.1f} tokens/sec)")
+                    else:
+                        logger.error(f"Batch {batch_idx + 1} failed: mismatched results count")
+                        failed_batches += 1
+                        all_results.extend(["ERROR"] * len(batch_prompts))
+                        
+                except Exception as e:
+                    logger.error(f"Batch {batch_idx + 1} failed with error: {e}")
+                    failed_batches += 1
+                    all_results.extend(["ERROR"] * len(batch_prompts))
+            
+            total_inference_time = time.time() - inference_start_time
+            logger.info(f"🎉 Inference completed in {total_inference_time:.2f}s")
+            
+            # Stop monitoring
+            logger.info("🔍 Stopping monitoring and collecting final metrics...")
+            self.resource_monitor.stop_monitoring()
+            resource_stats = self.resource_monitor.get_summary_stats()
+            
+            # Collect final vLLM metrics
+            final_vllm_stats = None
+            if self.vllm_metrics_collector:
+                self.vllm_metrics_collector.stop_monitoring()
+                final_vllm_stats = self.vllm_metrics_collector.get_comprehensive_stats()
+                
+                # Save vLLM metrics to CSV
+                vllm_csv_path = os.path.join(output_folder, "vllm_metrics.csv")
+                self.vllm_metrics_collector.save_metrics(vllm_csv_path)
+                
+                logger.info(f"📊 vLLM metrics collected: {len(self.vllm_metrics_collector.stats_history)} data points")
+            
+            # Calculate performance metrics
+            total_experiment_time = time.time() - experiment_start_time
+            estimated_input_tokens = sum(self.estimate_tokens(p) for p in prompts)
+            estimated_output_tokens = sum(self.estimate_tokens(r) for r in all_results if r != "ERROR")
+            estimated_total_tokens = estimated_input_tokens + estimated_output_tokens
+            
+            performance_metrics = {
+                'total_experiment_time': total_experiment_time,
+                'total_inference_time': total_inference_time,
+                'prompt_creation_time': prompt_creation_time,
+                'avg_time_per_row': total_inference_time / len(df) if len(df) > 0 else 0,
+                'estimated_total_tokens': estimated_total_tokens,
+                'estimated_input_tokens': estimated_input_tokens,
+                'estimated_output_tokens': estimated_output_tokens,
+                'overall_throughput_tokens_per_sec': estimated_total_tokens / total_inference_time if total_inference_time > 0 else 0,
+                'successful_batches': successful_batches,
+                'failed_batches': failed_batches,
+                'total_batches': successful_batches + failed_batches,
+                'success_rate_percent': (successful_batches / (successful_batches + failed_batches) * 100) if (successful_batches + failed_batches) > 0 else 0
+            }
+            
+            # Save results
+            logger.info("💾 Saving results...")
+            
+            # Create results DataFrame
+            results_df = df.copy()
+            results_df['llm_response'] = all_results
+            results_df['processing_time'] = [total_inference_time / len(df)] * len(df)  # Approximate
+            
+            # Save to CSV
+            results_csv_path = os.path.join(output_folder, "query_results.csv")
+            results_df.to_csv(results_csv_path, index=False)
+            logger.info(f"💾 Results saved: {results_csv_path}")
+            
+            # Save batch metrics
+            if batch_metrics:
+                batch_df = pd.DataFrame(batch_metrics)
+                batch_csv_path = os.path.join(output_folder, "batch_metrics.csv")
+                batch_df.to_csv(batch_csv_path, index=False)
+                logger.info(f"📊 Batch metrics saved: {batch_csv_path}")
+            
+            # Save resource monitoring data
+            if resource_stats and self.resource_monitor.metrics_log:
+                resource_df = pd.DataFrame(self.resource_monitor.metrics_log)
+                resource_csv_path = os.path.join(output_folder, "resource_metrics.csv")
+                resource_df.to_csv(resource_csv_path, index=False)
+                logger.info(f"🖥️ Resource metrics saved: {resource_csv_path}")
+            
+            # Prepare comprehensive results
+            experiment_results = {
+                'experiment_info': {
+                    'dataset_path': dataset_path,
+                    'query_key': query_key,
+                    'query_type': template.get('type', 'unknown'),
+                    'custom_query': custom_query,
+                    'model_name': self.model_name,
+                    'gpu_id': self.gpu_id,
+                    'gpu_ids': self.gpu_ids,
+                    'batch_size': batch_size,
+                    'max_rows': max_rows,
+                    'total_rows': len(df),
+                    'processed_rows': len(all_results),
+                    'experiment_timestamp': timestamp,
+                    'output_folder': output_folder
+                },
+                'performance_metrics': performance_metrics,
+                'batch_metrics': batch_metrics,
+                'resource_monitoring': resource_stats,
+                'vllm_metrics': {
+                    'prefix_caching_enabled': True,  # We enabled it in model config
+                    'initial_stats': initial_vllm_stats if 'initial_vllm_stats' in locals() else {},
+                    'final_stats': final_vllm_stats or {}
+                },
+                'results_summary': {
+                    'total_prompts': len(prompts),
+                    'successful_responses': len([r for r in all_results if r != "ERROR"]),
+                    'failed_responses': len([r for r in all_results if r == "ERROR"]),
+                    'average_response_length': sum(len(r) for r in all_results if r != "ERROR") / len([r for r in all_results if r != "ERROR"]) if any(r != "ERROR" for r in all_results) else 0
+                }
+            }
+            
+            # Save complete experiment results
+            results_json_path = os.path.join(output_folder, "experiment_results.json")
+            with open(results_json_path, 'w') as f:
+                json.dump(experiment_results, f, indent=2, default=str)
+            logger.info(f"📋 Complete results saved: {results_json_path}")
+            
+            # Generate comprehensive report
+            logger.info("📊 Generating comprehensive report...")
+            report_path = self.generate_comprehensive_report(experiment_results, output_folder)
+            
+            # Generate visualizations if metrics are available
+            if self.vllm_metrics_collector and self.vllm_metrics_collector.stats_history:
+                logger.info("📈 Generating KV cache visualizations...")
+                self.vllm_metrics_collector.plot_kv_cache_metrics(output_folder)
+            
+            # Final summary
+            logger.info("🎉 Experiment completed successfully!")
+            logger.info(f"📁 All outputs saved in: {output_folder}")
+            logger.info(f"📊 Processed {len(df)} rows in {total_experiment_time:.2f}s")
+            logger.info(f"⚡ Overall throughput: {performance_metrics['overall_throughput_tokens_per_sec']:.1f} tokens/sec")
+            logger.info(f"✅ Success rate: {performance_metrics['success_rate_percent']:.1f}%")
+            
+            if final_vllm_stats and final_vllm_stats.get('latest_stats', {}).get('stats_available', False):
+                key_metrics = final_vllm_stats.get('key_metrics', {})
+                if 'gpu_cache_usage_percent' in key_metrics:
+                    logger.info(f"🗄️ Final GPU cache usage: {key_metrics['gpu_cache_usage_percent']:.1f}%")
+                if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                    hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                    logger.info(f"🎯 GPU prefix cache hit rate: {hit_rate:.1f}%")
+                    if hit_rate > 50:
+                        logger.info("🏆 Excellent cache performance detected!")
+                    elif hit_rate > 20:
+                        logger.info("✅ Good cache performance detected!")
+            
+            return experiment_results
+            
+        except Exception as e:
+            logger.error(f"❌ Experiment failed: {e}")
+            
+            # Stop monitoring on error
+            try:
+                self.resource_monitor.stop_monitoring()
+                if self.vllm_metrics_collector:
+                    self.vllm_metrics_collector.stop_monitoring()
+            except:
+                pass
+            
+            # Still try to save partial results
+            error_results = {
+                'experiment_info': {
+                    'dataset_path': dataset_path,
+                    'query_key': query_key,
+                    'error': str(e),
+                    'experiment_timestamp': timestamp,
+                    'output_folder': output_folder
+                },
+                'error': str(e),
+                'partial_results': locals().get('all_results', [])
+            }
+            
+            try:
+                error_json_path = os.path.join(output_folder, "experiment_error.json")
+                with open(error_json_path, 'w') as f:
+                    json.dump(error_results, f, indent=2, default=str)
+                logger.info(f"💾 Error details saved: {error_json_path}")
+            except:
+                pass
+            
+            raise
+    
+    def plot_kv_cache_metrics(self, output_dir: str) -> Dict[str, str]:
+        """Generate KV cache visualization plots"""
+        if self.vllm_metrics_collector:
+            self.vllm_metrics_collector.plot_kv_cache_metrics(output_dir)
+            
+            # Return paths to generated plots
+            plot_files = {
+                'gpu_cache_usage': os.path.join(output_dir, 'gpu_cache_usage.png'),
+                'gpu_prefix_cache_hit_rate': os.path.join(output_dir, 'gpu_prefix_cache_hit_rate.png'),
+                'gpu_prefix_cache_hit_rate_calculated': os.path.join(output_dir, 'gpu_prefix_cache_hit_rate_calculated.png'),
+                'request_queue_status': os.path.join(output_dir, 'request_queue_status.png'),
+                'token_processing': os.path.join(output_dir, 'token_processing.png')
+            }
+            
+            return {k: v for k, v in plot_files.items() if os.path.exists(v)}
+        
+        return {}
+
+
+# Create a type alias for backward compatibility
+LLMExperimentRunner = SimpleLLMExperiment
+
+
+def main():
+    """Main CLI interface"""
+    parser = argparse.ArgumentParser(description='Run LLM experiments with vLLM and comprehensive monitoring')
+    
+    # Required arguments
+    parser.add_argument('dataset_path', help='Path to the dataset file (CSV, JSON, JSONL, or Parquet)')
+    parser.add_argument('query_key', help='Query template key or "custom" for custom query')
+    
+    # Model configuration
+    parser.add_argument('--model', default='Qwen/Qwen2.5-7B-Instruct', 
+                       help='Model name (HuggingFace or local path)')
+    parser.add_argument('--max-tokens', type=int, default=512,
+                       help='Maximum tokens to generate')
+    parser.add_argument('--temperature', type=float, default=0.1,
+                       help='Temperature for generation')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                       help='Top-p for generation')
+    
+    # GPU configuration (enhanced for multi-GPU)
+    parser.add_argument('--gpu', type=int, help='Single GPU ID to use (for backward compatibility)')
+    parser.add_argument('--gpus', type=str, help='Comma-separated GPU IDs to use (e.g., "0,1,2,3")')
+    parser.add_argument('--gpu-memory', type=float, default=0.85,
+                       help='GPU memory utilization (0.0 to 1.0)')
+    parser.add_argument('--max-model-len', type=int,
+                       help='Maximum model sequence length (auto-calculated if not specified)')
+    
+    # Experiment configuration
+    parser.add_argument('--custom-query', help='Custom query to use instead of template')
+    parser.add_argument('--max-rows', type=int, help='Maximum rows to process from dataset')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size for inference')
+    parser.add_argument('--output-dir', default='results', help='Output directory')
+    parser.add_argument('--output-prefix', help='Prefix for output folder name')
+    
+    # Advanced options
+    parser.add_argument('--enable-testing-mode', action='store_true',
+                       help='Enable testing mode with simulated metrics (for development)')
+    parser.add_argument('--skip-model-init', action='store_true',
+                       help='Skip model initialization (for testing infrastructure only)')
+    
+    args = parser.parse_args()
+    
+    # Print welcome message
+    print("=" * 70)
+    print("🚀 vLLM Experiment Runner with Enhanced KV Cache Monitoring")
+    print("=" * 70)
+    
+    # Parse GPU configuration
+    gpu_ids = None
+    if args.gpus:
+        try:
+            gpu_ids = [int(gpu_id.strip()) for gpu_id in args.gpus.split(',')]
+            print(f"🖥️  Multi-GPU mode: Using GPUs {gpu_ids}")
+        except ValueError:
+            print("❌ Error: Invalid GPU IDs format. Use comma-separated integers like '0,1,2,3'")
+            sys.exit(1)
+    elif args.gpu is not None:
+        gpu_ids = [args.gpu]
+        print(f"🖥️  Single-GPU mode: Using GPU {args.gpu}")
+    else:
+        gpu_ids = [0]  # Default
+        print(f"🖥️  Using default GPU 0")
+    
+    # Validate query
+    if args.query_key not in QUERY_TEMPLATES and args.query_key != "custom" and not args.custom_query:
+        print(f"❌ Error: Query key '{args.query_key}' not found.")
+        print("Available templates:")
+        for key, template in QUERY_TEMPLATES.items():
+            print(f"  - {key}: {template['type']} query")
+        print("  - custom: Use with --custom-query")
+        sys.exit(1)
+    
+    try:
+        # Initialize experiment
+        print(f"🔧 Initializing experiment with model: {args.model}")
+        experiment = SimpleLLMExperiment(
+            model_name=args.model,
+            output_dir=args.output_dir,
+            gpu_ids=gpu_ids
+        )
+        
+        # Initialize model
+        if not args.skip_model_init:
+            print("🔄 Loading model...")
+            success = experiment.initialize_model(
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                gpu_memory_utilization=args.gpu_memory,
+                max_model_len=args.max_model_len
+            )
+            
+            if not success:
+                print("❌ Failed to initialize model")
+                sys.exit(1)
+        else:
+            print("⚠️  Skipping model initialization (testing mode)")
+        
+        # Enable testing mode if requested
+        if args.enable_testing_mode:
+            print("🧪 Enabling testing mode with simulated metrics")
+            experiment.vllm_metrics_collector.enable_testing_mode()
+        
+        # Run experiment
+        print("🎯 Starting experiment...")
+        results = experiment.run_experiment(
+            dataset_path=args.dataset_path,
+            query_key=args.query_key,
+            custom_query=args.custom_query,
+            max_rows=args.max_rows,
+            batch_size=args.batch_size,
+            output_prefix=args.output_prefix
+        )
+        
+        print("\n" + "=" * 70)
+        print("🎉 Experiment completed successfully!")
+        print(f"📁 Results saved in: {results['experiment_info']['output_folder']}")
+        print("=" * 70)
+        
+    except KeyboardInterrupt:
+        print("\n❌ Experiment interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Experiment failed: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+
