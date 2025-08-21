@@ -42,22 +42,36 @@ class TinyDatasetKVCacheTest:
         # Set GPU device via environment variable (most reliable method)
         self.set_gpu_device(gpu_id)
         
-        # Tiny test dataset - designed to trigger cache hits with shared prefixes
+        # High KV cache potential dataset - designed to maximize cache hits with very long shared prefixes
         self.tiny_dataset = [
-            # Group 1: Movie reviews (shared prefix for cache testing)
-            "Analyze this movie review: 'The cinematography was absolutely stunning.'",
-            "Analyze this movie review: 'The cinematography was mediocre at best.'", 
-            "Analyze this movie review: 'The cinematography captured every emotion.'",
+            # Group 1: Very long shared prefixes with detailed context (should trigger significant cache hits)
+            "Please analyze this detailed movie review in the context of modern cinema trends and audience expectations, considering both technical aspects and emotional impact: 'The cinematography was absolutely stunning and created an immersive experience.'",
+            "Please analyze this detailed movie review in the context of modern cinema trends and audience expectations, considering both technical aspects and emotional impact: 'The cinematography was mediocre at best and failed to engage viewers.'",
+            "Please analyze this detailed movie review in the context of modern cinema trends and audience expectations, considering both technical aspects and emotional impact: 'The cinematography captured every emotion perfectly and elevated the storytelling.'",
+            "Please analyze this detailed movie review in the context of modern cinema trends and audience expectations, considering both technical aspects and emotional impact: 'The cinematography was innovative and pushed creative boundaries.'",
             
-            # Group 2: Restaurant reviews (different shared prefix)
-            "Evaluate this restaurant review: 'The service was exceptional.'",
-            "Evaluate this restaurant review: 'The service was disappointing.'",
-            "Evaluate this restaurant review: 'The service exceeded expectations.'",
+            # Group 2: Another set with very long shared prefix but different domain
+            "Given the following comprehensive restaurant review, please provide a detailed evaluation covering service quality, food presentation, ambiance, and overall dining experience: 'The service was exceptional with attentive staff and prompt delivery.'",
+            "Given the following comprehensive restaurant review, please provide a detailed evaluation covering service quality, food presentation, ambiance, and overall dining experience: 'The service was disappointing with long waits and inattentive staff.'",
+            "Given the following comprehensive restaurant review, please provide a detailed evaluation covering service quality, food presentation, ambiance, and overall dining experience: 'The service exceeded all expectations with personalized attention.'",
+            "Given the following comprehensive restaurant review, please provide a detailed evaluation covering service quality, food presentation, ambiance, and overall dining experience: 'The service was professional and created a memorable dining experience.'",
             
-            # Group 3: Product reviews (another shared prefix)
-            "Rate this product review: 'The quality is outstanding.'",
-            "Rate this product review: 'The quality is questionable.'",
-            "Rate this product review: 'The quality surpassed my expectations.'"
+            # Group 3: Extremely long shared prefix to maximize cache potential
+            "As a professional product analyst, please conduct a thorough evaluation of this consumer review, analyzing sentiment, identifying key concerns or praise points, assessing the reviewer's experience level, and providing insights about product quality and customer satisfaction: 'The build quality is outstanding and exceeds industry standards.'",
+            "As a professional product analyst, please conduct a thorough evaluation of this consumer review, analyzing sentiment, identifying key concerns or praise points, assessing the reviewer's experience level, and providing insights about product quality and customer satisfaction: 'The build quality is questionable with several manufacturing defects.'",
+            "As a professional product analyst, please conduct a thorough evaluation of this consumer review, analyzing sentiment, identifying key concerns or praise points, assessing the reviewer's experience level, and providing insights about product quality and customer satisfaction: 'The build quality surpassed expectations with premium materials.'",
+            "As a professional product analyst, please conduct a thorough evaluation of this consumer review, analyzing sentiment, identifying key concerns or praise points, assessing the reviewer's experience level, and providing insights about product quality and customer satisfaction: 'The build quality demonstrates excellent craftsmanship and attention to detail.'",
+            
+            # Group 4: Identical prefixes with minimal variation (maximum cache hit potential)
+            "Translate and analyze the sentiment of this customer feedback for our quality assurance team: 'The product delivered exactly what was promised.'",
+            "Translate and analyze the sentiment of this customer feedback for our quality assurance team: 'The product failed to meet basic expectations.'",
+            "Translate and analyze the sentiment of this customer feedback for our quality assurance team: 'The product exceeded our initial requirements.'",
+            "Translate and analyze the sentiment of this customer feedback for our quality assurance team: 'The product represents excellent value for money.'",
+            
+            # Group 5: Repeated processing of same prefix pattern (should show progressive cache hits)
+            "Process this business review following our standard evaluation protocol: 'Management was responsive and addressed all concerns promptly.'",
+            "Process this business review following our standard evaluation protocol: 'Management was unresponsive and ignored customer complaints.'",
+            "Process this business review following our standard evaluation protocol: 'Management demonstrated strong leadership and customer focus.'",
         ]
     
     def set_gpu_device(self, gpu_id: int):
@@ -99,16 +113,21 @@ class TinyDatasetKVCacheTest:
                 try:
                     print(f"🔄 Attempting to load model: {model_candidate}")
                     
-                    # Configure vLLM with prefix caching and small context for testing
+                    # Configure vLLM with optimal settings for maximum KV cache hit potential
                     self.llm = LLM(
                         model=model_candidate,
-                        max_model_len=1024,  # Small context for faster testing
+                        max_model_len=2048,  # Larger context to accommodate long shared prefixes
                         enable_prefix_caching=True,  # Essential for KV cache hit testing
-                        gpu_memory_utilization=0.5,  # Conservative for testing
+                        gpu_memory_utilization=0.6,  # Higher utilization for more cache space
                         tensor_parallel_size=1,
                         disable_log_stats=False,  # Enable internal stats
-                        # Allow fallback to CPU if GPU issues
+                        # Force prefix caching explicitly with optimal settings
+                        enable_chunked_prefill=False,  # May conflict with prefix caching in some versions
                         enforce_eager=True,  # Avoid compilation issues
+                        # Cache-optimized configuration
+                        block_size=16,  # Standard block size for prefix caching
+                        swap_space=8,  # More CPU offloading to support larger cache
+                        max_num_seqs=1,  # Process one at a time to maximize cache reuse
                         # GPU device selection - MODIFY THIS LINE TO SET YOUR GPU
                         # Option 1: Single GPU (replace 0 with your desired GPU ID)
                         # device="cuda:0",  # Use GPU 0
@@ -121,7 +140,24 @@ class TinyDatasetKVCacheTest:
                     
                     self.model_name = model_candidate  # Record successful model
                     print(f"✅ vLLM initialized successfully with model: {model_candidate}")
-                    print(f"   Prefix caching: ENABLED")
+                    
+                    # Verify prefix caching is actually enabled
+                    try:
+                        if hasattr(self.llm, 'llm_engine'):
+                            engine = self.llm.llm_engine
+                            if hasattr(engine, 'model_config'):
+                                prefix_caching_enabled = getattr(engine.model_config, 'enable_prefix_caching', False)
+                                print(f"   Prefix caching verified: {'✅ ENABLED' if prefix_caching_enabled else '❌ DISABLED'}")
+                                if not prefix_caching_enabled:
+                                    print("   ⚠️  WARNING: Prefix caching is not enabled in model config!")
+                                    print("   This may be due to model compatibility or vLLM version")
+                            else:
+                                print("   Prefix caching status: Cannot verify (no model_config)")
+                        else:
+                            print("   Prefix caching status: Cannot verify (no llm_engine)")
+                    except Exception as e:
+                        print(f"   Prefix caching verification failed: {e}")
+                    
                     print(f"   Max context: 1024 tokens")
                     print(f"   Test dataset size: {len(self.tiny_dataset)} prompts")
                     
@@ -181,18 +217,19 @@ class TinyDatasetKVCacheTest:
         try:
             from vllm import SamplingParams
             
-            # Sampling parameters for consistent testing
+            # Sampling parameters optimized for KV cache testing
             sampling_params = SamplingParams(
-                temperature=0.7,
-                top_p=0.9,
-                max_tokens=50,  # Short responses for faster testing
-                stop=["\n", ".", "!"]  # Stop early to focus on cache behavior
+                temperature=0.0,  # Deterministic for consistent cache behavior
+                top_p=1.0,        # No top-p filtering to ensure consistent token generation
+                max_tokens=30,    # Moderate length to allow cache benefits without being too short
+                # Removed stop tokens to allow natural completion and better cache utilization
             )
             
-            print(f"🔧 Inference settings:")
+            print(f"🔧 Inference settings (optimized for KV cache testing):")
             print(f"   Max tokens per response: {sampling_params.max_tokens}")
-            print(f"   Temperature: {sampling_params.temperature}")
+            print(f"   Temperature: {sampling_params.temperature} (deterministic)")
             print(f"   Total prompts: {len(self.tiny_dataset)}")
+            print(f"   Expected high cache hit rate due to long shared prefixes")
             
             # Start monitoring
             self.metrics_collector.start_monitoring()
@@ -435,6 +472,103 @@ class TinyDatasetKVCacheTest:
         
         return analysis
     
+    def analyze_cache_potential(self, test_result: dict):
+        """Analyze cache hit potential and effectiveness for high-overlap prompts"""
+        print("\n🔬 High KV Cache Potential Analysis")
+        print("-" * 50)
+        
+        # Analyze prompt structure for cache potential
+        shared_prefix_analysis = {}
+        
+        # Group prompts by their long shared prefixes
+        prefix_groups = {}
+        for i, prompt in enumerate(self.tiny_dataset):
+            # Find shared prefixes of different lengths
+            for prefix_len in [50, 100, 150, 200]:
+                if len(prompt) >= prefix_len:
+                    prefix = prompt[:prefix_len]
+                    if prefix not in prefix_groups:
+                        prefix_groups[prefix] = []
+                    prefix_groups[prefix].append(i)
+        
+        # Find the most promising cache groups
+        cache_groups = [(prefix, indices) for prefix, indices in prefix_groups.items() if len(indices) >= 2]
+        cache_groups.sort(key=lambda x: len(x[1]), reverse=True)
+        
+        print(f"📈 Cache Potential Analysis:")
+        print(f"   • Total prompts: {len(self.tiny_dataset)}")
+        print(f"   • Shared prefix groups found: {len(cache_groups)}")
+        
+        total_cache_potential = 0
+        for i, (prefix, indices) in enumerate(cache_groups[:5]):  # Top 5 groups
+            potential_hits = len(indices) - 1  # First is cache miss, rest are hits
+            total_cache_potential += potential_hits
+            print(f"   • Group {i+1}: {len(indices)} prompts, {potential_hits} potential cache hits")
+            print(f"     Prefix: '{prefix[:60]}...'")
+        
+        expected_hit_rate = (total_cache_potential / len(self.tiny_dataset)) * 100
+        print(f"   • Expected cache hit rate: {expected_hit_rate:.1f}%")
+        print(f"   • Theoretical maximum hits: {total_cache_potential}/{len(self.tiny_dataset)}")
+        
+        # Analyze actual results
+        stats_snapshots = test_result.get('stats_snapshots', [])
+        final_stats = None
+        
+        for snapshot in reversed(stats_snapshots):
+            if snapshot.get('stats', {}).get('stats_available', False):
+                final_stats = snapshot['stats']
+                break
+        
+        if final_stats and 'metrics_found' in final_stats:
+            metrics = final_stats['metrics_found']
+            
+            # Look for cache hit metrics
+            cache_metrics = {}
+            for key, value in metrics.items():
+                if 'cache' in key.lower():
+                    cache_metrics[key] = value
+            
+            print(f"\n🎯 Actual Cache Performance:")
+            if cache_metrics:
+                for metric, value in cache_metrics.items():
+                    if 'hit' in metric.lower() and 'rate' in metric.lower():
+                        actual_rate = value * 100 if value <= 1 else value
+                        print(f"   • {metric}: {actual_rate:.2f}%")
+                    elif 'usage' in metric.lower():
+                        usage_val = value * 100 if value <= 1 else value
+                        print(f"   • {metric}: {usage_val:.2f}%")
+                    else:
+                        print(f"   • {metric}: {value}")
+                
+                # Performance comparison
+                print(f"\n📊 Performance Analysis:")
+                hit_rate_keys = [k for k in cache_metrics.keys() if 'hit' in k.lower() and 'rate' in k.lower()]
+                if hit_rate_keys:
+                    actual_hit_rate = cache_metrics[hit_rate_keys[0]]
+                    actual_hit_rate = actual_hit_rate * 100 if actual_hit_rate <= 1 else actual_hit_rate
+                    efficiency = (actual_hit_rate / max(expected_hit_rate, 1)) * 100
+                    
+                    print(f"   • Expected hit rate: {expected_hit_rate:.1f}%")
+                    print(f"   • Actual hit rate: {actual_hit_rate:.1f}%") 
+                    print(f"   • Cache efficiency: {efficiency:.1f}%")
+                    
+                    if efficiency > 80:
+                        print("   🏆 EXCELLENT: Cache is working at near-optimal efficiency!")
+                    elif efficiency > 50:
+                        print("   ✅ GOOD: Cache is providing significant benefits")
+                    elif efficiency > 20:
+                        print("   ⚠️  MODERATE: Some cache benefits but room for improvement")
+                    else:
+                        print("   ❌ LOW: Cache not performing as expected - check configuration")
+                else:
+                    print("   ⚠️  No cache hit rate metrics found")
+            else:
+                print("   ❌ No cache-related metrics found")
+        else:
+            print(f"\n⚠️  No final stats available for analysis")
+        
+        return expected_hit_rate, cache_groups
+
     def print_final_report(self, test_result: dict):
         """Print comprehensive test report"""
         print("\n" + "=" * 80)

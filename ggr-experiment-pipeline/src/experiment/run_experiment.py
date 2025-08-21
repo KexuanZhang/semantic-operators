@@ -680,25 +680,25 @@ class VLLMMetricsCollector:
                                     # Method 1: Try vllm.utils.Device
                                     from vllm.utils import Device
                                     gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
-                                    cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
                                     metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                    cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
                                     metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
-                                    logger.debug(f"🎯 Direct prefix cache hit rates: GPU {gpu_hit_rate*100:.1f}%, CPU {cpu_hit_rate*100:.1f}%")
                                 except (ImportError, AttributeError):
+                                    # Method 2: Try with string device names
                                     try:
-                                        # Method 2: Try vllm.executor.executor_base.Device
-                                        from vllm.executor.executor_base import Device
-                                        gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
-                                        cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
+                                        gpu_hit_rate = scheduler.get_prefix_cache_hit_rate("gpu")
                                         metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                        cpu_hit_rate = scheduler.get_prefix_cache_hit_rate("cpu")
                                         metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
-                                        logger.debug(f"🎯 Direct prefix cache hit rates: GPU {gpu_hit_rate*100:.1f}%, CPU {cpu_hit_rate*100:.1f}%")
-                                    except (ImportError, AttributeError):
+                                    except Exception:
+                                        # Method 3: Try without device parameter
                                         try:
-                                            # Method 3: Fallback - try with string values or int values
-                                            gpu_hit_rate = scheduler.get_prefix_cache_hit_rate("gpu")
-                                            cpu_hit_rate = scheduler.get_prefix_cache_hit_rate("cpu")
-                                            metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                            hit_rate = scheduler.get_prefix_cache_hit_rate()
+                                            metrics['prefix_cache_hit_rate'] = hit_rate
+                                        except Exception:
+                                            pass
+                            except Exception as e:
+                                stats_data['debug_info']['cache_hit_rate_error'] = str(e)
                                             metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
                                         except:
                                             # Try with integer values (0=GPU, 1=CPU)
