@@ -64,8 +64,8 @@ class TinyDatasetKVCacheTest:
                 enable_prefix_caching=True,  # Essential for KV cache hit testing
                 gpu_memory_utilization=0.5,  # Conservative for testing
                 tensor_parallel_size=1,
-                disable_log_stats=False,  # Enable internal stats
-                disable_log_requests=False
+                disable_log_stats=False  # Enable internal stats
+                # Note: disable_log_requests removed for compatibility
             )
             
             print(f"✅ vLLM initialized successfully")
