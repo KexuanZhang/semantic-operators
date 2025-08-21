@@ -7,7 +7,10 @@ without requiring external dependencies like seaborn.
 import os
 import sys
 import time
-from pathlib import Path
+f# Create enhanced metrics collector  
+collector = VLLMMetricsCollector(
+    llm_instance=llm  # Pass actual vLLM instance for internal access
+)thlib import Path
 
 # Add src to path  
 sys.path.insert(0, str(Path(__file__).parent / "src"))
@@ -38,7 +41,7 @@ def test_kv_cache_implementation_basic():
         
         # Test 2: Instantiation
         print("\n📊 Test 2: Create VLLMMetricsCollector instance...")
-        collector = VLLMMetricsCollector(llm=None, collection_interval=1.0)
+        collector = VLLMMetricsCollector(llm_instance=None)
         print("   ✅ Instance created successfully")
         
         # Test 3: Check key methods

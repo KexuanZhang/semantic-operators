@@ -95,9 +95,7 @@ class KVCacheStatsInferenceTest:
             
             # Create collector with the vLLM instance for internal access
             self.metrics_collector = VLLMMetricsCollector(
-                llm=self.llm,
-                collection_interval=0.5,  # Frequent collection for testing
-                enable_monitoring=True
+                llm_instance=self.llm
             )
             
             print("✅ Enhanced metrics collector initialized")

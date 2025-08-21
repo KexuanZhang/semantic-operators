@@ -51,7 +51,7 @@ class KVCacheStatsStructureTest:
         try:
             from experiment.run_experiment import VLLMMetricsCollector
             
-            collector = VLLMMetricsCollector(llm=None)
+            collector = VLLMMetricsCollector(llm_instance=None)
             
             # Check for key methods
             required_methods = [
@@ -88,7 +88,7 @@ class KVCacheStatsStructureTest:
         try:
             from experiment.run_experiment import VLLMMetricsCollector
             
-            collector = VLLMMetricsCollector(llm=None)
+            collector = VLLMMetricsCollector(llm_instance=None)
             
             # Test collect_internal_stats
             internal_stats = collector.collect_internal_stats()
@@ -120,7 +120,7 @@ class KVCacheStatsStructureTest:
         try:
             from experiment.run_experiment import VLLMMetricsCollector
             
-            collector = VLLMMetricsCollector(llm=None)
+            collector = VLLMMetricsCollector(llm_instance=None)
             
             # Test Prometheus registry method
             prometheus_stats = collector._collect_prometheus_registry_only()
@@ -157,7 +157,7 @@ class KVCacheStatsStructureTest:
         try:
             from experiment.run_experiment import VLLMMetricsCollector
             
-            collector = VLLMMetricsCollector(llm=None)
+            collector = VLLMMetricsCollector(llm_instance=None)
             
             # Test comprehensive stats
             comprehensive = collector.get_comprehensive_stats()
@@ -195,7 +195,7 @@ class KVCacheStatsStructureTest:
         try:
             from experiment.run_experiment import VLLMMetricsCollector
             
-            collector = VLLMMetricsCollector(llm=None)
+            collector = VLLMMetricsCollector(llm_instance=None)
             
             # Create mock metrics data to test extraction
             mock_metrics = {
@@ -253,7 +253,7 @@ class KVCacheStatsStructureTest:
         try:
             from experiment.run_experiment import VLLMMetricsCollector
             
-            collector = VLLMMetricsCollector(llm=None, collection_interval=0.1)
+            collector = VLLMMetricsCollector(llm_instance=None)
             
             # Test initial state
             print("   📊 Testing initial state...")
