@@ -193,6 +193,11 @@ class TinyDatasetKVCacheTest:
         print("📊 Setting up KV cache metrics collector...")
         
         try:
+            # Add the src directory to Python path
+            src_path = os.path.join(os.path.dirname(__file__), 'src')
+            if src_path not in sys.path:
+                sys.path.insert(0, src_path)
+            
             from experiment.run_experiment import VLLMMetricsCollector
             
             # Create collector with the vLLM instance
@@ -205,7 +210,9 @@ class TinyDatasetKVCacheTest:
             
         except ImportError as e:
             print(f"❌ Metrics collector import failed: {e}")
-            return False
+            print("   This test will run without advanced metrics collection")
+            print("   Basic timing analysis will still be performed")
+            return False  # Allow test to continue without metrics collector
         except Exception as e:
             print(f"❌ Metrics collector setup failed: {e}")
             return False
