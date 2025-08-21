@@ -27,7 +27,13 @@ class TinyDatasetKVCacheTest:
     """Test KV cache stats with a tiny dataset during actual inference"""
     
     def __init__(self, gpu_id: int = 0):
-        self.model_name = "microsoft/DialoGPT-small"  # Small model for fast testing
+        # Try multiple fallback models in case of download issues
+        self.model_options = [
+            "gpt2",  # Most likely to be cached locally
+            "microsoft/DialoGPT-small",  # Original choice
+            "distilgpt2",  # Smaller alternative
+        ]
+        self.model_name = None  # Will be set during setup
         self.gpu_id = gpu_id  # GPU device to use
         self.llm = None
         self.metrics_collector = None
@@ -88,31 +94,46 @@ class TinyDatasetKVCacheTest:
         try:
             from vllm import LLM, SamplingParams
             
-            # Configure vLLM with prefix caching and small context for testing
-            self.llm = LLM(
-                model=self.model_name,
-                max_model_len=1024,  # Small context for faster testing
-                enable_prefix_caching=True,  # Essential for KV cache hit testing
-                gpu_memory_utilization=0.5,  # Conservative for testing
-                tensor_parallel_size=1,
-                disable_log_stats=False,  # Enable internal stats
-                # GPU device selection - MODIFY THIS LINE TO SET YOUR GPU
-                # Option 1: Single GPU (replace 0 with your desired GPU ID)
-                # device="cuda:0",  # Use GPU 0
-                # Option 2: Multiple GPUs  
-                # device="cuda:0,1",  # Use GPUs 0 and 1
-                # Option 3: Auto-detect (default)
-                # device="auto",  # Let vLLM choose
-                # Note: disable_log_requests removed for compatibility
-            )
+            # Try different models in case of download issues
+            for model_candidate in self.model_options:
+                try:
+                    print(f"🔄 Attempting to load model: {model_candidate}")
+                    
+                    # Configure vLLM with prefix caching and small context for testing
+                    self.llm = LLM(
+                        model=model_candidate,
+                        max_model_len=1024,  # Small context for faster testing
+                        enable_prefix_caching=True,  # Essential for KV cache hit testing
+                        gpu_memory_utilization=0.5,  # Conservative for testing
+                        tensor_parallel_size=1,
+                        disable_log_stats=False,  # Enable internal stats
+                        # Allow fallback to CPU if GPU issues
+                        enforce_eager=True,  # Avoid compilation issues
+                        # GPU device selection - MODIFY THIS LINE TO SET YOUR GPU
+                        # Option 1: Single GPU (replace 0 with your desired GPU ID)
+                        # device="cuda:0",  # Use GPU 0
+                        # Option 2: Multiple GPUs  
+                        # device="cuda:0,1",  # Use GPUs 0 and 1
+                        # Option 3: Auto-detect (default)
+                        # device="auto",  # Let vLLM choose
+                        # Note: disable_log_requests removed for compatibility
+                    )
+                    
+                    self.model_name = model_candidate  # Record successful model
+                    print(f"✅ vLLM initialized successfully with model: {model_candidate}")
+                    print(f"   Prefix caching: ENABLED")
+                    print(f"   Max context: 1024 tokens")
+                    print(f"   Test dataset size: {len(self.tiny_dataset)} prompts")
+                    
+                    return True
+                    
+                except Exception as model_error:
+                    print(f"⚠️  Failed to load {model_candidate}: {model_error}")
+                    continue
             
-            print(f"✅ vLLM initialized successfully")
-            print(f"   Model: {self.model_name}")
-            print(f"   Prefix caching: ENABLED")
-            print(f"   Max context: 1024 tokens")
-            print(f"   Test dataset size: {len(self.tiny_dataset)} prompts")
-            
-            return True
+            # If all models failed
+            print("❌ All model options failed to load")
+            return False
             
         except ImportError as e:
             print(f"❌ vLLM import failed: {e}")
