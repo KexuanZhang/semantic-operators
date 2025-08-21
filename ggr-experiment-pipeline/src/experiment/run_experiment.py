@@ -30,9 +30,15 @@ import sys
 import torch
 import threading
 import psutil
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime
 import logging
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import seaborn as sns
+from pathlib import Path
+import base64
+from io import BytesIO
 
 # Try to import prometheus_client for accessing vLLM metrics
 try:
@@ -40,8 +46,15 @@ try:
     from prometheus_client import CollectorRegistry, REGISTRY
     prometheus_available = True
 except ImportError:
-    logger.warning("prometheus_client not available. vLLM metrics will be limited.")
     prometheus_available = False
+
+# Try to import pynvml for enhanced GPU monitoring
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    nvidia_available = True
+except ImportError:
+    nvidia_available = False
 
 # Configure logging
 logging.basicConfig(
@@ -52,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 def check_gpu_availability():
     """Check GPU availability and CUDA setup"""
-    if torch.cuda.is_available():
+    if (torch.cuda.is_available()):
         gpu_count = torch.cuda.device_count()
         logger.info(f"GPU Setup Detected:")
         logger.info(f"  - Available GPUs: {gpu_count}")
@@ -913,7 +926,79 @@ class VLLMMetricsCollector:
     def get_metrics_history(self) -> List[Dict[str, Any]]:
         """Get the complete metrics collection history"""
         return self.stats_history.copy()
-
+    
+    def plot_kv_cache_metrics(self, output_dir: str):
+        """Plot KV cache metrics over time and save to output directory"""
+        if not self.stats_history:
+            logger.warning("No vLLM metrics history to plot")
+            return
+        
+        try:
+            # Convert stats history to DataFrame
+            df = pd.DataFrame(self.stats_history)
+            
+            # Extract relevant metrics
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            df.set_index('timestamp', inplace=True)
+            
+            # Plot GPU cache usage
+            if 'vllm:gpu_cache_usage_perc' in df.columns:
+                plt.figure(figsize=(12, 6))
+                plt.plot(df.index, df['vllm:gpu_cache_usage_perc'] * 100, label='GPU Cache Usage (%)')
+                plt.xlabel('Time')
+                plt.ylabel('Cache Usage (%)')
+                plt.title('GPU Cache Usage Over Time')
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'gpu_cache_usage.png'))
+                plt.close()
+                logger.info("Saved GPU cache usage plot")
+            
+            # Plot GPU prefix cache hit rate
+            if 'vllm:gpu_prefix_cache_hit_rate' in df.columns:
+                plt.figure(figsize=(12, 6))
+                plt.plot(df.index, df['vllm:gpu_prefix_cache_hit_rate'] * 100, label='GPU Prefix Cache Hit Rate (%)')
+                plt.xlabel('Time')
+                plt.ylabel('Hit Rate (%)')
+                plt.title('GPU Prefix Cache Hit Rate Over Time')
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'gpu_prefix_cache_hit_rate.png'))
+                plt.close()
+                logger.info("Saved GPU prefix cache hit rate plot")
+            
+            # Plot CPU cache usage if available
+            if 'vllm:cpu_cache_usage_perc' in df.columns:
+                plt.figure(figsize=(12, 6))
+                plt.plot(df.index, df['vllm:cpu_cache_usage_perc'] * 100, label='CPU Cache Usage (%)')
+                plt.xlabel('Time')
+                plt.ylabel('Cache Usage (%)')
+                plt.title('CPU Cache Usage Over Time')
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'cpu_cache_usage.png'))
+                plt.close()
+                logger.info("Saved CPU cache usage plot")
+            
+            # Plot CPU prefix cache hit rate if available
+            if 'vllm:cpu_prefix_cache_hit_rate' in df.columns:
+                plt.figure(figsize=(12, 6))
+                plt.plot(df.index, df['vllm:cpu_prefix_cache_hit_rate'] * 100, label='CPU Prefix Cache Hit Rate (%)')
+                plt.xlabel('Time')
+                plt.ylabel('Hit Rate (%)')
+                plt.title('CPU Prefix Cache Hit Rate Over Time')
+                plt.legend()
+                plt.grid(True)
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, 'cpu_prefix_cache_hit_rate.png'))
+                plt.close()
+                logger.info("Saved CPU prefix cache hit rate plot")
+        
+        except Exception as e:
+            logger.error(f"Error plotting KV cache metrics: {e}")
 
 def resolve_model_path(model_name: str) -> str:
     """Resolve model path, supporting local directories and HF model names"""
@@ -1590,7 +1675,7 @@ class SimpleLLMExperiment:
                     # Time to First Token
                     if 'vllm:time_to_first_token_seconds' in histogram_data:
                         ttft_data = histogram_data['vllm:time_to_first_token_seconds']
-                        if ttft_data.get('count', 0) > 0:
+                        if ttft_data['count'] > 0:
                             avg_ttft = ttft_data['sum'] / ttft_data['count']
                             histogram_summary['avg_time_to_first_token_seconds'] = avg_ttft
                             logger.info(f"⚡ Avg Time to First Token: {avg_ttft:.3f}s")
@@ -1598,7 +1683,7 @@ class SimpleLLMExperiment:
                     # Time per Output Token
                     if 'vllm:time_per_output_token_seconds' in histogram_data:
                         tpot_data = histogram_data['vllm:time_per_output_token_seconds']
-                        if tpot_data.get('count', 0) > 0:
+                        if tpot_data['count'] > 0:
                             avg_tpot = tpot_data['sum'] / tpot_data['count']
                             histogram_summary['avg_time_per_output_token_seconds'] = avg_tpot
                             logger.info(f"🔄 Avg Time per Output Token: {avg_tpot:.4f}s")
@@ -1606,7 +1691,7 @@ class SimpleLLMExperiment:
                     # E2E Request Latency
                     if 'vllm:e2e_request_latency_seconds' in histogram_data:
                         e2e_data = histogram_data['vllm:e2e_request_latency_seconds']
-                        if e2e_data.get('count', 0) > 0:
+                        if e2e_data['count'] > 0:
                             avg_e2e = e2e_data['sum'] / e2e_data['count']
                             histogram_summary['avg_e2e_latency_seconds'] = avg_e2e
                             logger.info(f"🏁 Avg E2E Request Latency: {avg_e2e:.3f}s")
@@ -2032,9 +2117,8 @@ class SimpleLLMExperiment:
             'results': results
         }
         
-        # Save results and generate report
+        # Save results and generate comprehensive report
         self.save_results(experiment_results)
-        self.generate_performance_report(experiment_results)
         
         # Log summary
         logger.info(f"Experiment completed!")
@@ -2060,87 +2144,9 @@ class SimpleLLMExperiment:
             json.dump(experiment_results, f, indent=2, default=str)
         logger.info(f"Detailed results saved to: {json_file}")
         
-        # Save results as CSV
-        results_df = pd.DataFrame(experiment_results['results'])
-        csv_file = os.path.join(run_folder, "query_results.csv")
-        results_df.to_csv(csv_file, index=False)
-        logger.info(f"Results CSV saved to: {csv_file}")
+        # Generate consolidated comprehensive report instead of multiple files
+        self.generate_comprehensive_report(experiment_results, run_folder)
         
-        # Save batch metrics as CSV
-        batch_df = pd.DataFrame(experiment_results['batch_metrics'])
-        batch_csv = os.path.join(run_folder, "batch_metrics.csv")
-        batch_df.to_csv(batch_csv, index=False)
-        logger.info(f"Batch metrics saved to: {batch_csv}")
-        
-        # Save resource monitoring data if available
-        if self.resource_monitor.metrics_log:
-            resource_df = pd.DataFrame(self.resource_monitor.metrics_log)
-            resource_csv = os.path.join(run_folder, "resource_metrics.csv")
-            resource_df.to_csv(resource_csv, index=False)
-            logger.info(f"Resource metrics saved to: {resource_csv}")
-        
-        # Save vLLM metrics history if available
-        if self.vllm_metrics_collector.stats_history:
-            vllm_csv = os.path.join(run_folder, "vllm_metrics.csv")
-            self.vllm_metrics_collector.save_metrics(vllm_csv)
-            logger.info(f"vLLM metrics saved to: {vllm_csv}")
-        
-        # Save Prometheus-style metrics if available
-        prometheus_metrics = self.vllm_metrics_collector.get_prometheus_metrics()
-        if prometheus_metrics:
-            prometheus_file = os.path.join(run_folder, "prometheus_metrics.json")
-            with open(prometheus_file, 'w') as f:
-                json.dump(prometheus_metrics, f, indent=2, default=str)
-            logger.info(f"Prometheus metrics saved to: {prometheus_file}")
-        
-        # Save a summary file with key metrics
-        summary_file = os.path.join(run_folder, "experiment_summary.txt")
-        with open(summary_file, 'w') as f:
-            exp_info = experiment_results['experiment_info']
-            perf = experiment_results['performance_metrics']
-            
-            f.write(f"LLM Query Experiment Summary\n")
-            f.write(f"=" * 50 + "\n\n")
-            
-            f.write(f"Experiment Details:\n")
-            f.write(f"- Query Key: {exp_info['query_key']}\n")
-            f.write(f"- Query Type: {exp_info['query_type']}\n")
-            f.write(f"- Model: {exp_info['model_name']}\n")
-            f.write(f"- GPU ID: {exp_info['gpu_id']}\n")
-            f.write(f"- Dataset: {exp_info['dataset_path']}\n")
-            f.write(f"- Total Rows: {exp_info['total_rows']}\n")
-            f.write(f"- Processed Rows: {exp_info['processed_rows']}\n")
-            f.write(f"- Batch Size: {exp_info['batch_size']}\n")
-            f.write(f"- Timestamp: {exp_info['experiment_timestamp']}\n\n")
-            
-            f.write(f"Performance Metrics:\n")
-            f.write(f"- Total Inference Time: {perf['total_inference_time']:.2f} seconds\n")
-            f.write(f"- Average Time per Row: {perf['avg_time_per_row']:.3f} seconds\n")
-            f.write(f"- Overall Throughput: {perf['overall_throughput_tokens_per_sec']:.1f} tokens/second\n")
-            f.write(f"- Total Tokens Processed: {perf['estimated_total_tokens']:,}\n")
-            f.write(f"- Successful Batches: {perf['successful_batches']}\n")
-            f.write(f"- Failed Batches: {perf['failed_batches']}\n\n")
-            
-            # vLLM stats if available
-            vllm_stats = experiment_results['vllm_metrics']['final_stats']
-            if vllm_stats.get('vllm_stats_available', False):
-                f.write(f"vLLM Statistics:\n")
-                f.write(f"- KV Cache Usage: {vllm_stats.get('gpu_cache_usage_sys', 'N/A')}\n")
-                if vllm_stats.get('gpu_prefix_cache_hit_rate') is not None:
-                    hit_rate = vllm_stats['gpu_prefix_cache_hit_rate'] * 100
-                    f.write(f"- Prefix Cache Hit Rate: {hit_rate:.1f}%\n")
-                f.write(f"\n")
-            
-            f.write(f"Files in this run:\n")
-            f.write(f"- experiment_results.json: Complete experiment data\n")
-            f.write(f"- query_results.csv: Query responses and metadata\n")
-            f.write(f"- batch_metrics.csv: Per-batch performance data\n")
-            f.write(f"- resource_metrics.csv: System resource monitoring\n")
-            f.write(f"- vllm_metrics.csv: vLLM inference metrics and KV cache stats\n")
-            f.write(f"- performance_report.md: Detailed analysis report\n")
-            f.write(f"- experiment_summary.txt: This summary file\n")
-        
-        logger.info(f"Experiment summary saved to: {summary_file}")
         logger.info(f"All results saved to folder: {run_folder}")
 
     def generate_performance_report(self, experiment_results: Dict[str, Any]):
@@ -2532,8 +2538,419 @@ class SimpleLLMExperiment:
             f.write(f"\n---\n")
             f.write(f"**Run ID**: `{os.path.basename(run_folder)}`  \n")
             f.write(f"**Report generated**: {datetime.now().isoformat()}  \n")
+
+    def generate_comprehensive_report(self, experiment_results: Dict[str, Any], run_folder: str):
+        """Generate a single comprehensive markdown report with all experiment data, metrics, and embedded plots"""
         
-        logger.info(f"Performance report saved to: {report_file}")
+        # Create the comprehensive report file
+        report_file = os.path.join(run_folder, "comprehensive_experiment_report.md")
+        
+        # Generate KV cache plots first
+        plots_generated = []
+        try:
+            if hasattr(self, 'vllm_metrics_collector') and self.vllm_metrics_collector:
+                self.vllm_metrics_collector.plot_kv_cache_metrics(run_folder)
+                # Check for generated plot files
+                plot_files = ['gpu_cache_usage.png', 'gpu_prefix_cache_hit_rate.png', 
+                             'cpu_cache_usage.png', 'cpu_prefix_cache_hit_rate.png']
+                for plot_file in plot_files:
+                    plot_path = os.path.join(run_folder, plot_file)
+                    if os.path.exists(plot_path):
+                        plots_generated.append(plot_file)
+        except Exception as e:
+            logger.warning(f"Error generating plots: {e}")
+        
+        # Helper function to encode image as base64 for embedding
+        def encode_image_as_base64(image_path):
+            try:
+                with open(image_path, 'rb') as img_file:
+                    img_data = img_file.read()
+                    img_base64 = base64.b64encode(img_data).decode('utf-8')
+                    return img_base64
+            except Exception as e:
+                logger.warning(f"Could not encode image {image_path}: {e}")
+                return None
+        
+        with open(report_file, 'w') as f:
+            # Header and metadata
+            exp_info = experiment_results['experiment_info']
+            timestamp = datetime.now()
+            
+            f.write(f"# 📊 Comprehensive vLLM Experiment Report\n\n")
+            f.write(f"**Generated**: {timestamp.isoformat()}  \n")
+            f.write(f"**Run Folder**: `{os.path.basename(run_folder)}`  \n")
+            f.write(f"**Experiment**: {exp_info['query_key']} on {os.path.basename(exp_info['dataset_path'])}  \n\n")
+            
+            # Table of Contents
+            f.write(f"## 📋 Table of Contents\n\n")
+            f.write(f"1. [Experiment Configuration](#experiment-configuration)\n")
+            f.write(f"2. [Performance Summary](#performance-summary)\n")
+            f.write(f"3. [KV Cache Metrics & Analysis](#kv-cache-metrics--analysis)\n")
+            f.write(f"4. [KV Cache Visualizations](#kv-cache-visualizations)\n")
+            f.write(f"5. [Resource Utilization](#resource-utilization)\n")
+            f.write(f"6. [Batch Performance Analysis](#batch-performance-analysis)\n")
+            f.write(f"7. [Query Results Sample](#query-results-sample)\n")
+            f.write(f"8. [System Information](#system-information)\n")
+            f.write(f"9. [Raw Data Export](#raw-data-export)\n")
+            f.write(f"10. [Analysis & Recommendations](#analysis--recommendations)\n\n")
+            
+            # 1. Experiment Configuration
+            f.write(f"## 1. Experiment Configuration\n\n")
+            f.write(f"| Parameter | Value |\n")
+            f.write(f"|-----------|-------|\n")
+            f.write(f"| **Query Key** | {exp_info['query_key']} |\n")
+            f.write(f"| **Query Type** | {exp_info['query_type']} |\n")
+            f.write(f"| **Model** | {exp_info['model_name']} |\n")
+            f.write(f"| **GPU ID** | {exp_info['gpu_id']} |\n")
+            f.write(f"| **Dataset** | {os.path.basename(exp_info['dataset_path'])} |\n")
+            f.write(f"| **Total Rows** | {exp_info['total_rows']:,} |\n")
+            f.write(f"| **Processed Rows** | {exp_info['processed_rows']:,} |\n")
+            f.write(f"| **Batch Size** | {exp_info['batch_size']} |\n")
+            f.write(f"| **Timestamp** | {exp_info['experiment_timestamp']} |\n\n")
+            
+            # Dataset type detection
+            dataset_name = os.path.basename(exp_info['dataset_path']).lower()
+            is_reordered = any(keyword in dataset_name for keyword in ['reordered', 'ggr', 'ordered', 'sorted'])
+            is_shuffled = any(keyword in dataset_name for keyword in ['shuffled', 'random', 'baseline'])
+            
+            if is_reordered:
+                f.write(f"**Dataset Type**: 🎯 Reordered/Optimized (likely using GGR or similar algorithm)  \n")
+                f.write(f"*Expected: Higher KV cache hit rates due to optimized data ordering*\n\n")
+            elif is_shuffled:
+                f.write(f"**Dataset Type**: 🔄 Shuffled/Random (baseline comparison)  \n")
+                f.write(f"*Expected: Lower cache hit rates, useful as performance baseline*\n\n")
+            else:
+                f.write(f"**Dataset Type**: 📄 Original/Natural order  \n")
+                f.write(f"*Expected: Moderate cache performance depending on natural data patterns*\n\n")
+            
+            # 2. Performance Summary
+            f.write(f"## 2. Performance Summary\n\n")
+            perf = experiment_results['performance_metrics']
+            
+            # Key metrics table
+            f.write(f"| Metric | Value |\n")
+            f.write(f"|--------|-------|\n")
+            f.write(f"| **Total Inference Time** | {perf['total_inference_time']:.2f}s |\n")
+            f.write(f"| **Prompt Creation Time** | {perf['prompt_creation_time']:.2f}s |\n")
+            f.write(f"| **Average Time per Row** | {perf['avg_time_per_row']:.3f}s |\n")
+            f.write(f"| **Overall Throughput** | {perf['overall_throughput_tokens_per_sec']:.1f} tokens/sec |\n")
+            f.write(f"| **Total Estimated Tokens** | {perf['estimated_total_tokens']:,} |\n")
+            f.write(f"| **Successful Batches** | {perf['successful_batches']:,} |\n")
+            f.write(f"| **Failed Batches** | {perf['failed_batches']:,} |\n\n")
+            
+            # 3. KV Cache Metrics & Analysis
+            f.write(f"## 3. KV Cache Metrics & Analysis\n\n")
+            vllm_metrics = experiment_results['vllm_metrics']
+            final_stats = vllm_metrics.get('final_stats', {})
+            
+            if final_stats.get('vllm_stats_available', False):
+                key_metrics = final_stats.get('key_metrics', {})
+                
+                f.write(f"### 📈 Cache Performance Overview\n\n")
+                
+                # GPU cache usage
+                if 'gpu_cache_usage_percent' in key_metrics:
+                    cache_usage = key_metrics['gpu_cache_usage_percent']
+                    f.write(f"**GPU Cache Usage**: {cache_usage:.1f}%  \n")
+                    if cache_usage > 80:
+                        f.write(f"🔥 High cache utilization - good memory efficiency\n\n")
+                    elif cache_usage > 50:
+                        f.write(f"✅ Moderate cache utilization\n\n")
+                    else:
+                        f.write(f"📊 Low cache utilization - room for larger batches\n\n")
+                
+                # Prefix cache hit rate analysis
+                hit_rate_found = False
+                if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                    hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                    hits = key_metrics.get('gpu_prefix_cache_hits', 0)
+                    queries = key_metrics.get('gpu_prefix_cache_queries', 0)
+                    
+                    # Validate hit rate data quality
+                    if queries > 10 or hit_rate < 99:  # Avoid reporting 100% from tiny values
+                        hit_rate_found = True
+                        f.write(f"### 🎯 GPU Prefix Cache Hit Rate: **{hit_rate:.2f}%**\n\n")
+                        
+                        if hits > 0 and queries > 0:
+                            f.write(f"📊 **Cache Statistics**: {hits:,} hits / {queries:,} queries\n\n")
+                        
+                        # Performance analysis with context-aware messaging
+                        if hit_rate > 70:
+                            f.write(f"🏆 **EXCELLENT PERFORMANCE** - Outstanding cache effectiveness!\n")
+                            if is_reordered:
+                                f.write(f"✨ The optimized data ordering is providing exceptional prefix reuse benefits.\n")
+                            else:
+                                f.write(f"✨ This dataset naturally has excellent prefix similarity patterns.\n")
+                        elif hit_rate > 40:
+                            f.write(f"✅ **GOOD PERFORMANCE** - Strong cache benefits detected!\n")
+                            if is_reordered:
+                                f.write(f"🎯 Clear evidence of effective prefix caching from optimized data ordering.\n")
+                            else:
+                                f.write(f"🎯 Good natural prefix reuse patterns in this dataset.\n")
+                        elif hit_rate > 15:
+                            f.write(f"⚠️ **MODERATE PERFORMANCE** - Some prefix reuse detected\n")
+                            if is_reordered:
+                                f.write(f"🔧 Consider further algorithm parameter tuning.\n")
+                            else:
+                                f.write(f"🔧 Dataset might benefit from optimized ordering algorithms.\n")
+                        else:
+                            f.write(f"❌ **LOW PERFORMANCE** - Limited cache effectiveness\n")
+                            if is_shuffled:
+                                f.write(f"✅ Expected for shuffled baseline data - use for comparison.\n")
+                            else:
+                                f.write(f"🔧 Consider applying data ordering algorithms like GGR.\n")
+                        f.write(f"\n")
+                
+                if not hit_rate_found:
+                    f.write(f"### ⚠️ Prefix Cache Hit Rate: Data Insufficient\n\n")
+                    queries = key_metrics.get('gpu_prefix_cache_queries', 0)
+                    f.write(f"📊 Only {queries} queries processed - need more data for reliable metrics.\n")
+                    f.write(f"💡 **Recommendations**: Run with more rows or longer experiment duration.\n\n")
+                
+                # Additional metrics
+                f.write(f"### 📊 Additional Cache Metrics\n\n")
+                metrics_table = []
+                
+                for metric_name, display_name in [
+                    ('requests_running', 'Running Requests'),
+                    ('requests_waiting', 'Waiting Requests'),
+                    ('prompt_tokens_total', 'Total Prompt Tokens'),
+                    ('generation_tokens_total', 'Total Generation Tokens')
+                ]:
+                    if metric_name in key_metrics:
+                        value = key_metrics[metric_name]
+                        if isinstance(value, int):
+                            metrics_table.append(f"| {display_name} | {value:,} |")
+                        else:
+                            metrics_table.append(f"| {display_name} | {value} |")
+                
+                if metrics_table:
+                    f.write(f"| Metric | Value |\n|--------|-------|\n")
+                    f.write(f"\n".join(metrics_table))
+                    f.write(f"\n\n")
+            else:
+                f.write(f"⚠️ **KV Cache Metrics**: Limited availability\n")
+                f.write(f"- vLLM metrics collection encountered issues\n")
+                f.write(f"- This may be due to version compatibility or configuration\n\n")
+            
+            # 4. KV Cache Visualizations
+            f.write(f"## 4. KV Cache Visualizations\n\n")
+            
+            if plots_generated:
+                f.write(f"📈 **Generated {len(plots_generated)} visualization(s)**:\n\n")
+                
+                for plot_file in plots_generated:
+                    plot_path = os.path.join(run_folder, plot_file)
+                    plot_title = plot_file.replace('_', ' ').replace('.png', '').title()
+                    
+                    f.write(f"### {plot_title}\n\n")
+                    
+                    # Try to embed the image as base64
+                    img_base64 = encode_image_as_base64(plot_path)
+                    if img_base64:
+                        f.write(f"![{plot_title}](data:image/png;base64,{img_base64})\n\n")
+                        f.write(f"*Plot file: `{plot_file}`*\n\n")
+                    else:
+                        f.write(f"📊 Plot saved as: `{plot_file}`\n\n")
+                        
+            else:
+                f.write(f"⚠️ **No KV cache plots generated** - Limited metrics data available\n\n")
+            
+            # 5. Resource Utilization
+            f.write(f"## 5. Resource Utilization\n\n")
+            resource = experiment_results.get('resource_monitoring', {})
+            
+            if resource and resource.get('total_samples', 0) > 0:
+                f.write(f"### 📊 Monitoring Overview\n\n")
+                f.write(f"- **Duration**: {resource.get('monitoring_duration_seconds', 0):.1f}s\n")
+                f.write(f"- **Samples**: {resource.get('total_samples', 0):,}\n")
+                f.write(f"- **Interval**: {resource.get('sampling_interval_seconds', 0)}s\n\n")
+                
+                f.write(f"### 💻 System Resources\n\n")
+                f.write(f"| Resource | Average | Maximum |\n")
+                f.write(f"|----------|---------|----------|\n")
+                f.write(f"| CPU Utilization | {resource.get('cpu_utilization_mean', 0):.1f}% | {resource.get('cpu_utilization_max', 0):.1f}% |\n")
+                f.write(f"| Memory Utilization | {resource.get('memory_utilization_mean', 0):.1f}% | {resource.get('memory_utilization_max', 0):.1f}% |\n")
+                f.write(f"| Memory Usage | {resource.get('memory_used_gb_mean', 0):.1f} GB | {resource.get('memory_used_gb_max', 0):.1f} GB |\n")
+                
+                if 'gpu_compute_utilization_mean' in resource:
+                    f.write(f"| GPU Compute | {resource['gpu_compute_utilization_mean']:.1f}% | {resource['gpu_compute_utilization_max']:.1f}% |\n")
+                    f.write(f"| GPU Memory | {resource.get('gpu_memory_utilization_mean', 0):.1f}% | {resource.get('gpu_memory_utilization_max', 0):.1f}% |\n")
+                    f.write(f"| GPU Memory Allocated | {resource.get('gpu_memory_allocated_gb_mean', 0):.1f} GB | {resource.get('gpu_memory_allocated_gb_max', 0):.1f} GB |\n")
+                
+                f.write(f"\n")
+            else:
+                f.write(f"⚠️ **Resource monitoring data not available**\n\n")
+            
+            # 6. Batch Performance Analysis
+            f.write(f"## 6. Batch Performance Analysis\n\n")
+            batch_metrics = experiment_results.get('batch_metrics', [])
+            
+            if batch_metrics:
+                import pandas as pd
+                batch_df = pd.DataFrame(batch_metrics)
+                
+                f.write(f"### 📊 Batch Statistics\n\n")
+                f.write(f"| Metric | Value |\n")
+                f.write(f"|--------|-------|\n")
+                f.write(f"| Total Batches | {len(batch_metrics):,} |\n")
+                f.write(f"| Average Duration | {batch_df['batch_duration'].mean():.3f}s |\n")
+                f.write(f"| Average Throughput | {batch_df['batch_throughput_tokens_per_sec'].mean():.1f} tokens/sec |\n")
+                f.write(f"| Max Throughput | {batch_df['batch_throughput_tokens_per_sec'].max():.1f} tokens/sec |\n")
+                f.write(f"| Average Batch Size | {batch_df['batch_size'].mean():.1f} |\n\n")
+                
+                # Top performing batches
+                top_batches = batch_df.nlargest(3, 'batch_throughput_tokens_per_sec')[['batch_idx', 'batch_throughput_tokens_per_sec', 'batch_duration']]
+                f.write(f"### 🏆 Top 3 Performing Batches\n\n")
+                f.write(f"| Batch | Throughput | Duration |\n")
+                f.write(f"|-------|------------|----------|\n")
+                for _, batch in top_batches.iterrows():
+                    f.write(f"| {int(batch['batch_idx'])} | {batch['batch_throughput_tokens_per_sec']:.1f} tokens/sec | {batch['batch_duration']:.3f}s |\n")
+                f.write(f"\n")
+            else:
+                f.write(f"⚠️ **Batch performance data not available**\n\n")
+            
+            # 7. Query Results Sample  
+            f.write(f"## 7. Query Results Sample\n\n")
+            query_results = experiment_results.get('query_results', [])
+            
+            if query_results:
+                f.write(f"📊 **Showing first 3 query results** (out of {len(query_results):,} total):\n\n")
+                
+                for i, result in enumerate(query_results[:3], 1):
+                    f.write(f"### Sample {i}\n\n")
+                    f.write(f"**Input**: {result.get('input_text', 'N/A')[:200]}...\n\n")
+                    f.write(f"**Generated Text**:\n")
+                    f.write(f"```\n{result.get('generated_text', 'N/A')[:300]}...\n```\n\n")
+                    f.write(f"**Processing Time**: {result.get('processing_time', 0):.3f}s\n\n")
+            else:
+                f.write(f"⚠️ **Query results not available**\n\n")
+            
+            # 8. System Information
+            f.write(f"## 8. System Information\n\n")
+            f.write(f"### 🖥️ Hardware & Software\n\n")
+            
+            if torch.cuda.is_available():
+                gpu_id = exp_info['gpu_id']
+                gpu_name = torch.cuda.get_device_name(gpu_id)
+                gpu_memory = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+                f.write(f"- **GPU**: {gpu_name}\n")
+                f.write(f"- **GPU Memory**: {gpu_memory:.1f} GB\n")
+                f.write(f"- **CUDA Version**: {torch.version.cuda}\n")
+            
+            f.write(f"- **PyTorch Version**: {torch.__version__}\n")
+            f.write(f"- **Python Version**: {sys.version.split()[0]}\n")
+            f.write(f"- **CPU Count**: {psutil.cpu_count()}\n")
+            f.write(f"- **Total System Memory**: {psutil.virtual_memory().total / 1e9:.1f} GB\n\n")
+            
+            # 9. Raw Data Export
+            f.write(f"## 9. Raw Data Export\n\n")
+            f.write(f"### 📁 Generated Files\n\n")
+            f.write(f"This experiment run generated the following files in `{os.path.basename(run_folder)}/`:\n\n")
+            f.write(f"- **`comprehensive_experiment_report.md`**: This complete report (you are here!)\n")
+            f.write(f"- **`experiment_results.json`**: Complete raw experiment data and metadata\n")
+            
+            # Save additional CSV exports for data analysis
+            try:
+                # Export query results as CSV
+                if query_results:
+                    query_df = pd.DataFrame(query_results)
+                    query_csv = os.path.join(run_folder, "query_results.csv")
+                    query_df.to_csv(query_csv, index=False)
+                    f.write(f"- **`query_results.csv`**: Query responses and processing details\n")
+                
+                # Export batch metrics as CSV
+                if batch_metrics:
+                    batch_df = pd.DataFrame(batch_metrics)
+                    batch_csv = os.path.join(run_folder, "batch_metrics.csv")
+                    batch_df.to_csv(batch_csv, index=False)
+                    f.write(f"- **`batch_metrics.csv`**: Per-batch performance metrics\n")
+                
+                # Export resource monitoring as CSV
+                if hasattr(self, 'resource_monitor') and self.resource_monitor:
+                    resource_csv = os.path.join(run_folder, "resource_metrics.csv")
+                    self.resource_monitor.save_metrics(resource_csv)
+                    f.write(f"- **`resource_metrics.csv`**: System resource monitoring data\n")
+                
+                # Export vLLM metrics as JSON
+                if hasattr(self, 'vllm_metrics_collector') and self.vllm_metrics_collector:
+                    vllm_csv = os.path.join(run_folder, "vllm_metrics.json")
+                    self.vllm_metrics_collector.save_metrics(vllm_csv)
+                    f.write(f"- **`vllm_metrics.json`**: vLLM inference metrics and KV cache stats\n")
+                
+                # List any generated plot files
+                for plot_file in plots_generated:
+                    f.write(f"- **`{plot_file}`**: KV cache performance visualization\n")
+                    
+            except Exception as e:
+                logger.warning(f"Error exporting additional data files: {e}")
+            
+            f.write(f"\n")
+            
+            # 10. Analysis & Recommendations
+            f.write(f"## 10. Analysis & Recommendations\n\n")
+            
+            # Get cache hit rate for context-aware recommendations
+            cache_hit_rate = 0
+            if final_stats.get('key_metrics', {}).get('gpu_prefix_cache_hit_rate_percent'):
+                cache_hit_rate = final_stats['key_metrics']['gpu_prefix_cache_hit_rate_percent']
+            elif final_stats.get('gpu_prefix_cache_hit_rate'):
+                cache_hit_rate = final_stats['gpu_prefix_cache_hit_rate'] * 100
+            
+            f.write(f"### 🎯 Performance Analysis\n\n")
+            
+            if cache_hit_rate > 0:
+                f.write(f"Your experiment achieved a **{cache_hit_rate:.1f}%** KV cache hit rate.\n\n")
+            
+            if is_reordered and cache_hit_rate > 40:
+                f.write(f"### ✅ Optimized Dataset Performance\n\n")
+                f.write(f"🎯 **Excellent results!** Your reordered dataset is demonstrating strong cache performance.\n\n")
+                f.write(f"**Continue optimization:**\n")
+                f.write(f"- Scale testing with larger datasets to validate benefits\n")
+                f.write(f"- Compare against shuffled baseline to quantify improvements\n")
+                f.write(f"- Fine-tune algorithm parameters for even better results\n\n")
+                
+            elif is_shuffled or cache_hit_rate < 20:
+                f.write(f"### 💡 Optimization Opportunities\n\n")
+                if is_shuffled:
+                    f.write(f"📊 This shuffled baseline shows {cache_hit_rate:.1f}% hit rate - ideal for comparison studies.\n\n")
+                    f.write(f"**For comprehensive analysis:**\n")
+                    f.write(f"- Run identical experiment with GGR-optimized data\n")
+                    f.write(f"- Look for 2-4x improvements in cache hit rates\n")
+                    f.write(f"- Document throughput and latency improvements\n\n")
+                else:
+                    f.write(f"🔧 **Optimization potential detected** - {cache_hit_rate:.1f}% hit rate suggests room for improvement.\n\n")
+                    f.write(f"**Consider data ordering algorithms:**\n")
+                    f.write(f"- Apply GGR (Greedy Group Recursion) algorithm\n")
+                    f.write(f"- Group similar queries to maximize prefix reuse\n")
+                    f.write(f"- Sort by common prefixes or functional dependencies\n\n")
+            else:
+                f.write(f"### 🔧 General Optimization Tips\n\n")
+                f.write(f"Your dataset achieved {cache_hit_rate:.1f}% cache hit rate.\n\n")
+            
+            f.write(f"### ⚙️ Technical Recommendations\n\n")
+            f.write(f"**Performance tuning:**\n")
+            f.write(f"- Adjust batch size based on GPU memory and throughput patterns\n")
+            f.write(f"- Monitor GPU utilization and scale model size if underutilized\n")
+            f.write(f"- Consider tensor parallelism for larger models\n\n")
+            
+            f.write(f"**Experimental methodology:**\n")
+            f.write(f"- Run multiple trials for statistical significance\n")
+            f.write(f"- Test with different model sizes and architectures\n")
+            f.write(f"- Compare against various baseline orderings\n")
+            f.write(f"- Document scaling behavior with dataset size\n\n")
+            
+            # Footer
+            f.write(f"---\n\n")
+            f.write(f"**📋 Experiment ID**: `{os.path.basename(run_folder)}`  \n")
+            f.write(f"**🕒 Report Generated**: {timestamp.isoformat()}  \n")
+            f.write(f"**🤖 Generated by**: vLLM KV Cache Experiment Pipeline  \n")
+            f.write(f"**📊 Total Sections**: 10 sections with comprehensive analysis and visualizations  \n\n")
+            
+            f.write(f"> 💡 **Tip**: This report contains embedded visualizations and can be viewed in any markdown-compatible viewer or converted to HTML/PDF for sharing.\n")
+        
+        logger.info(f"📊 Comprehensive experiment report saved to: {report_file}")
+        return report_file
 
 
 def main():
