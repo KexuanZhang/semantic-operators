@@ -183,23 +183,9 @@ Sentiment:"""
         prompt = self.create_sentiment_prompt(text)
         
         try:
-            # Get cache stats before inference
-            cache_stats_before = self.get_cache_stats()
-            
             # Generate response
             output = self.llm.generate([prompt], self.sampling_params)
             response = output[0].outputs[0].text.strip()
-            
-            # Get cache stats after inference
-            cache_stats_after = self.get_cache_stats()
-            
-            # Store cache metrics for this inference
-            cache_metrics = {
-                'before': cache_stats_before,
-                'after': cache_stats_after,
-                'timestamp': datetime.now().isoformat()
-            }
-            self.cache_metrics.append(cache_metrics)
             
             # Return raw response without any processing
             return response
@@ -291,6 +277,9 @@ Sentiment:"""
         results = []
         start_time = time.time()
         
+        # Get initial cache stats
+        initial_cache_stats = self.get_cache_stats()
+        
         print(f"Starting sentiment analysis for {len(df)} samples...")
         
         # Process each row
@@ -325,6 +314,17 @@ Sentiment:"""
         end_time = time.time()
         total_inference_time = end_time - start_time
         
+        # Get final cache stats
+        final_cache_stats = self.get_cache_stats()
+        
+        # Store overall cache metrics
+        overall_cache_metrics = {
+            'initial_stats': initial_cache_stats,
+            'final_stats': final_cache_stats,
+            'experiment_start': datetime.fromtimestamp(start_time).isoformat(),
+            'experiment_end': datetime.fromtimestamp(end_time).isoformat()
+        }
+        
         # Create summary - count unique responses
         response_counts = {}
         for r in results:
@@ -347,7 +347,8 @@ Sentiment:"""
                 'top_p': self.sampling_params.top_p,
                 'max_tokens': self.sampling_params.max_tokens,
             },
-            'cache_metrics_summary': self._analyze_cache_metrics()
+            'cache_metrics_summary': self._analyze_cache_metrics(),
+            'overall_cache_metrics': overall_cache_metrics
         }
         
         return {
@@ -397,6 +398,19 @@ Sentiment:"""
         
         # Print cache metrics summary if available
         cache_summary = metadata.get('cache_metrics_summary', {})
+        overall_cache = metadata.get('overall_cache_metrics', {})
+        
+        if overall_cache.get('initial_stats') and overall_cache.get('final_stats'):
+            print(f"\nOverall Cache Performance:")
+            initial = overall_cache['initial_stats']
+            final = overall_cache['final_stats']
+            
+            if 'gpu_prefix_cache_hit_rate' in final:
+                print(f"- Final cache hit rate: {final['gpu_prefix_cache_hit_rate']:.2%}")
+            
+            if 'gpu_cache_usage_perc' in final:
+                print(f"- Final GPU cache usage: {final['gpu_cache_usage_perc']:.2%}")
+        
         if 'average_cache_hit_rate' in cache_summary:
             print(f"\nPrefix Cache Performance:")
             print(f"- Average cache hit rate: {cache_summary['average_cache_hit_rate']:.2%}")
