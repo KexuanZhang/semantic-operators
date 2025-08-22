@@ -273,14 +273,16 @@ Sentiment:"""
         if text_column not in df.columns:
             raise ValueError(f"Column '{text_column}' not found in dataset. Available columns: {list(df.columns)}")
         
-        # Initialize results
-        results = []
+        # Initialize results tracking
         start_time = time.time()
         
         # Get initial cache stats
         initial_cache_stats = self.get_cache_stats()
         
         print(f"Starting sentiment analysis for {len(df)} samples...")
+        
+        # Create summary - count unique responses
+        response_counts = {}
         
         # Process each row
         for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
@@ -289,26 +291,12 @@ Sentiment:"""
             # Skip empty texts
             if not text or text.lower() == 'nan':
                 sentiment = "POSITIVE"  # Default for empty texts
-                row_inference_time = 0.0
             else:
                 # Analyze sentiment
-                row_start_time = time.time()
                 sentiment = self.analyze_sentiment(text)
-                row_end_time = time.time()
-                row_inference_time = row_end_time - row_start_time
             
-            # Store result - just save the raw LLM response
-            result = {
-                'index': idx,
-                'text': text,
-                'llm_response': sentiment,  # Raw LLM response
-                'inference_time': row_inference_time,
-                'timestamp': datetime.now().isoformat()
-            }
-            
-            # Do not add original dataset columns to keep results clean
-            
-            results.append(result)
+            # Count responses for summary
+            response_counts[sentiment] = response_counts.get(sentiment, 0) + 1
         
         # Calculate total time
         end_time = time.time()
@@ -336,10 +324,10 @@ Sentiment:"""
             'dataset_path': dataset_path,
             'text_column': text_column,
             'total_samples': len(df),
-            'processed_samples': len(results),
+            'processed_samples': len(df),
             'response_counts': response_counts,
             'total_inference_time_seconds': total_inference_time,
-            'average_inference_time_seconds': total_inference_time / len(results) if results else 0,
+            'average_inference_time_seconds': total_inference_time / len(df) if len(df) > 0 else 0,
             'experiment_timestamp': datetime.now().isoformat(),
             'gpu_devices': self.gpu_devices,
             'sampling_params': {
@@ -352,7 +340,7 @@ Sentiment:"""
         }
         
         return {
-            'results': results,
+            'results': [],  # No per-inference results saved
             'metadata': experiment_metadata
         }
     
@@ -377,6 +365,10 @@ Sentiment:"""
             results_df = pd.DataFrame(experiment_data['results'])
             csv_file = self.results_dir / f"{experiment_name}_results.csv"
             results_df.to_csv(csv_file, index=False)
+        else:
+            csv_file = self.results_dir / f"{experiment_name}_no_individual_results.txt"
+            with open(csv_file, 'w') as f:
+                f.write("No per-inference results saved. See metadata for overall statistics.")
         
         # Save summary metadata
         metadata_file = self.results_dir / f"{experiment_name}_metadata.json"
