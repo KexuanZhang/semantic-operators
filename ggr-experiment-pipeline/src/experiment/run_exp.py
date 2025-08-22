@@ -72,12 +72,30 @@ class SentimentAnalysisExperiment:
             self.llm = LLM(
                 model=self.model_path,
                 trust_remote_code=True,
-                gpu_memory_utilization=0.8,  # Use 80% of GPU memory
+                gpu_memory_utilization=0.95,  # Use 95% of GPU memory
+                max_model_len=6256,  # Set to estimated maximum based on available memory
+                # Enable additional memory optimizations
+                enforce_eager=True,  # Use eager execution to save memory
+                disable_custom_all_reduce=True,  # Disable custom all-reduce to save memory
             )
             print("Model loaded successfully!")
         except Exception as e:
             print(f"Error loading model: {e}")
-            raise
+            # Try with even more conservative settings if first attempt fails
+            print("Retrying with more conservative memory settings...")
+            try:
+                self.llm = LLM(
+                    model=self.model_path,
+                    trust_remote_code=True,
+                    gpu_memory_utilization=0.90,  # Reduce to 90%
+                    max_model_len=4000,  # Further reduce max length
+                    enforce_eager=True,
+                    disable_custom_all_reduce=True,
+                )
+                print("Model loaded successfully with conservative settings!")
+            except Exception as e2:
+                print(f"Failed with conservative settings too: {e2}")
+                raise
     
     def create_sentiment_prompt(self, text: str) -> str:
         """
