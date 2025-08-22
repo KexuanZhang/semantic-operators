@@ -21,29 +21,36 @@ class SentimentAnalysisExperiment:
     - Saving results and inference times
     """
     
-    def __init__(self, model_path: str, results_dir: str = "results", gpu_device: Optional[str] = None):
+    def __init__(self, model_path: str, results_dir: str = "results", gpu_devices: Optional[List[int]] = None):
         """
         Initialize the experiment with model path and results directory.
         
         Args:
             model_path: Path to the local LLM model
             results_dir: Directory to save experiment results
-            gpu_device: GPU device to use (e.g., "cuda:0", "cuda:1", etc.)
+            gpu_devices: List of GPU device IDs to use (e.g., [0, 1] or [6, 7])
         """
         self.model_path = model_path
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(exist_ok=True)
-        self.gpu_device = gpu_device
+        self.gpu_devices = gpu_devices
         
         # Set environment variable for cached outputs
         os.environ["VLLM_USE_CACHED_OUTPUTS"] = "True"
         
-        # Set GPU device if specified
-        if gpu_device and torch.cuda.is_available():
-            device_id = gpu_device.split(":")[-1] if ":" in gpu_device else "0"
-            os.environ["CUDA_VISIBLE_DEVICES"] = device_id
-            torch.cuda.set_device(int(device_id))
-            print(f"Using GPU device: {gpu_device}")
+        # Set GPU devices if specified
+        if gpu_devices and torch.cuda.is_available():
+            # Set CUDA_VISIBLE_DEVICES to the specified GPUs
+            gpu_ids_str = ",".join(str(gpu_id) for gpu_id in gpu_devices)
+            os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
+            print(f"Using GPU devices: {gpu_devices} (CUDA_VISIBLE_DEVICES={gpu_ids_str})")
+            
+            # Set the primary device to the first GPU in the list
+            torch.cuda.set_device(0)  # After setting CUDA_VISIBLE_DEVICES, use index 0
+        elif torch.cuda.is_available():
+            print("Using default GPU device")
+        else:
+            print("CUDA not available, using CPU")
         
         # Clear GPU memory
         if torch.cuda.is_available():
@@ -200,7 +207,7 @@ Sentiment:"""
             'total_inference_time_seconds': total_inference_time,
             'average_inference_time_seconds': total_inference_time / len(results) if results else 0,
             'experiment_timestamp': datetime.now().isoformat(),
-            'gpu_device': self.gpu_device,
+            'gpu_devices': self.gpu_devices,
             'sampling_params': {
                 'temperature': self.sampling_params.temperature,
                 'top_p': self.sampling_params.top_p,
@@ -308,12 +315,22 @@ def main():
     )
     
     parser.add_argument(
-        "--gpu-device",
+        "--gpus",
         type=str,
-        help="GPU device to use for inference (e.g., 'cuda:0', 'cuda:1'). If not specified, will use default GPU."
+        help="Comma-separated list of GPU device IDs to use for inference (e.g., '6,7' or '0,1,2,3'). If not specified, will use default GPU."
     )
     
     args = parser.parse_args()
+    
+    # Parse GPU devices
+    gpu_devices = None
+    if args.gpus:
+        try:
+            gpu_devices = [int(gpu_id.strip()) for gpu_id in args.gpus.split(',')]
+            print(f"Parsed GPU devices: {gpu_devices}")
+        except ValueError:
+            print(f"Error: Invalid GPU device format '{args.gpus}'. Use comma-separated integers like '6,7'")
+            return 1
     
     # Validate input paths
     if not os.path.exists(args.model_path):
@@ -329,7 +346,7 @@ def main():
         experiment = SentimentAnalysisExperiment(
             model_path=args.model_path,
             results_dir=args.results_dir,
-            gpu_device=args.gpu_device
+            gpu_devices=gpu_devices
         )
         
         # Load model
