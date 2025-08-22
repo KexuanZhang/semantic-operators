@@ -1759,7 +1759,7 @@ class SimpleLLMExperiment:
         f.write(f"2. [Performance Summary](#2-performance-summary)\n")
         f.write(f"3. [vLLM Engine Metrics](#3-vllm-engine-metrics)\n")
         f.write(f"4. [Resource Utilization](#4-resource-utilization)\n")
-        f.write(f"5. [Batch Processing Analysis](#5-batch-processing-analysis)\n")
+        f.write(f"5. [Processing Overview](#5-processing-overview)\n")
         f.write(f"6. [KV Cache Visualizations](#6-kv-cache-visualizations)\n")
         f.write(f"7. [Analysis & Recommendations](#7-analysis--recommendations)\n")
         f.write(f"8. [Data Exports](#8-data-exports)\n\n")
@@ -1797,9 +1797,7 @@ class SimpleLLMExperiment:
         f.write(f"|--------|-------|\n")
         f.write(f"| **Estimated Total Tokens** | {perf.get('estimated_total_tokens', 0):,} |\n")
         f.write(f"| **Input Tokens** | {perf.get('estimated_input_tokens', 0):,} |\n")
-        f.write(f"| **Output Tokens** | {perf.get('estimated_output_tokens', 0):,} |\n")
-        f.write(f"| **Successful Batches** | {perf.get('successful_batches', 0)} |\n")
-        f.write(f"| **Failed Batches** | {perf.get('failed_batches', 0)} |\n\n")
+        f.write(f"| **Output Tokens** | {perf.get('estimated_output_tokens', 0):,} |\n\n")
     
     def _write_vllm_metrics_analysis(self, f, experiment_results: Dict[str, Any]):
         """Write vLLM metrics analysis section"""
@@ -1945,31 +1943,10 @@ class SimpleLLMExperiment:
         f.write(f"- **Sampling Interval**: {resource_data.get('sampling_interval_seconds', 0):.1f}s\n\n")
     
     def _write_batch_analysis(self, f, experiment_results: Dict[str, Any]):
-        """Write batch processing analysis"""
-        batch_metrics = experiment_results.get('batch_metrics', [])
-        if not batch_metrics:
-            f.write(f"## 5. Batch Processing Analysis\n\n")
-            f.write(f"Batch metrics not available.\n\n")
-            return
-            
-        f.write(f"## 5. Batch Processing Analysis\n\n")
-        f.write(f"### 📦 Batch Performance Overview\n\n")
-        f.write(f"| Batch | Size | Duration | Input Tokens | Output Tokens | Throughput |\n")
-        f.write(f"|-------|------|----------|--------------|---------------|------------|\n")
-        
-        for batch in batch_metrics[:10]:  # Show first 10 batches
-            batch_idx = batch.get('batch_idx', 'N/A')
-            batch_size = batch.get('batch_size', 0)
-            duration = batch.get('batch_duration', 0)
-            input_tokens = batch.get('batch_input_tokens', 0)
-            output_tokens = batch.get('batch_output_tokens', 0)
-            throughput = batch.get('batch_throughput_tokens_per_sec', 0)
-            f.write(f"| {batch_idx} | {batch_size} | {duration:.2f}s | {input_tokens} | {output_tokens} | {throughput:.1f} |\n")
-        
-        if len(batch_metrics) > 10:
-            f.write(f"\n*Showing first 10 of {len(batch_metrics)} batches*\n")
-        
-        f.write(f"\n")
+        """Write batch processing analysis - disabled as batch monitoring has been removed"""
+        f.write(f"## 5. Processing Overview\n\n")
+        f.write(f"Batch monitoring functionality has been removed from the experiment pipeline.\n")
+        f.write(f"All prompts are now processed efficiently in a single operation.\n\n")
     
     def _write_kv_cache_visualizations(self, f, experiment_results: Dict[str, Any], output_folder: str):
         """Write KV cache visualizations section"""
@@ -2054,7 +2031,6 @@ class SimpleLLMExperiment:
         expected_files = [
             ("experiment_results.json", "Complete experiment results in JSON format"),
             ("query_results.csv", "Individual query results and processing times"),
-            ("batch_metrics.csv", "Batch-level performance metrics"),
             ("resource_metrics.csv", "System resource utilization over time"),
             ("vllm_metrics.json", "vLLM engine metrics and statistics")
         ]
@@ -2072,7 +2048,7 @@ class SimpleLLMExperiment:
         f.write(f"# View JSON results\n")
         f.write(f"jq . {output_folder}/experiment_results.json\n\n")
         f.write(f"# Analyze CSV data with pandas\n")
-        f.write(f"python -c \"import pandas as pd; df = pd.read_csv('{output_folder}/batch_metrics.csv'); print(df.describe())\"\n")
+        f.write(f"python -c \"import pandas as pd; df = pd.read_csv('{output_folder}/query_results.csv'); print(df.describe())\"\n")
         f.write(f"```\n\n")
         
         f.write(f"---\n\n")
@@ -2212,57 +2188,26 @@ class SimpleLLMExperiment:
             prompt_creation_time = time.time() - prompt_start_time
             logger.info(f"✅ Created {len(prompts)} prompts in {prompt_creation_time:.2f}s")
             
-            # Run inference in batches
+            # Run inference
             logger.info("🧠 Starting inference...")
             inference_start_time = time.time()
             
             all_results = []
-            batch_metrics = []
-            successful_batches = 0
-            failed_batches = 0
             
-            # Process in batches
-            for i in range(0, len(prompts), batch_size):
-                batch_idx = i // batch_size
-                batch_prompts = prompts[i:i + batch_size]
-                batch_start_time = time.time()
-                
-                logger.info(f"Processing batch {batch_idx + 1}/{(len(prompts) + batch_size - 1) // batch_size} "
-                           f"({len(batch_prompts)} prompts)...")
-                
-                try:
-                    batch_results = self.run_batch_inference(batch_prompts, batch_size)
+            # Process all prompts directly
+            logger.info(f"Processing {len(prompts)} prompts...")
+            
+            try:
+                all_results = self.run_batch_inference(prompts, batch_size)
+                if len(all_results) != len(prompts):
+                    logger.error(f"Result count mismatch: expected {len(prompts)}, got {len(all_results)}")
+                    all_results = ["ERROR"] * len(prompts)
+                else:
+                    logger.info(f"✅ Inference completed successfully")
                     
-                    if len(batch_results) == len(batch_prompts):
-                        all_results.extend(batch_results)
-                        successful_batches += 1
-                        
-                        # Calculate batch metrics
-                        batch_duration = time.time() - batch_start_time
-                        batch_input_tokens = sum(self.estimate_tokens(p) for p in batch_prompts)
-                        batch_output_tokens = sum(self.estimate_tokens(r) for r in batch_results)
-                        batch_throughput = (batch_input_tokens + batch_output_tokens) / batch_duration
-                        
-                        batch_metrics.append({
-                            'batch_idx': batch_idx,
-                            'batch_size': len(batch_prompts),
-                            'batch_duration': batch_duration,
-                            'batch_input_tokens': batch_input_tokens,
-                            'batch_output_tokens': batch_output_tokens,
-                            'batch_throughput_tokens_per_sec': batch_throughput
-                        })
-                        
-                        logger.info(f"✅ Batch {batch_idx + 1} completed in {batch_duration:.2f}s "
-                                   f"({batch_throughput:.1f} tokens/sec)")
-                    else:
-                        logger.error(f"Batch {batch_idx + 1} failed: mismatched results count")
-                        failed_batches += 1
-                        all_results.extend(["ERROR"] * len(batch_prompts))
-                        
-                except Exception as e:
-                    logger.error(f"Batch {batch_idx + 1} failed with error: {e}")
-                    failed_batches += 1
-                    all_results.extend(["ERROR"] * len(batch_prompts))
+            except Exception as e:
+                logger.error(f"Inference failed with error: {e}")
+                all_results = ["ERROR"] * len(prompts)
             
             total_inference_time = time.time() - inference_start_time
             logger.info(f"🎉 Inference completed in {total_inference_time:.2f}s")
@@ -2320,14 +2265,7 @@ class SimpleLLMExperiment:
                     'estimated_total_tokens': estimated_total_tokens,
                     'estimated_input_tokens': estimated_input_tokens,
                     'estimated_output_tokens': estimated_output_tokens,
-                    'overall_throughput_tokens_per_sec': estimated_total_tokens / total_inference_time if total_inference_time > 0 else 0,
-                    'batch_statistics': {
-                        'successful_batches': successful_batches,
-                        'failed_batches': failed_batches,
-                        'total_batches': successful_batches + failed_batches,
-                        'success_rate_percent': (successful_batches / (successful_batches + failed_batches) * 100) if (successful_batches + failed_batches) > 0 else 0
-                    },
-                    'batch_metrics': batch_metrics
+                    'overall_throughput_tokens_per_sec': estimated_total_tokens / total_inference_time if total_inference_time > 0 else 0
                 },
                 'system_resource_usage': resource_stats or {},
                 'vllm_metrics': {
@@ -2365,7 +2303,12 @@ class SimpleLLMExperiment:
             logger.info(f"📁 Primary output: {results_json_path}")
             logger.info(f"📊 Processed {len(df)} rows in {total_experiment_time:.2f}s")
             logger.info(f"⚡ Overall throughput: {experiment_results['inference_performance']['overall_throughput_tokens_per_sec']:.1f} tokens/sec")
-            logger.info(f"✅ Success rate: {experiment_results['inference_performance']['batch_statistics']['success_rate_percent']:.1f}%")
+            
+            # Calculate success rate from results
+            successful_responses = len([r for r in all_results if r != "ERROR"])
+            total_responses = len(all_results)
+            success_rate = (successful_responses / total_responses * 100) if total_responses > 0 else 0
+            logger.info(f"✅ Success rate: {success_rate:.1f}%")
             
             # Log key vLLM metrics if available
             if experiment_results['vllm_metrics']['metrics_available']:
