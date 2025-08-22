@@ -4,6 +4,13 @@ Simple LLM Query Experiment Script with vLLM
 Uses predefined query templates to run experiments on datasets with GPU support
 Includes comprehensive resource monitoring and KV cache tracking
 
+*** OPTIMIZED FOR FAIR PERFORMANCE COMPARISON ***
+- Monitoring runs in separate threads to avoid interference with inference timing
+- Resource monitoring: 10 second intervals (reduced from 2s)
+- vLLM metrics monitoring: 15 second intervals (reduced from 1s)
+- Only saves comprehensive JSON stats file for focused analysis
+- Uses modern prefix cache counters: hits/queries instead of deprecated hit_rate
+
 Multi-GPU Usage Examples:
   # Use multiple GPUs to handle large models (recommended for 7B+ models)
   python run_experiment.py dataset.csv query_key --gpus "4,5,6,7"
@@ -288,11 +295,11 @@ QUERY_TEMPLATES = {
 
 
 class ResourceMonitor:
-    """Monitor system resources during inference"""
+    """Monitor system resources during inference with minimal performance impact"""
     
-    def __init__(self, gpu_id: int = 0, sampling_interval: float = 2.0):
+    def __init__(self, gpu_id: int = 0, sampling_interval: float = 5.0):
         self.gpu_id = gpu_id
-        self.sampling_interval = sampling_interval
+        self.sampling_interval = max(sampling_interval, 5.0)  # Minimum 5 seconds to reduce impact
         self.monitoring = False
         self.metrics_log = []
         self.monitor_thread = None
@@ -309,19 +316,20 @@ class ResourceMonitor:
         """Stop resource monitoring"""
         self.monitoring = False
         if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=5.0)
+            self.monitor_thread.join(timeout=10.0)
         logger.info("Stopped resource monitoring")
         
     def _monitor_loop(self):
-        """Main monitoring loop running in background"""
+        """Main monitoring loop running in background - optimized for minimal interference"""
         while self.monitoring:
             try:
                 timestamp = time.time()
+                # Use threading to collect metrics without blocking
                 metrics = self._collect_metrics(timestamp)
                 if metrics:
                     self.metrics_log.append(metrics)
             except Exception as e:
-                logger.warning(f"Error collecting metrics: {e}")
+                logger.debug(f"Error collecting metrics: {e}")  # Use debug level to avoid spam
             
             time.sleep(self.sampling_interval)
     
@@ -465,10 +473,10 @@ class ResourceMonitor:
 class VLLMMetricsCollector:
     """Enhanced vLLM metrics collector using official Prometheus metrics"""
     
-    def __init__(self, llm_instance=None):
+    def __init__(self, llm_instance=None, collection_interval=10.0):
         self.llm = llm_instance
         self.stats_history = []
-        self.collection_interval = 1.0
+        self.collection_interval = max(collection_interval, 10.0)  # Minimum 10 seconds for fair comparison
         self.monitoring = False
         self.monitor_thread = None
         self.modern_logging_available = False
@@ -485,9 +493,11 @@ class VLLMMetricsCollector:
             'gpu_cache_usage_perc': 'vllm:gpu_cache_usage_perc',
             'cpu_cache_usage_perc': 'vllm:cpu_cache_usage_perc',  # Deprecated but may exist
             
-            # Prefix Cache Hit Rates - KEY PERFORMANCE INDICATORS
-            'gpu_prefix_cache_hit_rate': 'vllm:gpu_prefix_cache_hit_rate',  # Deprecated but may exist
-            'cpu_prefix_cache_hit_rate': 'vllm:cpu_prefix_cache_hit_rate',  # Deprecated but may exist
+            # Modern Prefix Cache Counters (V1 engine and newer)
+            'gpu_prefix_cache_hits': 'vllm:gpu_prefix_cache_hits',
+            'gpu_prefix_cache_queries': 'vllm:gpu_prefix_cache_queries',
+            'cpu_prefix_cache_hits': 'vllm:cpu_prefix_cache_hits',
+            'cpu_prefix_cache_queries': 'vllm:cpu_prefix_cache_queries',
             
             # Token counters
             'prompt_tokens_total': 'vllm:prompt_tokens_total',
@@ -672,17 +682,35 @@ class VLLMMetricsCollector:
                                     cpu_usage = 1.0 - (free_cpu / total_cpu)
                                     metrics['cpu_cache_usage_sys'] = cpu_usage
                         
-                        # Try to get prefix cache hit rates
+                        # Try to get prefix cache counters (modern approach)
+                        if hasattr(scheduler, 'get_prefix_cache_stats'):
+                            try:
+                                # Try to get prefix cache statistics directly
+                                cache_stats = scheduler.get_prefix_cache_stats()
+                                if isinstance(cache_stats, dict):
+                                    metrics.update(cache_stats)
+                            except Exception as e:
+                                stats_data['debug_info']['cache_stats_error'] = str(e)
+                        
+                        # Fallback: Try individual prefix cache hit rates (deprecated but may exist)
                         if hasattr(scheduler, 'get_prefix_cache_hit_rate'):
                             try:
                                 # Try different ways to access Device enum
                                 try:
-                                    # Method 1: Try vllm.utils.Device
-                                    from vllm.utils import Device
-                                    gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
-                                    metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
-                                    cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
-                                    metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
+                                    # Method 1: Try importing Device from various locations
+                                    try:
+                                        from vllm.utils import Device
+                                        gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
+                                        metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                        cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
+                                        metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
+                                    except ImportError:
+                                        # Try alternative import path
+                                        from vllm.engine.llm_engine import Device
+                                        gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.GPU)
+                                        metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
+                                        cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(Device.CPU)
+                                        metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
                                 except (ImportError, AttributeError):
                                     # Method 2: Try with string device names
                                     try:
@@ -691,24 +719,12 @@ class VLLMMetricsCollector:
                                         cpu_hit_rate = scheduler.get_prefix_cache_hit_rate("cpu")
                                         metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
                                     except Exception:
-                                        # Method 3: Try without device parameter
+                                        # Method 3: Try without device parameter (aggregate)
                                         try:
                                             hit_rate = scheduler.get_prefix_cache_hit_rate()
                                             metrics['prefix_cache_hit_rate'] = hit_rate
                                         except Exception:
                                             pass
-                            except Exception as e:
-                                stats_data['debug_info']['cache_hit_rate_error'] = str(e)
-                                            metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
-                                        except:
-                                            # Try with integer values (0=GPU, 1=CPU)
-                                            try:
-                                                gpu_hit_rate = scheduler.get_prefix_cache_hit_rate(0)
-                                                cpu_hit_rate = scheduler.get_prefix_cache_hit_rate(1)
-                                                metrics['gpu_prefix_cache_hit_rate'] = gpu_hit_rate
-                                                metrics['cpu_prefix_cache_hit_rate'] = cpu_hit_rate
-                                            except:
-                                                pass
                             except Exception as e:
                                 stats_data['debug_info']['cache_hit_rate_error'] = str(e)
                     
@@ -1033,7 +1049,7 @@ class VLLMMetricsCollector:
         logger.info(f"✅ Testing mode enabled with {len(self.stats_history)} data points")
     
     def start_monitoring(self):
-        """Start background monitoring"""
+        """Start background monitoring with minimal performance impact"""
         if self.monitoring:
             logger.info("vLLM metrics monitoring already active")
             return
@@ -1043,9 +1059,10 @@ class VLLMMetricsCollector:
             self.initialize_logging()
             
         self.monitoring = True
+        self.collection_interval = max(self.collection_interval, 10.0)  # Minimum 10 seconds to reduce impact
         self.monitor_thread = threading.Thread(target=self._monitoring_loop, daemon=True)
         self.monitor_thread.start()
-        logger.info("Started vLLM Prometheus metrics monitoring thread")
+        logger.info(f"Started vLLM metrics monitoring (interval: {self.collection_interval}s)")
         
     def stop_monitoring(self):
         """Stop background monitoring"""
@@ -1054,16 +1071,17 @@ class VLLMMetricsCollector:
             
         self.monitoring = False
         if self.monitor_thread and self.monitor_thread.is_alive():
-            self.monitor_thread.join(timeout=3.0)
+            self.monitor_thread.join(timeout=15.0)
         logger.info("Stopped vLLM metrics monitoring")
         
     def _monitoring_loop(self):
-        """Enhanced monitoring loop collecting Prometheus metrics"""
+        """Optimized monitoring loop with reduced interference"""
         consecutive_failures = 0
-        max_failures = 10
+        max_failures = 5  # Reduce failure tolerance
         
         while self.monitoring:
             try:
+                # Use a separate thread for metrics collection to avoid blocking
                 stats = self.collect_prometheus_metrics()
                 
                 if stats.get('stats_available', False):
@@ -1077,26 +1095,25 @@ class VLLMMetricsCollector:
                     # Reset failure counter on success
                     consecutive_failures = 0
                     
-                    # Log key metrics periodically
-                    if len(self.stats_history) % 10 == 0:
+                    # Log key metrics less frequently
+                    if len(self.stats_history) % 30 == 0:  # Log every 30 collections instead of 10
                         self._log_key_prometheus_metrics(stats)
                         
                 else:
                     consecutive_failures += 1
-                    if consecutive_failures == 1:
-                        logger.debug("vLLM Prometheus metrics collection failed, will retry")
-                    elif consecutive_failures >= max_failures:
-                        logger.warning(f"vLLM Prometheus metrics collection failed {max_failures} times")
-                        consecutive_failures = 0  # Reset to avoid spam
+                    if consecutive_failures >= max_failures:
+                        logger.debug(f"vLLM metrics collection failed {max_failures} times, reducing frequency")
+                        self.collection_interval = min(self.collection_interval * 1.5, 30.0)  # Increase interval on failures
+                        consecutive_failures = 0
                 
                 # Keep history manageable
-                if len(self.stats_history) > 1000:
-                    self.stats_history = self.stats_history[-500:]
+                if len(self.stats_history) > 100:  # Reduce history size
+                    self.stats_history = self.stats_history[-50:]
                     
             except Exception as e:
                 consecutive_failures += 1
                 if consecutive_failures == 1:
-                    logger.debug(f"Error in vLLM Prometheus monitoring loop: {e}")
+                    logger.debug(f"Error in vLLM monitoring loop: {e}")
                 
             time.sleep(self.collection_interval)
     
@@ -1199,17 +1216,70 @@ class VLLMMetricsCollector:
             # Key metrics summary
             summary['key_metrics'] = {}
             
+    def _calculate_prefix_cache_hit_rate(self, metrics_found: Dict[str, Any]) -> Dict[str, float]:
+        """Calculate prefix cache hit rates from modern counter metrics"""
+        hit_rates = {}
+        
+        # GPU prefix cache hit rate
+        gpu_hits = metrics_found.get('vllm:gpu_prefix_cache_hits', 0)
+        gpu_queries = metrics_found.get('vllm:gpu_prefix_cache_queries', 0)
+        if gpu_queries > 0:
+            hit_rates['gpu_prefix_cache_hit_rate'] = gpu_hits / gpu_queries
+            hit_rates['gpu_prefix_cache_hit_rate_percent'] = (gpu_hits / gpu_queries) * 100
+        
+        # CPU prefix cache hit rate  
+        cpu_hits = metrics_found.get('vllm:cpu_prefix_cache_hits', 0)
+        cpu_queries = metrics_found.get('vllm:cpu_prefix_cache_queries', 0)
+        if cpu_queries > 0:
+            hit_rates['cpu_prefix_cache_hit_rate'] = cpu_hits / cpu_queries
+            hit_rates['cpu_prefix_cache_hit_rate_percent'] = (cpu_hits / cpu_queries) * 100
+        
+        # Store raw counters for reference
+        hit_rates['gpu_prefix_cache_hits'] = gpu_hits
+        hit_rates['gpu_prefix_cache_queries'] = gpu_queries
+        hit_rates['cpu_prefix_cache_hits'] = cpu_hits
+        hit_rates['cpu_prefix_cache_queries'] = cpu_queries
+        
+        return hit_rates
+
+    def get_comprehensive_stats(self) -> Dict[str, Any]:
+        """Get comprehensive statistics with modern prefix cache metrics analysis"""
+        current_stats = self.collect_prometheus_metrics()
+        
+        summary = {
+            'latest_stats': current_stats,
+            'monitoring_active': self.monitoring,
+            'total_collections': len(self.stats_history),
+            'collection_interval': self.collection_interval,
+            'modern_metrics_enabled': self.modern_logging_available,
+            'last_successful_collection': self.last_stats.get('collection_time', 0),
+            'collection_method': current_stats.get('collection_method', 'prometheus_registry')
+        }
+        
+        # Prometheus metrics analysis
+        if current_stats.get('stats_available', False):
+            metrics_found = current_stats.get('metrics_found', {})
+            histogram_data = current_stats.get('histogram_data', {})
+            
+            # Key metrics summary
+            summary['key_metrics'] = {}
+            
             # KV Cache Usage
             if 'vllm:gpu_cache_usage_perc' in metrics_found:
                 cache_usage = metrics_found['vllm:gpu_cache_usage_perc']
                 summary['key_metrics']['gpu_cache_usage_percent'] = cache_usage * 100
                 summary['key_metrics']['gpu_cache_usage_raw'] = cache_usage
             
-            # Prefix Cache Hit Rate (if available - may be deprecated)
+            # Calculate prefix cache hit rates from counters (modern approach)
+            hit_rate_data = self._calculate_prefix_cache_hit_rate(metrics_found)
+            summary['key_metrics'].update(hit_rate_data)
+            
+            # Fallback: Check for deprecated direct hit rate metrics
             if 'vllm:gpu_prefix_cache_hit_rate' in metrics_found:
                 hit_rate = metrics_found['vllm:gpu_prefix_cache_hit_rate']
-                summary['key_metrics']['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
-                summary['key_metrics']['gpu_prefix_cache_hit_rate_raw'] = hit_rate
+                if 'gpu_prefix_cache_hit_rate' not in summary['key_metrics']:
+                    summary['key_metrics']['gpu_prefix_cache_hit_rate_percent'] = hit_rate * 100
+                    summary['key_metrics']['gpu_prefix_cache_hit_rate_raw'] = hit_rate
             
             # Request Queue Status
             for metric_key in ['vllm:num_requests_running', 'vllm:num_requests_waiting', 'vllm:num_requests_swapped']:
@@ -1563,8 +1633,13 @@ class SimpleLLMExperiment:
         self.output_dir = output_dir
         self.llm = None
         self.sampling_params = None
-        self.resource_monitor = ResourceMonitor(gpu_id=self.gpu_id)
-        self.vllm_metrics_collector = VLLMMetricsCollector(llm_instance=None)  # Will be updated after model init
+        
+        # Use optimized monitoring intervals for fair comparison
+        self.resource_monitor = ResourceMonitor(gpu_id=self.gpu_id, sampling_interval=10.0)  # 10 second intervals
+        self.vllm_metrics_collector = VLLMMetricsCollector(
+            llm_instance=None,  # Will be updated after model init
+            collection_interval=15.0  # 15 second intervals for vLLM metrics
+        )
         
         # Validate local model if it's a local path
         if self.is_local_model:
@@ -2341,11 +2416,6 @@ class SimpleLLMExperiment:
             if self.vllm_metrics_collector:
                 self.vllm_metrics_collector.stop_monitoring()
                 final_vllm_stats = self.vllm_metrics_collector.get_comprehensive_stats()
-                
-                # Save vLLM metrics to CSV
-                vllm_csv_path = os.path.join(output_folder, "vllm_metrics.csv")
-                self.vllm_metrics_collector.save_metrics(vllm_csv_path)
-                
                 logger.info(f"📊 vLLM metrics collected: {len(self.vllm_metrics_collector.stats_history)} data points")
             
             # Calculate performance metrics
@@ -2354,105 +2424,90 @@ class SimpleLLMExperiment:
             estimated_output_tokens = sum(self.estimate_tokens(r) for r in all_results if r != "ERROR")
             estimated_total_tokens = estimated_input_tokens + estimated_output_tokens
             
-            performance_metrics = {
-                'total_experiment_time': total_experiment_time,
-                'total_inference_time': total_inference_time,
-                'prompt_creation_time': prompt_creation_time,
-                'avg_time_per_row': total_inference_time / len(df) if len(df) > 0 else 0,
-                'estimated_total_tokens': estimated_total_tokens,
-                'estimated_input_tokens': estimated_input_tokens,
-                'estimated_output_tokens': estimated_output_tokens,
-                'overall_throughput_tokens_per_sec': estimated_total_tokens / total_inference_time if total_inference_time > 0 else 0,
-                'successful_batches': successful_batches,
-                'failed_batches': failed_batches,
-                'total_batches': successful_batches + failed_batches,
-                'success_rate_percent': (successful_batches / (successful_batches + failed_batches) * 100) if (successful_batches + failed_batches) > 0 else 0
-            }
-            
-            # Save results
-            logger.info("💾 Saving results...")
-            
-            # Create results DataFrame
-            results_df = df.copy()
-            results_df['llm_response'] = all_results
-            results_df['processing_time'] = [total_inference_time / len(df)] * len(df)  # Approximate
-            
-            # Save to CSV
-            results_csv_path = os.path.join(output_folder, "query_results.csv")
-            results_df.to_csv(results_csv_path, index=False)
-            logger.info(f"💾 Results saved: {results_csv_path}")
-            
-            # Save batch metrics
-            if batch_metrics:
-                batch_df = pd.DataFrame(batch_metrics)
-                batch_csv_path = os.path.join(output_folder, "batch_metrics.csv")
-                batch_df.to_csv(batch_csv_path, index=False)
-                logger.info(f"📊 Batch metrics saved: {batch_csv_path}")
-            
-            # Save resource monitoring data
-            if resource_stats and self.resource_monitor.metrics_log:
-                resource_df = pd.DataFrame(self.resource_monitor.metrics_log)
-                resource_csv_path = os.path.join(output_folder, "resource_metrics.csv")
-                resource_df.to_csv(resource_csv_path, index=False)
-                logger.info(f"🖥️ Resource metrics saved: {resource_csv_path}")
-            
-            # Prepare comprehensive results
+            # Create comprehensive experiment results JSON
             experiment_results = {
-                'experiment_info': {
+                'experiment_metadata': {
+                    'timestamp': timestamp,
                     'dataset_path': dataset_path,
                     'query_key': query_key,
                     'query_type': template.get('type', 'unknown'),
                     'custom_query': custom_query,
                     'model_name': self.model_name,
-                    'gpu_id': self.gpu_id,
-                    'gpu_ids': self.gpu_ids,
-                    'batch_size': batch_size,
-                    'max_rows': max_rows,
-                    'total_rows': len(df),
-                    'processed_rows': len(all_results),
-                    'experiment_timestamp': timestamp,
-                    'output_folder': output_folder
+                    'gpu_config': {
+                        'gpu_id': self.gpu_id,
+                        'gpu_ids': self.gpu_ids,
+                        'gpu_memory_utilization': self.gpu_memory_utilization
+                    },
+                    'inference_config': {
+                        'batch_size': batch_size,
+                        'max_tokens': self.max_tokens,
+                        'temperature': self.temperature,
+                        'top_p': self.top_p
+                    },
+                    'dataset_stats': {
+                        'total_rows': len(df),
+                        'processed_rows': len(all_results),
+                        'max_rows_limit': max_rows
+                    }
                 },
-                'performance_metrics': performance_metrics,
-                'batch_metrics': batch_metrics,
-                'resource_monitoring': resource_stats,
+                'inference_performance': {
+                    'total_experiment_time_seconds': total_experiment_time,
+                    'total_inference_time_seconds': total_inference_time,
+                    'prompt_creation_time_seconds': prompt_creation_time,
+                    'avg_time_per_row_seconds': total_inference_time / len(df) if len(df) > 0 else 0,
+                    'estimated_total_tokens': estimated_total_tokens,
+                    'estimated_input_tokens': estimated_input_tokens,
+                    'estimated_output_tokens': estimated_output_tokens,
+                    'overall_throughput_tokens_per_sec': estimated_total_tokens / total_inference_time if total_inference_time > 0 else 0,
+                    'batch_statistics': {
+                        'successful_batches': successful_batches,
+                        'failed_batches': failed_batches,
+                        'total_batches': successful_batches + failed_batches,
+                        'success_rate_percent': (successful_batches / (successful_batches + failed_batches) * 100) if (successful_batches + failed_batches) > 0 else 0
+                    },
+                    'batch_metrics': batch_metrics
+                },
+                'system_resource_usage': resource_stats or {},
                 'vllm_metrics': {
-                    'prefix_caching_enabled': True,  # We enabled it in model config
-                    'initial_stats': initial_vllm_stats if 'initial_vllm_stats' in locals() else {},
-                    'final_stats': final_vllm_stats or {}
+                    'metrics_available': final_vllm_stats is not None and final_vllm_stats.get('latest_stats', {}).get('stats_available', False),
+                    'collection_method': final_vllm_stats.get('collection_method', 'none') if final_vllm_stats else 'none',
+                    'monitoring_active': final_vllm_stats.get('monitoring_active', False) if final_vllm_stats else False,
+                    'total_collections': final_vllm_stats.get('total_collections', 0) if final_vllm_stats else 0,
+                    'key_metrics': final_vllm_stats.get('key_metrics', {}) if final_vllm_stats else {},
+                    'histogram_analysis': final_vllm_stats.get('histogram_analysis', {}) if final_vllm_stats else {}
                 },
                 'results_summary': {
                     'total_prompts': len(prompts),
                     'successful_responses': len([r for r in all_results if r != "ERROR"]),
                     'failed_responses': len([r for r in all_results if r == "ERROR"]),
-                    'average_response_length': sum(len(r) for r in all_results if r != "ERROR") / len([r for r in all_results if r != "ERROR"]) if any(r != "ERROR" for r in all_results) else 0
+                    'average_response_length_chars': sum(len(r) for r in all_results if r != "ERROR") / len([r for r in all_results if r != "ERROR"]) if any(r != "ERROR" for r in all_results) else 0,
+                    'sample_responses': all_results[:5] if len(all_results) > 0 else []
                 }
             }
             
-            # Save complete experiment results
-            results_json_path = os.path.join(output_folder, "experiment_results.json")
+            # Save comprehensive experiment results as JSON
+            results_json_path = os.path.join(output_folder, "experiment_stats.json")
             with open(results_json_path, 'w') as f:
                 json.dump(experiment_results, f, indent=2, default=str)
-            logger.info(f"📋 Complete results saved: {results_json_path}")
+            logger.info(f"📋 Comprehensive experiment stats saved: {results_json_path}")
             
-            # Generate comprehensive report
-            logger.info("📊 Generating comprehensive report...")
-            report_path = self.generate_comprehensive_report(experiment_results, output_folder)
-            
-            # Generate visualizations if metrics are available
-            if self.vllm_metrics_collector and self.vllm_metrics_collector.stats_history:
-                logger.info("📈 Generating KV cache visualizations...")
-                self.vllm_metrics_collector.plot_kv_cache_metrics(output_folder)
+            # Also save a minimal results CSV for reference
+            results_df = df.copy()
+            results_df['llm_response'] = all_results
+            results_df['processing_time'] = [total_inference_time / len(df)] * len(df)
+            results_csv_path = os.path.join(output_folder, "query_results.csv") 
+            results_df.to_csv(results_csv_path, index=False)
             
             # Final summary
             logger.info("🎉 Experiment completed successfully!")
-            logger.info(f"📁 All outputs saved in: {output_folder}")
+            logger.info(f"📁 Primary output: {results_json_path}")
             logger.info(f"📊 Processed {len(df)} rows in {total_experiment_time:.2f}s")
-            logger.info(f"⚡ Overall throughput: {performance_metrics['overall_throughput_tokens_per_sec']:.1f} tokens/sec")
-            logger.info(f"✅ Success rate: {performance_metrics['success_rate_percent']:.1f}%")
+            logger.info(f"⚡ Overall throughput: {experiment_results['inference_performance']['overall_throughput_tokens_per_sec']:.1f} tokens/sec")
+            logger.info(f"✅ Success rate: {experiment_results['inference_performance']['batch_statistics']['success_rate_percent']:.1f}%")
             
-            if final_vllm_stats and final_vllm_stats.get('latest_stats', {}).get('stats_available', False):
-                key_metrics = final_vllm_stats.get('key_metrics', {})
+            # Log key vLLM metrics if available
+            if experiment_results['vllm_metrics']['metrics_available']:
+                key_metrics = experiment_results['vllm_metrics']['key_metrics']
                 if 'gpu_cache_usage_percent' in key_metrics:
                     logger.info(f"🗄️ Final GPU cache usage: {key_metrics['gpu_cache_usage_percent']:.1f}%")
                 if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
@@ -2462,8 +2517,15 @@ class SimpleLLMExperiment:
                         logger.info("🏆 Excellent cache performance detected!")
                     elif hit_rate > 20:
                         logger.info("✅ Good cache performance detected!")
+                        
+                # Log cache counter details
+                if 'gpu_prefix_cache_hits' in key_metrics and 'gpu_prefix_cache_queries' in key_metrics:
+                    hits = key_metrics['gpu_prefix_cache_hits']
+                    queries = key_metrics['gpu_prefix_cache_queries']
+                    logger.info(f"📈 Cache counters: {hits} hits / {queries} queries")
             
             return experiment_results
+
             
         except Exception as e:
             logger.error(f"❌ Experiment failed: {e}")
