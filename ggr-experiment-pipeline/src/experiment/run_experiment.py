@@ -1396,160 +1396,9 @@ class VLLMMetricsCollector:
         return self.stats_history.copy()
     
     def plot_kv_cache_metrics(self, output_dir: str):
-        """Plot KV cache metrics over time and save to output directory with enhanced data structure handling"""
-        if not self.stats_history:
-            logger.warning("No vLLM metrics history to plot")
-            return
-        
-        try:
-            # Extract metrics data properly from the nested structure
-            flattened_data = []
-            
-            for entry in self.stats_history:
-                if not entry.get('stats_available', False):
-                    continue
-                    
-                row = {
-                    'timestamp': entry.get('timestamp', 0),
-                    'collection_time': entry.get('collection_time', 0)
-                }
-                
-                # Extract metrics from nested metrics_found dictionary
-                metrics_found = entry.get('metrics_found', {})
-                for metric_name, value in metrics_found.items():
-                    row[metric_name] = value
-                
-                if row['timestamp'] > 0:  # Only include valid timestamps
-                    flattened_data.append(row)
-            
-            if not flattened_data:
-                logger.warning("No valid metrics data found for plotting")
-                return
-                
-            # Convert to DataFrame
-            df = pd.DataFrame(flattened_data)
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            df.set_index('timestamp', inplace=True)
-            
-            logger.info(f"Plotting {len(df)} data points with columns: {list(df.columns)}")
-            
-            plots_created = 0
-            
-            # Plot GPU cache usage
-            cache_usage_cols = ['vllm:gpu_cache_usage_perc', 'gpu_cache_usage_perc']
-            for col in cache_usage_cols:
-                if col in df.columns and not df[col].isna().all():
-                    plt.figure(figsize=(12, 6))
-                    values = df[col] * 100 if df[col].max() <= 1.0 else df[col]  # Handle both decimal and percentage
-                    plt.plot(df.index, values, label='GPU Cache Usage (%)', color='blue', linewidth=2)
-                    plt.xlabel('Time')
-                    plt.ylabel('Cache Usage (%)')
-                    plt.title('GPU KV Cache Usage Over Time')
-                    plt.legend()
-                    plt.grid(True, alpha=0.3)
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, 'gpu_cache_usage.png'), dpi=150)
-                    plt.close()
-                    logger.info(f"✅ Saved GPU cache usage plot ({len(df)} points)")
-                    plots_created += 1
-                    break
-            
-            # Plot GPU prefix cache hit rate (direct metric)
-            hit_rate_cols = ['vllm:gpu_prefix_cache_hit_rate', 'gpu_prefix_cache_hit_rate']
-            for col in hit_rate_cols:
-                if col in df.columns and not df[col].isna().all():
-                    plt.figure(figsize=(12, 6))
-                    values = df[col] * 100 if df[col].max() <= 1.0 else df[col]  # Handle both decimal and percentage
-                    plt.plot(df.index, values, label='GPU Prefix Cache Hit Rate (%)', color='green', linewidth=2)
-                    plt.xlabel('Time')
-                    plt.ylabel('Hit Rate (%)')
-                    plt.title('GPU Prefix Cache Hit Rate Over Time')
-                    plt.legend()
-                    plt.grid(True, alpha=0.3)
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, 'gpu_prefix_cache_hit_rate.png'), dpi=150)
-                    plt.close()
-                    logger.info(f"✅ Saved GPU prefix cache hit rate plot ({len(df)} points)")
-                    plots_created += 1
-                    break
-            
-            # Plot calculated hit rate from counters
-            hits_col = 'vllm:gpu_prefix_cache_hits'
-            queries_col = 'vllm:gpu_prefix_cache_queries'
-            if hits_col in df.columns and queries_col in df.columns:
-                # Calculate hit rate from counters
-                df_valid = df[(df[queries_col] > 0) & (df[hits_col] >= 0)].copy()
-                if len(df_valid) > 0:
-                    df_valid['calculated_hit_rate'] = (df_valid[hits_col] / df_valid[queries_col]) * 100
-                    
-                    plt.figure(figsize=(12, 6))
-                    plt.plot(df_valid.index, df_valid['calculated_hit_rate'], 
-                           label='Prefix Cache Hit Rate (calculated)', color='orange', linewidth=2)
-                    plt.xlabel('Time')
-                    plt.ylabel('Hit Rate (%)')
-                    plt.title('GPU Prefix Cache Hit Rate (Calculated from Counters)')
-                    plt.legend()
-                    plt.grid(True, alpha=0.3)
-                    plt.tight_layout()
-                    plt.savefig(os.path.join(output_dir, 'gpu_prefix_cache_hit_rate_calculated.png'), dpi=150)
-                    plt.close()
-                    logger.info(f"✅ Saved calculated prefix cache hit rate plot ({len(df_valid)} points)")
-                    plots_created += 1
-            
-            # Plot request queue status
-            queue_cols = ['vllm:num_requests_running', 'vllm:num_requests_waiting']
-            queue_data = []
-            for col in queue_cols:
-                if col in df.columns and not df[col].isna().all():
-                    queue_data.append((col.replace('vllm:num_requests_', '').replace('_', ' ').title(), df[col]))
-            
-            if queue_data:
-                plt.figure(figsize=(12, 6))
-                for label, data in queue_data:
-                    plt.plot(df.index, data, label=f'{label} Requests', linewidth=2)
-                plt.xlabel('Time')
-                plt.ylabel('Number of Requests')
-                plt.title('vLLM Request Queue Status Over Time')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, 'request_queue_status.png'), dpi=150)
-                plt.close()
-                logger.info(f"✅ Saved request queue status plot ({len(df)} points)")
-                plots_created += 1
-            
-            # Plot token processing rates
-            token_cols = ['vllm:prompt_tokens_total', 'vllm:generation_tokens_total']
-            token_data = []
-            for col in token_cols:
-                if col in df.columns and not df[col].isna().all():
-                    token_data.append((col.replace('vllm:', '').replace('_total', '').replace('_', ' ').title(), df[col]))
-            
-            if token_data:
-                plt.figure(figsize=(12, 6))
-                for label, data in token_data:
-                    plt.plot(df.index, data, label=f'{label}', linewidth=2)
-                plt.xlabel('Time')
-                plt.ylabel('Token Count (Cumulative)')
-                plt.title('Token Processing Over Time')
-                plt.legend()
-                plt.grid(True, alpha=0.3)
-                plt.tight_layout()
-                plt.savefig(os.path.join(output_dir, 'token_processing.png'), dpi=150)
-                plt.close()
-                logger.info(f"✅ Saved token processing plot ({len(df)} points)")
-                plots_created += 1
-            
-            if plots_created == 0:
-                logger.warning("⚠️ No plots could be created - no suitable metrics data found")
-                logger.warning(f"Available columns: {list(df.columns)}")
-            else:
-                logger.info(f"✅ Successfully created {plots_created} KV cache and performance plots")
-        
-        except Exception as e:
-            logger.error(f"Error plotting KV cache metrics: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+        """Plotting functionality disabled as requested"""
+        logger.info("📊 Plotting functionality has been disabled")
+        return
 
 def resolve_model_path(model_name: str) -> str:
     """Resolve model path, supporting local directories and HF model names"""
@@ -1634,6 +1483,12 @@ class SimpleLLMExperiment:
         self.llm = None
         self.sampling_params = None
         
+        # Initialize configuration attributes
+        self.gpu_memory_utilization = 0.85  # Default value
+        self.max_tokens = 512
+        self.temperature = 0.1
+        self.top_p = 0.9
+        
         # Use optimized monitoring intervals for fair comparison
         self.resource_monitor = ResourceMonitor(gpu_id=self.gpu_id, sampling_interval=10.0)  # 10 second intervals
         self.vllm_metrics_collector = VLLMMetricsCollector(
@@ -1710,6 +1565,12 @@ class SimpleLLMExperiment:
                         max_model_len: int = None,
                         **kwargs):
         """Initialize vLLM model with GPU configuration and memory optimization"""
+        # Store configuration parameters as instance variables
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        
         logger.info(f"Initializing vLLM model: {self.model_name}")
         logger.info(f"Model type: {'Local' if self.is_local_model else 'HuggingFace'}")
         logger.info(f"Target GPUs: {self.gpu_ids}")
@@ -2562,21 +2423,8 @@ class SimpleLLMExperiment:
             raise
     
     def plot_kv_cache_metrics(self, output_dir: str) -> Dict[str, str]:
-        """Generate KV cache visualization plots"""
-        if self.vllm_metrics_collector:
-            self.vllm_metrics_collector.plot_kv_cache_metrics(output_dir)
-            
-            # Return paths to generated plots
-            plot_files = {
-                'gpu_cache_usage': os.path.join(output_dir, 'gpu_cache_usage.png'),
-                'gpu_prefix_cache_hit_rate': os.path.join(output_dir, 'gpu_prefix_cache_hit_rate.png'),
-                'gpu_prefix_cache_hit_rate_calculated': os.path.join(output_dir, 'gpu_prefix_cache_hit_rate_calculated.png'),
-                'request_queue_status': os.path.join(output_dir, 'request_queue_status.png'),
-                'token_processing': os.path.join(output_dir, 'token_processing.png')
-            }
-            
-            return {k: v for k, v in plot_files.items() if os.path.exists(v)}
-        
+        """Plotting functionality disabled as requested"""
+        logger.info("📊 KV cache plotting functionality has been disabled")
         return {}
 
 
