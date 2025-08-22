@@ -2290,6 +2290,7 @@ class SimpleLLMExperiment:
                 'experiment_metadata': {
                     'timestamp': timestamp,
                     'dataset_path': dataset_path,
+                    'output_folder': output_folder,  # Add output folder to metadata
                     'query_key': query_key,
                     'query_type': template.get('type', 'unknown'),
                     'custom_query': custom_query,
@@ -2547,7 +2548,19 @@ def main():
         
         print("\n" + "=" * 70)
         print("🎉 Experiment completed successfully!")
-        print(f"📁 Results saved in: {results['experiment_info']['output_folder']}")
+        
+        # Handle different return structures (success vs error)
+        if 'experiment_info' in results:
+            # Error case structure
+            output_folder = results['experiment_info']['output_folder']
+        elif 'experiment_metadata' in results:
+            # Success case structure
+            output_folder = results['experiment_metadata']['output_folder']
+        else:
+            # Fallback
+            output_folder = "experiment_results"
+            
+        print(f"📁 Results saved in: {output_folder}")
         print("=" * 70)
         
     except KeyboardInterrupt:
