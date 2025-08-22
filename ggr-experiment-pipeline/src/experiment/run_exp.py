@@ -11,6 +11,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
+
 class SentimentAnalysisExperiment:
     """
     A class to perform sentiment analysis experiments using vLLM.
@@ -37,6 +38,9 @@ class SentimentAnalysisExperiment:
         
         # Set environment variable for cached outputs
         os.environ["VLLM_USE_CACHED_OUTPUTS"] = "True"
+        
+        # Force vLLM to use v0 to access cache metrics via internal APIs
+        os.environ["VLLM_USE_V1"] = "0"
         
         # Set GPU devices if specified
         if gpu_devices and torch.cuda.is_available():
