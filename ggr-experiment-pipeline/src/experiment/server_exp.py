@@ -24,6 +24,7 @@ import requests
 import pandas as pd
 import signal
 import atexit
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -55,6 +56,7 @@ class ExperimentConfig:
     enforce_eager: bool = False  # Disable CUDA graph (for debugging)
     enable_chunked_prefill: bool = True  # Enable chunked prefill for better memory usage
     max_num_seqs: int = 256  # Maximum number of sequences in a batch
+    cuda_visible_devices: Optional[str] = None  # Specific GPU selection
 
 
 class VLLMServerExperiment:
@@ -200,7 +202,7 @@ class VLLMServerExperiment:
             env = dict(os.environ)
             
             # Set CUDA visibility if needed
-            if hasattr(self.config, 'cuda_visible_devices') and self.config.cuda_visible_devices:
+            if self.config.cuda_visible_devices:
                 env['CUDA_VISIBLE_DEVICES'] = self.config.cuda_visible_devices
             
             self.server_process = subprocess.Popen(
@@ -751,6 +753,7 @@ Examples:
                        help="Disable CUDA graph for debugging (may reduce performance)")
     parser.add_argument("--disable-chunked-prefill", action="store_true",
                        help="Disable chunked prefill")
+    parser.add_argument("--cuda-visible-devices", help="Comma-separated list of GPU IDs to use (e.g., 0,1,2)")
     
     args = parser.parse_args()
     
@@ -776,6 +779,7 @@ Examples:
         max_num_seqs=args.max_num_seqs,
         enforce_eager=args.enforce_eager,
         enable_chunked_prefill=not args.disable_chunked_prefill,
+        cuda_visible_devices=args.cuda_visible_devices,
     )
     
     # Run experiment

@@ -7,15 +7,24 @@ itertools-recipes
 tqdm
 scikit-learn>=1.0.0
 
-# vLLM and LLM inference requirements
-vllm>=0.3.0
+# vLLM and LLM inference requirements (Updated for server experiment)
+vllm>=0.10.0  # Updated to latest version for server experiment
 torch>=2.0.0
 transformers>=4.30.0
+tokenizers>=0.13.0
+
+# HTTP and API support for server experiment
+requests>=2.28.0
+fastapi>=0.95.0
+uvicorn>=0.20.0
 
 # Resource monitoring requirements
 psutil>=5.9.0
 pynvml>=11.4.1  # NVIDIA GPU monitoring
 nvidia-ml-py>=11.495.46  # Alternative NVIDIA monitoring
+
+# Metrics and monitoring (Updated for comprehensive metrics collection)
+prometheus-client>=0.15.0
 
 # Visualization and analysis
 matplotlib>=3.6.0
@@ -27,6 +36,11 @@ jupyter>=1.0.0
 ipywidgets>=8.0.0
 
 # Additional utilities
-requests>=2.28.0
 aiohttp>=3.8.0
-prometheus-client>=0.15.0
+typing-extensions>=4.5.0
+
+# Optional: For advanced GPU features (uncomment if needed)
+# accelerate>=0.20.0  # For model loading optimization
+# bitsandbytes>=0.40.0  # For 8-bit quantization
+# auto-gptq>=0.4.0  # For GPTQ quantization
+# autoawq>=0.1.0  # For AWQ quantization
