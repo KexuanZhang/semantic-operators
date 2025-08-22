@@ -189,11 +189,11 @@ Sentiment:"""
                 row_end_time = time.time()
                 row_inference_time = row_end_time - row_start_time
             
-            # Store result
+            # Store result - just save the raw LLM response
             result = {
                 'index': idx,
                 'text': text,
-                'predicted_sentiment': sentiment,
+                'llm_response': sentiment,  # Raw LLM response
                 'inference_time': row_inference_time,
                 'timestamp': datetime.now().isoformat()
             }
@@ -212,7 +212,7 @@ Sentiment:"""
         # Create summary - count unique responses
         response_counts = {}
         for r in results:
-            response = r['predicted_sentiment']
+            response = r['llm_response']  # Use raw LLM response
             response_counts[response] = response_counts.get(response, 0) + 1
         
         experiment_metadata = {
