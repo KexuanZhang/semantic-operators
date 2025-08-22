@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
 """
-vLLM Server Experiment Script
+vLLM Server Experiment Script - Configured for GPUs 6 & 7
 
 This script hosts a vLLM server with a language model and processes datasets
 for sentiment analysis experiments. It collects comprehensive metrics including
 KV cache usage, inference times, and throughput statistics.
 
+By default, this script is configured to use GPUs 6 and 7 with tensor parallelism,
+providing optimal performance for multi-GPU setups while using conservative memory
+settings to avoid out-of-memory errors.
+
+Default Configuration:
+- GPUs: 6 and 7 (CUDA_VISIBLE_DEVICES=6,7)
+- Tensor Parallelism: 2 GPUs
+- Memory Utilization: 80% (conservative)
+- Batch Size: 128 sequences (conservative)
+
 Usage:
-    python server_exp.py --model MODEL_NAME --dataset DATASET_PATH [options]
+    # Default configuration (GPUs 6 & 7 with tensor parallelism)
+    python server_exp.py --model MODEL_NAME --dataset DATASET_PATH
+    
+    # Single GPU override
+    python server_exp.py --model MODEL_NAME --dataset DATASET_PATH \\
+                        --tensor-parallel-size 1 --cuda-visible-devices 6
 
 Example:
     python server_exp.py --model microsoft/DialoGPT-medium --dataset data/reviews.csv
@@ -703,24 +718,24 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # Basic GPU usage (single GPU)
+    # Basic GPU usage with tensor parallelism (GPUs 6 & 7 - default)
     python server_exp.py --model microsoft/DialoGPT-medium --dataset data/reviews.csv
 
-    # Multi-GPU setup with tensor parallelism
+    # Override to use single GPU 6 only
+    python server_exp.py --model microsoft/DialoGPT-medium --dataset data/reviews.csv \\
+                        --tensor-parallel-size 1 --cuda-visible-devices 6
+
+    # Large model with tensor parallelism on GPUs 6 & 7 and quantization
     python server_exp.py --model meta-llama/Llama-2-7b-chat-hf --dataset data/reviews.csv \\
-                        --tensor-parallel-size 2 --gpu-memory-utilization 0.85
+                        --quantization awq --gpu-memory-utilization 0.7
 
-    # Large model with quantization for memory efficiency
-    python server_exp.py --model meta-llama/Llama-2-13b-chat-hf --dataset data/reviews.csv \\
-                        --quantization awq --gpu-memory-utilization 0.95
-
-    # Specific GPU selection
-    CUDA_VISIBLE_DEVICES=0,1 python server_exp.py --model meta-llama/Llama-2-7b-chat-hf \\
-                        --dataset data/reviews.csv --tensor-parallel-size 2
+    # Use different GPUs (override default)
+    python server_exp.py --model microsoft/DialoGPT-medium --dataset data/reviews.csv \\
+                        --cuda-visible-devices 0,1 --tensor-parallel-size 2
 
     # CPU fallback (for testing without GPU)
-    CUDA_VISIBLE_DEVICES="" python server_exp.py --model microsoft/DialoGPT-medium \\
-                        --dataset data/reviews.csv
+    python server_exp.py --model microsoft/DialoGPT-medium --dataset data/reviews.csv \\
+                        --cuda-visible-devices ""
         """
     )
     
@@ -736,26 +751,48 @@ Examples:
     parser.add_argument("--metrics-interval", type=float, default=1.0, help="Metrics collection interval")
     parser.add_argument("--server-timeout", type=int, default=300, help="Server startup timeout")
     
-    # GPU Configuration Arguments
-    parser.add_argument("--tensor-parallel-size", type=int, default=1, 
-                       help="Number of GPUs for tensor parallelism (default: 1)")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9,
-                       help="GPU memory utilization ratio (0.1-1.0, default: 0.9)")
+    # GPU Configuration Arguments (configured for GPUs 6 & 7 by default)
+    parser.add_argument("--tensor-parallel-size", type=int, default=2, 
+                       help="Number of GPUs for tensor parallelism (default: 2 for GPUs 6 & 7)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8,
+                       help="GPU memory utilization ratio (0.1-1.0, default: 0.8 for conservative memory use)")
     parser.add_argument("--dtype", default="auto", 
                        choices=["auto", "half", "float16", "bfloat16", "float32"],
                        help="Data type for model weights (default: auto)")
     parser.add_argument("--max-model-len", type=int, help="Maximum sequence length")
     parser.add_argument("--quantization", choices=["awq", "gptq", "squeezellm", "fp8"],
                        help="Quantization method for memory efficiency")
-    parser.add_argument("--max-num-seqs", type=int, default=256,
-                       help="Maximum number of sequences in a batch (default: 256)")
+    parser.add_argument("--max-num-seqs", type=int, default=128,
+                       help="Maximum number of sequences in a batch (default: 128 for conservative memory use)")
     parser.add_argument("--enforce-eager", action="store_true",
                        help="Disable CUDA graph for debugging (may reduce performance)")
     parser.add_argument("--disable-chunked-prefill", action="store_true",
                        help="Disable chunked prefill")
-    parser.add_argument("--cuda-visible-devices", help="Comma-separated list of GPU IDs to use (e.g., 0,1,2)")
+    parser.add_argument("--cuda-visible-devices", default="6,7",
+                       help="Comma-separated list of GPU IDs to use (default: 6,7)")
     
     args = parser.parse_args()
+    
+    # Set CUDA_VISIBLE_DEVICES environment variable for GPU selection
+    if args.cuda_visible_devices:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_visible_devices
+        print(f"🎯 Configured to use GPUs: {args.cuda_visible_devices}")
+        
+        # Validate GPU availability if not empty
+        if args.cuda_visible_devices.strip():
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    gpu_count = torch.cuda.device_count()
+                    print(f"✅ Detected {gpu_count} visible GPU(s)")
+                    if gpu_count >= args.tensor_parallel_size:
+                        print(f"✅ Ready for tensor parallelism with {args.tensor_parallel_size} GPU(s)")
+                    else:
+                        print(f"⚠️  Warning: Only {gpu_count} GPU(s) available for tensor_parallel_size={args.tensor_parallel_size}")
+                else:
+                    print("❌ CUDA not available - will fallback to CPU")
+            except ImportError:
+                print("⚠️  PyTorch not available - cannot verify GPU setup")
     
     # Create configuration with GPU settings
     config = ExperimentConfig(
