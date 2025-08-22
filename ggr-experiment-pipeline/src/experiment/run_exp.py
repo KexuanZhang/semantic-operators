@@ -65,6 +65,9 @@ class SentimentAnalysisExperiment:
             # Remove stop tokens to get full response
         )
         
+        # For tracking vLLM internal metrics
+        self.cache_metrics = []
+        
     def load_model(self):
         """Load the vLLM model."""
         try:
@@ -114,6 +117,52 @@ Text: {text}
 Sentiment:"""
         return prompt
     
+    def get_cache_stats(self):
+        """
+        Get cache statistics from vLLM internal Stats object.
+        This accesses internal APIs which may change in future versions.
+        """
+        try:
+            # Access internal engine stats - this is version-dependent
+            if hasattr(self.llm, 'llm_engine'):
+                engine = self.llm.llm_engine
+                
+                # For vLLM v1 engines (0.10.0+), try to access stats through different paths
+                stats = None
+                
+                # Try different paths to access stats object
+                if hasattr(engine, 'engine_core') and hasattr(engine.engine_core, 'stats'):
+                    stats = engine.engine_core.stats
+                elif hasattr(engine, '_get_stats'):
+                    # Older versions
+                    stats = engine._get_stats()
+                elif hasattr(engine, 'scheduler') and hasattr(engine.scheduler, 'stats'):
+                    stats = engine.scheduler.stats
+                
+                if stats:
+                    cache_metrics = {}
+                    
+                    # Extract key metrics
+                    if hasattr(stats, 'gpu_cache_usage_sys'):
+                        cache_metrics['gpu_cache_usage_perc'] = stats.gpu_cache_usage_sys
+                    
+                    if hasattr(stats, 'gpu_prefix_cache_hit_rate'):
+                        cache_metrics['gpu_prefix_cache_hit_rate'] = stats.gpu_prefix_cache_hit_rate
+                    
+                    # Try alternative attribute names
+                    for attr in dir(stats):
+                        if 'cache' in attr.lower() and 'hit' in attr.lower():
+                            cache_metrics[attr] = getattr(stats, attr)
+                        elif 'cache' in attr.lower() and 'usage' in attr.lower():
+                            cache_metrics[attr] = getattr(stats, attr)
+                    
+                    return cache_metrics
+                    
+        except Exception as e:
+            print(f"Warning: Could not access cache stats: {e}")
+            
+        return {}
+        
     def analyze_sentiment(self, text: str) -> str:
         """
         Analyze sentiment of a single text using the LLM.
@@ -130,9 +179,23 @@ Sentiment:"""
         prompt = self.create_sentiment_prompt(text)
         
         try:
+            # Get cache stats before inference
+            cache_stats_before = self.get_cache_stats()
+            
             # Generate response
             output = self.llm.generate([prompt], self.sampling_params)
             response = output[0].outputs[0].text.strip()
+            
+            # Get cache stats after inference
+            cache_stats_after = self.get_cache_stats()
+            
+            # Store cache metrics for this inference
+            cache_metrics = {
+                'before': cache_stats_before,
+                'after': cache_stats_after,
+                'timestamp': datetime.now().isoformat()
+            }
+            self.cache_metrics.append(cache_metrics)
             
             # Return raw response without any processing
             return response
@@ -141,7 +204,59 @@ Sentiment:"""
             print(f"Error during inference: {e}")
             return f"Error: {str(e)}"
     
-    def process_dataset(self, dataset_path: str, text_column: str, 
+    def _analyze_cache_metrics(self) -> Dict[str, Any]:
+        """
+        Analyze collected cache metrics to provide summary statistics.
+        
+        Returns:
+            Dictionary containing cache performance summary
+        """
+        if not self.cache_metrics:
+            return {'note': 'No cache metrics collected'}
+        
+        summary = {
+            'total_inferences': len(self.cache_metrics),
+            'cache_hit_rates': [],
+            'cache_usage_percentages': [],
+            'detailed_metrics': []
+        }
+        
+        for i, metric in enumerate(self.cache_metrics):
+            inference_summary = {
+                'inference_index': i,
+                'timestamp': metric['timestamp'],
+                'before_stats': metric['before'],
+                'after_stats': metric['after']
+            }
+            
+            # Extract cache hit rates if available
+            if 'gpu_prefix_cache_hit_rate' in metric.get('after', {}):
+                hit_rate = metric['after']['gpu_prefix_cache_hit_rate']
+                summary['cache_hit_rates'].append(hit_rate)
+                inference_summary['cache_hit_rate'] = hit_rate
+            
+            # Extract cache usage if available
+            if 'gpu_cache_usage_perc' in metric.get('after', {}):
+                usage = metric['after']['gpu_cache_usage_perc']
+                summary['cache_usage_percentages'].append(usage)
+                inference_summary['cache_usage_perc'] = usage
+            
+            summary['detailed_metrics'].append(inference_summary)
+        
+        # Calculate averages
+        if summary['cache_hit_rates']:
+            summary['average_cache_hit_rate'] = sum(summary['cache_hit_rates']) / len(summary['cache_hit_rates'])
+            summary['max_cache_hit_rate'] = max(summary['cache_hit_rates'])
+            summary['min_cache_hit_rate'] = min(summary['cache_hit_rates'])
+        
+        if summary['cache_usage_percentages']:
+            summary['average_cache_usage'] = sum(summary['cache_usage_percentages']) / len(summary['cache_usage_percentages'])
+            summary['max_cache_usage'] = max(summary['cache_usage_percentages'])
+            summary['min_cache_usage'] = min(summary['cache_usage_percentages'])
+        
+        return summary
+
+    def process_dataset(self, dataset_path: str, text_column: str,
                        batch_size: int = 1) -> Dict[str, Any]:
         """
         Process an entire dataset for sentiment analysis.
@@ -198,10 +313,7 @@ Sentiment:"""
                 'timestamp': datetime.now().isoformat()
             }
             
-            # Add other columns from original dataset
-            for col in df.columns:
-                if col != text_column:
-                    result[f'original_{col}'] = row[col]
+            # Do not add original dataset columns to keep results clean
             
             results.append(result)
         
@@ -230,7 +342,8 @@ Sentiment:"""
                 'temperature': self.sampling_params.temperature,
                 'top_p': self.sampling_params.top_p,
                 'max_tokens': self.sampling_params.max_tokens,
-            }
+            },
+            'cache_metrics_summary': self._analyze_cache_metrics()
         }
         
         return {
@@ -277,6 +390,19 @@ Sentiment:"""
         print(f"- Response counts: {metadata['response_counts']}")
         print(f"- Total inference time: {metadata['total_inference_time_seconds']:.2f} seconds")
         print(f"- Average inference time per sample: {metadata['average_inference_time_seconds']:.4f} seconds")
+        
+        # Print cache metrics summary if available
+        cache_summary = metadata.get('cache_metrics_summary', {})
+        if 'average_cache_hit_rate' in cache_summary:
+            print(f"\nPrefix Cache Performance:")
+            print(f"- Average cache hit rate: {cache_summary['average_cache_hit_rate']:.2%}")
+            print(f"- Max cache hit rate: {cache_summary['max_cache_hit_rate']:.2%}")
+            print(f"- Min cache hit rate: {cache_summary['min_cache_hit_rate']:.2%}")
+        
+        if 'average_cache_usage' in cache_summary:
+            print(f"- Average GPU cache usage: {cache_summary['average_cache_usage']:.2%}")
+            print(f"- Max GPU cache usage: {cache_summary['max_cache_usage']:.2%}")
+            print(f"- Min GPU cache usage: {cache_summary['min_cache_usage']:.2%}")
     
     def cleanup(self):
         """Clean up resources."""
