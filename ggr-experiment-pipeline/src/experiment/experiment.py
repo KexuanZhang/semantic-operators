@@ -341,6 +341,10 @@ class VLLMExperimentRunner:
             response = requests.get(self.metrics_url, timeout=5)
             response.raise_for_status()
             
+            # Log the raw metrics text for debugging
+            self.logger.debug("RAW METRICS RESPONSE:")
+            self.logger.debug(response.text[:2000] + "..." if len(response.text) > 2000 else response.text)
+            
             metrics = {}
             
             for family in text_string_to_metric_families(response.text):
@@ -354,21 +358,18 @@ class VLLMExperimentRunner:
                     
                     metrics[key] = sample.value
             
-            # Log all cache-related metrics for debugging
-            cache_metrics = {k: v for k, v in metrics.items() if 'cache' in k.lower() or 'prefix' in k.lower()}
-            if cache_metrics:
-                self.logger.debug(f"Cache metrics found: {cache_metrics}")
-            
+            self.logger.info(f"Collected {len(metrics)} metrics from Prometheus endpoint")
             return metrics
             
         except requests.exceptions.RequestException as e:
-            self.logger.debug(f"Error getting metrics: {e}")
+            self.logger.error(f"Error getting metrics: {e}")
             return {}
     
     def monitor_metrics(self):
         """Monitor metrics in background thread"""
         self.logger.info("Starting metrics monitoring...")
         
+        sample_count = 0
         while not self.stop_monitoring:
             try:
                 metrics = self.get_metrics()
@@ -376,73 +377,89 @@ class VLLMExperimentRunner:
                     # Add timestamp
                     metrics['_timestamp'] = time.time()
                     self.metrics_data.append(metrics)
+                    sample_count += 1
                     
-                    # Log key metrics
-                    self.log_key_metrics(metrics)
+                    # Log detailed metrics for first few samples and periodically
+                    if sample_count <= 3 or sample_count % 10 == 0:
+                        self.log_key_metrics(metrics)
+                    else:
+                        # Just log basic info
+                        kv_usage = metrics.get('vllm:gpu_cache_usage_perc', 
+                                             metrics.get('vllm_gpu_cache_usage_perc', 0))
+                        running_requests = metrics.get('vllm:num_requests_running', 0)
+                        if kv_usage > 0 or running_requests > 0:
+                            self.logger.info(f"Sample {sample_count}: KV Cache: {kv_usage:.1f}%, Running: {running_requests}")
+                else:
+                    self.logger.warning("No metrics received from server")
                 
                 time.sleep(10)  # Sample every 10 seconds
                 
             except Exception as e:
-                self.logger.debug(f"Metrics monitoring error: {e}")
+                self.logger.error(f"Metrics monitoring error: {e}")
                 time.sleep(10)
+        
+        self.logger.info(f"Metrics monitoring stopped. Collected {len(self.metrics_data)} samples.")
     
     def log_key_metrics(self, metrics: Dict[str, Any]):
         """Log important metrics"""
-        # Try different possible metric names for cache hits
-        possible_cache_usage_keys = [
-            'vllm:gpu_cache_usage_perc',
-            'vllm_gpu_cache_usage_perc', 
-            'gpu_cache_usage_perc',
-            'vllm:kv_cache_usage_perc'
-        ]
+        # Log ALL metrics for debugging
+        self.logger.info("="*60)
+        self.logger.info("ALL AVAILABLE METRICS:")
+        self.logger.info("="*60)
         
-        possible_cache_query_keys = [
-            'vllm:cache_query_total',
-            'vllm_cache_query_total',
-            'cache_query_total',
-            'vllm:prefix_cache_query_total',
-            'vllm_prefix_cache_query_total'
-        ]
+        # Sort metrics by name for easier reading
+        sorted_metrics = sorted(metrics.items())
         
-        possible_cache_hit_keys = [
-            'vllm:cache_query_hit_total', 
-            'vllm_cache_query_hit_total',
-            'cache_query_hit_total',
-            'vllm:prefix_cache_hit_total',
-            'vllm_prefix_cache_hit_total'
-        ]
+        for key, value in sorted_metrics:
+            if key != '_timestamp':  # Skip our internal timestamp
+                self.logger.info(f"{key}: {value}")
         
-        # Find the actual metric keys
-        kv_usage = 0
-        for key in possible_cache_usage_keys:
-            if key in metrics:
-                kv_usage = metrics[key]
-                break
+        self.logger.info("="*60)
         
-        cache_queries = 0
-        for key in possible_cache_query_keys:
-            if key in metrics:
-                cache_queries = metrics[key] 
-                break
-                
-        cache_hits = 0
-        for key in possible_cache_hit_keys:
-            if key in metrics:
-                cache_hits = metrics[key]
-                break
+        # Also specifically look for cache-related metrics
+        cache_related = {}
+        kv_related = {}
+        prefix_related = {}
+        request_related = {}
         
-        running_requests = metrics.get('vllm:num_requests_running', 0)
-        waiting_requests = metrics.get('vllm:num_requests_waiting', 0)
+        for key, value in metrics.items():
+            key_lower = key.lower()
+            if 'cache' in key_lower:
+                cache_related[key] = value
+            if 'kv' in key_lower:
+                kv_related[key] = value
+            if 'prefix' in key_lower:
+                prefix_related[key] = value
+            if 'request' in key_lower or 'running' in key_lower or 'waiting' in key_lower:
+                request_related[key] = value
         
-        if any([kv_usage > 0, cache_queries > 0, running_requests > 0]):
-            hit_rate = (cache_hits / cache_queries * 100) if cache_queries > 0 else 0
-            self.logger.info(
-                f"Metrics - KV Cache: {kv_usage:.1f}% | "
-                f"Cache Queries: {cache_queries} | "
-                f"Cache Hits: {cache_hits} | "
-                f"Hit Rate: {hit_rate:.1f}% | "
-                f"Requests - Running: {running_requests}, Waiting: {waiting_requests}"
-            )
+        if cache_related:
+            self.logger.info("CACHE-RELATED METRICS:")
+            for key, value in cache_related.items():
+                self.logger.info(f"  {key}: {value}")
+        else:
+            self.logger.warning("NO CACHE-RELATED METRICS FOUND!")
+            
+        if kv_related:
+            self.logger.info("KV-RELATED METRICS:")
+            for key, value in kv_related.items():
+                self.logger.info(f"  {key}: {value}")
+        else:
+            self.logger.warning("NO KV-RELATED METRICS FOUND!")
+            
+        if prefix_related:
+            self.logger.info("PREFIX-RELATED METRICS:")
+            for key, value in prefix_related.items():
+                self.logger.info(f"  {key}: {value}")
+        else:
+            self.logger.warning("NO PREFIX-RELATED METRICS FOUND!")
+            
+        if request_related:
+            self.logger.info("REQUEST-RELATED METRICS:")
+            for key, value in request_related.items():
+                self.logger.info(f"  {key}: {value}")
+        else:
+            self.logger.warning("NO REQUEST-RELATED METRICS FOUND!")
     
     def load_dataset(self) -> List[Dict[str, Any]]:
         """Load dataset from file"""
@@ -650,55 +667,155 @@ class VLLMExperimentRunner:
     def extract_metrics_summary(self) -> Dict[str, Any]:
         """Extract key metrics summary"""
         if not self.metrics_data:
+            self.logger.warning("No metrics data collected!")
             return {}
+        
+        self.logger.info(f"Analyzing metrics from {len(self.metrics_data)} samples...")
+        
+        # Get all unique metric names across all samples
+        all_metric_names = set()
+        for metrics in self.metrics_data:
+            all_metric_names.update(metrics.keys())
+        
+        self.logger.info(f"Found {len(all_metric_names)} unique metric names:")
+        for name in sorted(all_metric_names):
+            if name != '_timestamp':
+                self.logger.info(f"  - {name}")
         
         # Try to find cache metrics across all samples
         all_cache_queries = []
         all_cache_hits = []
         all_kv_usage = []
         
+        # Extended list of possible metric names
+        possible_cache_query_keys = [
+            'vllm:cache_query_total',
+            'vllm_cache_query_total',
+            'cache_query_total',
+            'vllm:prefix_cache_query_total',
+            'vllm_prefix_cache_query_total',
+            'prefix_cache_query_total',
+            'vllm:cache_queries_total',
+            'vllm_cache_queries_total'
+        ]
+        
+        possible_cache_hit_keys = [
+            'vllm:cache_query_hit_total', 
+            'vllm_cache_query_hit_total',
+            'cache_query_hit_total',
+            'vllm:prefix_cache_hit_total',
+            'vllm_prefix_cache_hit_total',
+            'prefix_cache_hit_total',
+            'vllm:cache_hits_total',
+            'vllm_cache_hits_total'
+        ]
+        
+        possible_cache_usage_keys = [
+            'vllm:gpu_cache_usage_perc',
+            'vllm_gpu_cache_usage_perc', 
+            'gpu_cache_usage_perc',
+            'vllm:kv_cache_usage_perc',
+            'vllm_kv_cache_usage_perc',
+            'kv_cache_usage_perc',
+            'vllm:cache_usage_perc',
+            'vllm_cache_usage_perc'
+        ]
+        
+        # Look for any metrics containing these keywords
+        cache_query_metrics = []
+        cache_hit_metrics = []
+        cache_usage_metrics = []
+        
         for metrics in self.metrics_data:
-            # Try different metric names
-            for cache_query_key in ['vllm:cache_query_total', 'vllm_cache_query_total', 'vllm:prefix_cache_query_total']:
+            for key in metrics.keys():
+                key_lower = key.lower()
+                if any(keyword in key_lower for keyword in ['cache', 'prefix']) and 'query' in key_lower and 'hit' not in key_lower:
+                    cache_query_metrics.append((key, metrics[key]))
+                elif any(keyword in key_lower for keyword in ['cache', 'prefix']) and 'hit' in key_lower:
+                    cache_hit_metrics.append((key, metrics[key]))
+                elif 'usage' in key_lower and any(keyword in key_lower for keyword in ['cache', 'kv']):
+                    cache_usage_metrics.append((key, metrics[key]))
+        
+        self.logger.info("FOUND CACHE QUERY METRICS:")
+        for key, value in cache_query_metrics:
+            self.logger.info(f"  {key}: {value}")
+            
+        self.logger.info("FOUND CACHE HIT METRICS:")
+        for key, value in cache_hit_metrics:
+            self.logger.info(f"  {key}: {value}")
+            
+        self.logger.info("FOUND CACHE USAGE METRICS:")
+        for key, value in cache_usage_metrics:
+            self.logger.info(f"  {key}: {value}")
+        
+        # Try standard extraction
+        for metrics in self.metrics_data:
+            # Try different metric names for cache queries
+            found_query = False
+            for cache_query_key in possible_cache_query_keys:
                 if cache_query_key in metrics:
                     all_cache_queries.append(metrics[cache_query_key])
+                    found_query = True
                     break
-            else:
+            if not found_query:
                 all_cache_queries.append(0)
                 
-            for cache_hit_key in ['vllm:cache_query_hit_total', 'vllm_cache_query_hit_total', 'vllm:prefix_cache_hit_total']:
+            # Try different metric names for cache hits    
+            found_hit = False
+            for cache_hit_key in possible_cache_hit_keys:
                 if cache_hit_key in metrics:
                     all_cache_hits.append(metrics[cache_hit_key])
+                    found_hit = True
                     break
-            else:
+            if not found_hit:
                 all_cache_hits.append(0)
                 
-            for kv_usage_key in ['vllm:gpu_cache_usage_perc', 'vllm_gpu_cache_usage_perc', 'vllm:kv_cache_usage_perc']:
+            # Try different metric names for cache usage
+            found_usage = False
+            for kv_usage_key in possible_cache_usage_keys:
                 if kv_usage_key in metrics:
                     all_kv_usage.append(metrics[kv_usage_key])
+                    found_usage = True
                     break
-            else:
+            if not found_usage:
                 all_kv_usage.append(0)
         
-        # Calculate deltas
+        # Calculate deltas and stats
         total_cache_queries = max(all_cache_queries) - min(all_cache_queries) if all_cache_queries else 0
         total_cache_hits = max(all_cache_hits) - min(all_cache_hits) if all_cache_hits else 0
         max_kv_usage = max(all_kv_usage) if all_kv_usage else 0
+        avg_kv_usage = sum(all_kv_usage) / len(all_kv_usage) if all_kv_usage else 0
         
-        # Also check for any running requests
+        # Check for any running requests
         max_running_requests = 0
+        total_requests = 0
         for metrics in self.metrics_data:
             max_running_requests = max(max_running_requests, metrics.get('vllm:num_requests_running', 0))
+            total_requests = max(total_requests, metrics.get('vllm:num_requests_total', 0))
         
-        self.logger.info(f"Cache metrics summary - Queries: {total_cache_queries}, Hits: {total_cache_hits}, Max KV: {max_kv_usage}")
+        # Summary of findings
+        self.logger.info("METRICS ANALYSIS SUMMARY:")
+        self.logger.info(f"  Cache Queries Range: {min(all_cache_queries) if all_cache_queries else 0} - {max(all_cache_queries) if all_cache_queries else 0}")
+        self.logger.info(f"  Cache Hits Range: {min(all_cache_hits) if all_cache_hits else 0} - {max(all_cache_hits) if all_cache_hits else 0}")
+        self.logger.info(f"  KV Usage Range: {min(all_kv_usage) if all_kv_usage else 0:.1f}% - {max(all_kv_usage) if all_kv_usage else 0:.1f}%")
+        self.logger.info(f"  Total Cache Queries: {total_cache_queries}")
+        self.logger.info(f"  Total Cache Hits: {total_cache_hits}")
+        self.logger.info(f"  Max KV Usage: {max_kv_usage:.1f}%")
+        self.logger.info(f"  Average KV Usage: {avg_kv_usage:.1f}%")
         
         return {
             "max_kv_cache_usage_percent": max_kv_usage,
+            "average_kv_cache_usage_percent": avg_kv_usage,
             "total_cache_queries": total_cache_queries,
             "total_cache_hits": total_cache_hits,
             "cache_hit_rate_percent": (total_cache_hits / total_cache_queries * 100) if total_cache_queries > 0 else 0,
             "max_concurrent_requests": max_running_requests,
-            "metrics_samples_collected": len(self.metrics_data)
+            "total_requests_processed": total_requests,
+            "metrics_samples_collected": len(self.metrics_data),
+            "unique_metric_names_found": len(all_metric_names),
+            "raw_cache_query_values": all_cache_queries,
+            "raw_cache_hit_values": all_cache_hits,
+            "raw_kv_usage_values": all_kv_usage
         }
     
     def save_results(self, summary: Dict[str, Any]):
@@ -723,6 +840,43 @@ class VLLMExperimentRunner:
             with open(metrics_file, 'w') as f:
                 json.dump(self.metrics_data, f, indent=2, default=str)
             self.logger.info(f"Metrics saved: {metrics_file}")
+            
+            # Save a human-readable metrics summary
+            metrics_summary_file = self.result_dir / f"metrics_summary_{timestamp}.txt"
+            with open(metrics_summary_file, 'w') as f:
+                f.write("VLLM METRICS SUMMARY\n")
+                f.write("=" * 50 + "\n\n")
+                
+                # Get all unique metric names
+                all_metric_names = set()
+                for metrics in self.metrics_data:
+                    all_metric_names.update(metrics.keys())
+                
+                f.write(f"Total samples collected: {len(self.metrics_data)}\n")
+                f.write(f"Unique metrics found: {len(all_metric_names)}\n\n")
+                
+                f.write("ALL METRIC NAMES:\n")
+                for name in sorted(all_metric_names):
+                    if name != '_timestamp':
+                        f.write(f"  - {name}\n")
+                
+                f.write("\nFIRST SAMPLE VALUES:\n")
+                if self.metrics_data:
+                    first_sample = self.metrics_data[0]
+                    for key, value in sorted(first_sample.items()):
+                        if key != '_timestamp':
+                            f.write(f"  {key}: {value}\n")
+                
+                f.write("\nLAST SAMPLE VALUES:\n")
+                if self.metrics_data:
+                    last_sample = self.metrics_data[-1]
+                    for key, value in sorted(last_sample.items()):
+                        if key != '_timestamp':
+                            f.write(f"  {key}: {value}\n")
+            
+            self.logger.info(f"Metrics summary saved: {metrics_summary_file}")
+        else:
+            self.logger.warning("No metrics data to save!")
         
         # Save CSV for easy analysis
         if self.inference_results:
@@ -791,7 +945,12 @@ Examples:
         if summary.get('kv_cache_metrics'):
             kv_metrics = summary['kv_cache_metrics']
             print(f"Max KV Cache Usage: {kv_metrics['max_kv_cache_usage_percent']:.1f}%")
+            print(f"Average KV Cache Usage: {kv_metrics['average_kv_cache_usage_percent']:.1f}%")
             print(f"Cache Hit Rate: {kv_metrics['cache_hit_rate_percent']:.1f}%")
+            print(f"Total Cache Queries: {kv_metrics['total_cache_queries']}")
+            print(f"Total Cache Hits: {kv_metrics['total_cache_hits']}")
+            print(f"Unique Metrics Found: {kv_metrics['unique_metric_names_found']}")
+            print(f"Metrics Samples Collected: {kv_metrics['metrics_samples_collected']}")
         
         print("="*50)
         
