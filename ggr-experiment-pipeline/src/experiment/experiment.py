@@ -737,7 +737,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="vLLM Experiment Runner with KV Cache Monitoring",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilogue=f"""
+        epilog=f"""s
 Available Query Types:
 {chr(10).join([f"  {k}: {v['prompt'][:80]}..." for k, v in QUERY_TEMPLATES.items()])}
 
