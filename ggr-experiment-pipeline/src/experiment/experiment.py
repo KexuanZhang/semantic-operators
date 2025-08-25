@@ -259,7 +259,7 @@ class VLLMExperimentRunner:
         
         gpu_count = len(self.gpus.split(','))
         
-        # Build server command
+        # Build server command - explicitly enable prefix caching and stats
         cmd = [
             sys.executable, "-m", "vllm.entrypoints.openai.api_server",
             "--model", self.model_path,
@@ -267,10 +267,11 @@ class VLLMExperimentRunner:
             "--port", str(self.port),
             "--tensor-parallel-size", str(gpu_count),
             "--gpu-memory-utilization", "0.85",
-            "--enable-prefix-caching",
-            "--disable-log-stats",  # We'll collect metrics manually
+            "--enable-prefix-caching",  # Explicitly enable
             "--max-model-len", "8192",
-            "--dtype", "auto"
+            "--dtype", "auto",
+            # Remove the disable-log-stats flag to enable metrics
+            "--trust-remote-code"  # Add this in case the model needs it
         ]
         
         self.logger.info(f"Server command: {' '.join(cmd)}")
@@ -278,6 +279,9 @@ class VLLMExperimentRunner:
         try:
             env = dict(os.environ)
             env["CUDA_VISIBLE_DEVICES"] = self.gpus
+            # Add environment variables for better metrics
+            env["VLLM_LOGGING_LEVEL"] = "INFO"
+            env["VLLM_ENABLE_METRICS"] = "1"
             
             self.server_process = subprocess.Popen(
                 cmd,
@@ -297,10 +301,22 @@ class VLLMExperimentRunner:
                     if response.status_code == 200:
                         self.logger.info("Server started successfully!")
                         
-                        # Log initial metrics
-                        initial_metrics = self.get_metrics()
-                        gpu_cache_usage = initial_metrics.get('vllm:gpu_cache_usage_perc', 0)
-                        self.logger.info(f"Initial GPU cache usage: {gpu_cache_usage:.1f}%")
+                        # Test metrics endpoint immediately
+                        self.logger.info("Testing metrics endpoint...")
+                        try:
+                            metrics_response = requests.get(self.metrics_url, timeout=5)
+                            if metrics_response.status_code == 200:
+                                self.logger.info(f"Metrics endpoint accessible. Content length: {len(metrics_response.text)}")
+                                # Log first few lines of metrics
+                                lines = metrics_response.text.split('\n')[:20]
+                                self.logger.info("First 20 lines of metrics:")
+                                for line in lines:
+                                    if line.strip():
+                                        self.logger.info(f"  {line}")
+                            else:
+                                self.logger.warning(f"Metrics endpoint returned status: {metrics_response.status_code}")
+                        except Exception as me:
+                            self.logger.error(f"Metrics endpoint test failed: {me}")
                         
                         return True
                 except requests.exceptions.RequestException:
@@ -310,7 +326,8 @@ class VLLMExperimentRunner:
                 if self.server_process.poll() is not None:
                     stdout, stderr = self.server_process.communicate()
                     self.logger.error("Server process terminated unexpectedly")
-                    self.logger.error(f"STDERR: {stderr[-1000:]}")
+                    self.logger.error(f"STDOUT: {stdout[-1000:] if stdout else 'None'}")
+                    self.logger.error(f"STDERR: {stderr[-1000:] if stderr else 'None'}")
                     return False
                 
                 time.sleep(5)
@@ -341,9 +358,9 @@ class VLLMExperimentRunner:
             response = requests.get(self.metrics_url, timeout=5)
             response.raise_for_status()
             
-            # Log the raw metrics text for debugging
-            self.logger.debug("RAW METRICS RESPONSE:")
-            self.logger.debug(response.text[:2000] + "..." if len(response.text) > 2000 else response.text)
+            # Log the raw metrics text for debugging - change to INFO level
+            self.logger.info("RAW METRICS RESPONSE (first 3000 chars):")
+            self.logger.info(response.text[:3000])
             
             metrics = {}
             
@@ -359,6 +376,13 @@ class VLLMExperimentRunner:
                     metrics[key] = sample.value
             
             self.logger.info(f"Collected {len(metrics)} metrics from Prometheus endpoint")
+            
+            # Log all metric names to see what's available
+            self.logger.info("ALL METRIC NAMES FOUND:")
+            for name in sorted(metrics.keys()):
+                if name != '_timestamp':
+                    self.logger.info(f"  {name}")
+            
             return metrics
             
         except requests.exceptions.RequestException as e:
@@ -503,16 +527,29 @@ class VLLMExperimentRunner:
     
     def query_model(self, prompt: str, row_index: int) -> Dict[str, Any]:
         """Query the model with a prompt"""
-        # Use consistent parameters to enable prefix caching
+        # For better caching, use the same system prompt for all requests
+        template = QUERY_TEMPLATES[self.query_type]
+        
+        # Use a consistent structure that encourages prefix caching
         payload = {
             "model": self.model_path,
             "messages": [
-                {"role": "system", "content": QUERY_TEMPLATES[self.query_type]["prompt"]},
-                {"role": "user", "content": f"Given the following data: {json.dumps(self.current_data_row, indent=2, sort_keys=True)}"}
+                {
+                    "role": "system", 
+                    "content": "You are a data analyst. Use the provided JSON data to answer the user query based on the specified fields. Respond with only the answer, no extra formatting."
+                },
+                {
+                    "role": "user", 
+                    "content": f"{template['prompt']}\n\nGiven the following data: {json.dumps(self.current_data_row, indent=2, sort_keys=True)}"
+                }
             ],
             "max_tokens": 512,
-            "temperature": 0.0,  # Use 0.0 for consistent results
-            "seed": 42  # Add seed for consistency
+            "temperature": 0.0,
+            "seed": 42,
+            # Add these parameters for better caching
+            "top_p": 1.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0
         }
         
         start_time = time.time()
@@ -680,7 +717,7 @@ class VLLMExperimentRunner:
         self.logger.info(f"Found {len(all_metric_names)} unique metric names:")
         for name in sorted(all_metric_names):
             if name != '_timestamp':
-                self.logger.info(f"  - {name}")
+                self.logger.info(f"  {name}")
         
         # Try to find cache metrics across all samples
         all_cache_queries = []
