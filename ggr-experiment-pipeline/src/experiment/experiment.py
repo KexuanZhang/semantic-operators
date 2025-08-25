@@ -259,29 +259,38 @@ class VLLMExperimentRunner:
         
         gpu_count = len(self.gpus.split(','))
         
-        # Build server command - explicitly enable prefix caching and stats
+        # Build server command with more conservative settings
         cmd = [
             sys.executable, "-m", "vllm.entrypoints.openai.api_server",
             "--model", self.model_path,
             "--host", self.host,
             "--port", str(self.port),
-            "--tensor-parallel-size", str(gpu_count),
-            "--gpu-memory-utilization", "0.85",
-            "--enable-prefix-caching",  # Explicitly enable
-            "--max-model-len", "8192",
+            "--gpu-memory-utilization", "0.8",  # More conservative memory usage
+            "--enable-prefix-caching",
+            "--max-model-len", "4096",  # Smaller max length to reduce memory pressure
             "--dtype", "auto",
-            # Remove the disable-log-stats flag to enable metrics
-            "--trust-remote-code"  # Add this in case the model needs it
+            "--trust-remote-code",
+            "--disable-log-requests",  # Reduce logging overhead
         ]
+        
+        # Only add tensor-parallel-size if we have multiple GPUs
+        if gpu_count > 1:
+            cmd.extend(["--tensor-parallel-size", str(gpu_count)])
+            self.logger.info(f"Using tensor parallelism with {gpu_count} GPUs")
+        else:
+            self.logger.info(f"Using single GPU mode")
         
         self.logger.info(f"Server command: {' '.join(cmd)}")
         
         try:
             env = dict(os.environ)
             env["CUDA_VISIBLE_DEVICES"] = self.gpus
-            # Add environment variables for better metrics
+            
+            # Add environment variables for better stability
             env["VLLM_LOGGING_LEVEL"] = "INFO"
             env["VLLM_ENABLE_METRICS"] = "1"
+            env["VLLM_USE_MODELSCOPE"] = "False"  # Disable ModelScope
+            env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"  # Use spawn method
             
             self.server_process = subprocess.Popen(
                 cmd,
@@ -291,25 +300,39 @@ class VLLMExperimentRunner:
                 env=env
             )
             
-            # Wait for server to start
+            # Wait for server to start with better error handling
             self.logger.info("Waiting for server to start...")
             start_time = time.time()
             
             while time.time() - start_time < 300:  # 5 minute timeout
+                # Check if process crashed
+                if self.server_process.poll() is not None:
+                    stdout, stderr = self.server_process.communicate()
+                    self.logger.error("Server process terminated unexpectedly")
+                    self.logger.error(f"STDOUT: {stdout[-2000:] if stdout else 'None'}")
+                    self.logger.error(f"STDERR: {stderr[-2000:] if stderr else 'None'}")
+                    
+                    # Try single GPU fallback if multi-GPU failed
+                    if gpu_count > 1:
+                        self.logger.warning("Multi-GPU initialization failed, trying single GPU...")
+                        return self._start_single_gpu_fallback()
+                    else:
+                        return False
+                
                 try:
                     response = requests.get(f"{self.server_url}/health", timeout=5)
                     if response.status_code == 200:
                         self.logger.info("Server started successfully!")
                         
-                        # Test metrics endpoint immediately
+                        # Test metrics endpoint
                         self.logger.info("Testing metrics endpoint...")
                         try:
                             metrics_response = requests.get(self.metrics_url, timeout=5)
                             if metrics_response.status_code == 200:
                                 self.logger.info(f"Metrics endpoint accessible. Content length: {len(metrics_response.text)}")
                                 # Log first few lines of metrics
-                                lines = metrics_response.text.split('\n')[:20]
-                                self.logger.info("First 20 lines of metrics:")
+                                lines = metrics_response.text.split('\n')[:10]
+                                self.logger.info("First 10 lines of metrics:")
                                 for line in lines:
                                     if line.strip():
                                         self.logger.info(f"  {line}")
@@ -322,14 +345,6 @@ class VLLMExperimentRunner:
                 except requests.exceptions.RequestException:
                     pass
                 
-                # Check if process is still running
-                if self.server_process.poll() is not None:
-                    stdout, stderr = self.server_process.communicate()
-                    self.logger.error("Server process terminated unexpectedly")
-                    self.logger.error(f"STDOUT: {stdout[-1000:] if stdout else 'None'}")
-                    self.logger.error(f"STDERR: {stderr[-1000:] if stderr else 'None'}")
-                    return False
-                
                 time.sleep(5)
             
             self.logger.error("Server startup timeout")
@@ -337,6 +352,69 @@ class VLLMExperimentRunner:
             
         except Exception as e:
             self.logger.error(f"Failed to start server: {e}")
+            return False
+    
+    def _start_single_gpu_fallback(self) -> bool:
+        """Fallback to single GPU mode"""
+        self.logger.info("Attempting single GPU fallback...")
+        
+        # Use only the first GPU
+        first_gpu = self.gpus.split(',')[0]
+        
+        cmd = [
+            sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+            "--model", self.model_path,
+            "--host", self.host,
+            "--port", str(self.port),
+            "--gpu-memory-utilization", "0.7",  # Even more conservative
+            "--enable-prefix-caching",
+            "--max-model-len", "2048",  # Smaller for stability
+            "--dtype", "auto",
+            "--trust-remote-code",
+            "--disable-log-requests",
+        ]
+        
+        self.logger.info(f"Fallback command: {' '.join(cmd)}")
+        
+        try:
+            env = dict(os.environ)
+            env["CUDA_VISIBLE_DEVICES"] = first_gpu
+            env["VLLM_LOGGING_LEVEL"] = "INFO"
+            env["VLLM_ENABLE_METRICS"] = "1"
+            
+            self.server_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env
+            )
+            
+            # Wait for fallback server to start
+            start_time = time.time()
+            while time.time() - start_time < 180:  # 3 minute timeout for fallback
+                if self.server_process.poll() is not None:
+                    stdout, stderr = self.server_process.communicate()
+                    self.logger.error("Fallback server also failed")
+                    self.logger.error(f"STDOUT: {stdout[-1000:] if stdout else 'None'}")
+                    self.logger.error(f"STDERR: {stderr[-1000:] if stderr else 'None'}")
+                    return False
+                
+                try:
+                    response = requests.get(f"{self.server_url}/health", timeout=5)
+                    if response.status_code == 200:
+                        self.logger.info("Fallback server started successfully!")
+                        return True
+                except requests.exceptions.RequestException:
+                    pass
+                
+                time.sleep(5)
+            
+            self.logger.error("Fallback server startup timeout")
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Fallback server failed: {e}")
             return False
     
     def stop_server(self):
@@ -595,11 +673,15 @@ class VLLMExperimentRunner:
         try:
             data = self.load_dataset()
         except Exception as e:
-            return {"status": "failed", "error": f"Dataset loading failed: {e}"}
+            error_msg = f"Dataset loading failed: {e}"
+            self.logger.error(error_msg)
+            return {"status": "failed", "error": error_msg}
         
         # Start server
         if not self.start_server():
-            return {"status": "failed", "error": "Failed to start vLLM server"}
+            error_msg = "Failed to start vLLM server"
+            self.logger.error(error_msg)
+            return {"status": "failed", "error": error_msg}
         
         # Start metrics monitoring
         self.stop_monitoring = False
@@ -621,7 +703,7 @@ class VLLMExperimentRunner:
             self.logger.info("Small dataset detected, duplicating rows to test caching")
             # Duplicate the first row multiple times
             original_data = data.copy()
-            data = [original_data[0]] * 5 + original_data
+            data = [original_data[0]] * 3 + original_data  # Smaller duplication for stability
             self.logger.info(f"Extended dataset to {len(data)} rows for cache testing")
         
         for i, row in enumerate(data):
@@ -641,14 +723,14 @@ class VLLMExperimentRunner:
                 total_inference_time += result['inference_time']
                 successful_queries += 1
             
-            # Smaller delay to see caching effects better
-            time.sleep(0.5)
+            # Longer delay for stability
+            time.sleep(1.0)
         
         experiment_end_time = time.time()
         total_experiment_time = experiment_end_time - experiment_start_time
         
         # Wait a bit more to collect final metrics
-        time.sleep(2)
+        time.sleep(5)
         
         # Stop monitoring
         self.stop_monitoring = True
