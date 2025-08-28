@@ -1,284 +1,213 @@
+#!/usr/bin/env python3
+"""
+Dummy Test Script for vLLM with Stats Logging
+This script creates three simple queries and runs them through a model,
+printing both LLM responses and vLLM statistics for each response.
+"""
+
 import argparse
-import json
+import time
 import os
-from typing import List, Dict, Any
-from vllm import LLM, SamplingParams
-from vllm.v1.metrics.reader import Counter, Gauge, Histogram, Vector
-import pandas as pd
+import sys
+import torch
+import json
+import logging
+from pathlib import Path
 
-# Prompt template
-SYSTEM_PROMPT = """You are a data analyst. Use the provided JSON data to answer the user query based on the specified fields. Respond with only the answer, no extra formatting. Answer the below query: {QUERY}
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-Given the following data: {fields}"""
+# Import local vLLM setup with flexible path handling
+try:
+    # Try direct import first
+    logger.info("Trying direct import of use_local_vllm...")
+    try:
+        from use_local_vllm import initialize_experiment_with_local_vllm, create_enhanced_llm
+    except ImportError:
+        # If direct import fails, search for module
+        logger.info("Direct import failed, searching for module...")
+        
+        # Search for module in potential paths
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        potential_paths = [
+            current_dir,
+            os.path.dirname(current_dir),
+            os.path.dirname(os.path.dirname(current_dir)),
+            '/home/data/so/semantic-operators/ggr-experiment-pipeline',
+            '/Users/zhang/Desktop/huawei/so1/semantic-operators/ggr-experiment-pipeline'
+        ]
+        
+        module_found = False
+        for path in potential_paths:
+            if os.path.exists(os.path.join(path, 'use_local_vllm.py')):
+                logger.info(f"Found use_local_vllm.py in: {path}")
+                sys.path.insert(0, path)
+                from use_local_vllm import initialize_experiment_with_local_vllm, create_enhanced_llm
+                module_found = True
+                break
+        
+        if not module_found:
+            raise ImportError("Could not find use_local_vllm.py in any of the expected paths")
+except Exception as e:
+    logger.error(f"Failed to import use_local_vllm: {e}")
+    sys.exit(1)
 
-# Query templates organized by type
-QUERY_TEMPLATES = {
-    # LLM Aggregation Queries
-    "agg_movies_sentiment": {
-        "type": "aggregation",
-        "prompt": "Given the following fields of a movie description and a user review, assign a sentiment score for the review out of 5. Answer with ONLY a single integer between 1 (bad) and 5 (good).",
-        "datasets": ["movies"]
-    },
-    "agg_products_sentiment": {
-        "type": "aggregation", 
-        "prompt": "Given the following fields of a product description and a user review, assign a sentiment score for the review out of 5. Answer with ONLY a single integer between 1 (bad) and 5 (good).",
-        "datasets": ["products"]
-    },
+# Initialize local vLLM with stats logging
+logger.info("Initializing local vLLM with stats logging...")
+initialize_experiment_with_local_vllm()
+
+# Import vLLM components
+from vllm import SamplingParams
+from vllm.offline_llm_with_stats import OfflineLLMWithStats
+
+def run_dummy_test(model_path, gpu_ids=None, tensor_parallel_size=None, gpu_memory_utilization=0.7, max_model_len=2048):
+    """
+    Run a dummy test with three queries and print responses with stats
+    """
+    logger.info(f"🚀 Running dummy test with model: {model_path}")
     
-    # Multi-LLM Invocation Queries
-    "multi_movies_sentiment": {
-        "type": "multi_invocation",
-        "prompt": "Given the following review, answer whether the sentiment associated is 'POSITIVE' or 'NEGATIVE'. Answer in all caps with ONLY 'POSITIVE' or 'NEGATIVE':",
-        "datasets": ["movies"]
-    },
-    "multi_products_sentiment": {
-        "type": "multi_invocation",
-        "prompt": "Given the following review, answer whether the sentiment associated is 'POSITIVE' or 'NEGATIVE'. Answer in all caps with ONLY 'POSITIVE' or 'NEGATIVE':",
-        "datasets": ["products"]
-    },
+    # Set GPU devices if specified
+    if gpu_ids:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        logger.info(f"Set CUDA_VISIBLE_DEVICES={gpu_ids}")
+        
+        # Parse GPU IDs and set tensor_parallel_size if not specified
+        gpu_id_list = [int(gpu.strip()) for gpu in gpu_ids.split(',')]
+        if tensor_parallel_size is None:
+            tensor_parallel_size = len(gpu_id_list)
+            logger.info(f"Set tensor_parallel_size={tensor_parallel_size} based on number of GPUs")
     
-    # LLM Filter Queries
-    "filter_movies_kids": {
-        "type": "filter",
-        "prompt": "Given the following fields, answer in one word, 'Yes' or 'No', whether the movie would be suitable for kids. Answer with ONLY 'Yes' or 'No'.",
-        "datasets": ["movies"]
-    },
-    "filter_products_sentiment": {
-        "type": "filter",
-        "prompt": "Given the following fields determine if the review speaks positively ('POSITIVE'), negatively ('NEGATIVE'), or neutral ('NEUTRAL') about the product. Answer only 'POSITIVE', 'NEGATIVE', or 'NEUTRAL', nothing else.",
-        "datasets": ["products"]
-    },
-    "filter_bird_statistics": {
-        "type": "filter",
-        "prompt": "Given the following fields related to posts in an online codebase community, answer whether the post is related to statistics. Answer with only 'YES' or 'NO'.",
-        "datasets": ["bird"]
-    },
-    "filter_pdmx_individual": {
-        "type": "filter",
-        "prompt": "Based on following fields, answer 'YES' or 'NO' if any of the song information references a specific individual. Answer only 'YES' or 'NO', nothing else.",
-        "datasets": ["pdmx"]
-    },
-    "filter_beer_european": {
-        "type": "filter",
-        "prompt": "Based on the beer descriptions, does this beer have European origin? Answer 'YES' if it does or 'NO' if it doesn't.",
-        "datasets": ["beer"]
-    },
-    
-    # LLM Projection Queries
-    "proj_movies_summary": {
-        "type": "projection",
-        "prompt": "Given information including movie descriptions and critic reviews, summarize the good qualities in this movie that led to a favorable rating.",
-        "datasets": ["movies"]
-    },
-    "proj_products_consistency": {
-        "type": "projection",
-        "prompt": "Given the following fields related to amazon products, summarize the product, then answer whether the product description is consistent with the quality expressed in the review.",
-        "datasets": ["products"]
-    },
-    "proj_bird_comment": {
-        "type": "projection", 
-        "prompt": "Given the following fields related to posts in an online codebase community, summarize how the comment Text related to the post body.",
-        "datasets": ["bird"]
-    },
-    "proj_pdmx_music": {
-        "type": "projection",
-        "prompt": "Given the following fields, provide an overview on the music type, and analyze the given scores. Give exactly 50 words of summary.",
-        "datasets": ["pdmx"]
-    },
-    "proj_beer_overview": {
-        "type": "projection",
-        "prompt": "Given the following fields, provide an high-level overview on the beer and review in a 20 words paragraph.",
-        "datasets": ["beer"]
-    },
-    
-    # RAG Queries
-    "rag_fever": {
-        "type": "rag",
-        "prompt": "You are given 4 pieces of evidence as {evidence1}, {evidence2}, {evidence3}, and {evidence4}. You are also given a claim as {claim}. Answer SUPPORTS if the pieces of evidence support the given {claim}, REFUTES if the evidence refutes the given {claim}, or NOT ENOUGH INFO if there is not enough information to answer. Your answer should just be SUPPORTS, REFUTES, or NOT ENOUGH INFO and nothing else.",
-        "datasets": ["fever"]
-    },
-    "rag_squad": {
-        "type": "rag",
-        "prompt": "Given a question and supporting contexts, answer the provided question.",
-        "datasets": ["squad"]
+    # LLM parameters
+    llm_kwargs = {
+        'tensor_parallel_size': tensor_parallel_size or 1,
+        'max_model_len': max_model_len,
+        'gpu_memory_utilization': gpu_memory_utilization,
+        'enable_prefix_caching': True,
+        'log_stats_interval': 1  # Log stats after each query
     }
-}
-
-
-def load_dataset(dataset_path: str) -> List[Dict[str, Any]]:
-    """Load dataset from JSON or CSV file"""
-    if dataset_path.endswith('.json'):
-        with open(dataset_path, 'r') as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else [data]
-    elif dataset_path.endswith('.csv'):
-        df = pd.read_csv(dataset_path)
-        return df.to_dict('records')
-    else:
-        raise ValueError(f"Unsupported file format: {dataset_path}")
-
-
-def format_prompt(prompt_template: str, data_row: Dict[str, Any]) -> str:
-    """Format the prompt with data from a row"""
-    if prompt_template in QUERY_TEMPLATES:
-        query_info = QUERY_TEMPLATES[prompt_template]
-        query = query_info["prompt"]
+    
+    # Initialize LLM
+    logger.info(f"Initializing model with parameters: {llm_kwargs}")
+    try:
+        llm = create_enhanced_llm(model_path, **llm_kwargs)
+        logger.info("✅ Model initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize model: {e}")
+        return
+    
+    # Define sampling parameters
+    sampling_params = SamplingParams(
+        temperature=0.1,
+        top_p=0.9,
+        max_tokens=200,
+        stop=["</s>", "<|endoftext|>"]
+    )
+    
+    # Create three test queries with increasing similarity
+    queries = [
+        "Explain the concept of tensor parallelism in large language models.",
+        "How does GPU memory utilization affect the performance of large language models?",
+        "What is the impact of context length (max_model_len) on LLM inference speed and memory usage?"
+    ]
+    
+    logger.info(f"Running inference on {len(queries)} test queries...")
+    
+    # Process each query individually to see stats for each
+    for i, query in enumerate(queries):
+        logger.info(f"Processing query {i+1}/{len(queries)}...")
+        start_time = time.time()
         
-        # Convert data row to formatted fields string
-        fields_str = json.dumps(data_row, indent=2)
-        
-        # Use system prompt template
-        formatted_prompt = SYSTEM_PROMPT.format(
-            QUERY=query,
-            fields=fields_str
-        )
-        return formatted_prompt
-    else:
-        # Custom prompt - format with data row fields
         try:
-            return prompt_template.format(**data_row)
-        except KeyError as e:
-            print(f"Warning: Key {e} not found in data row, using raw prompt")
-            return prompt_template
-
-
-def run_inference(llm: LLM, prompts: List[str], sampling_params: SamplingParams) -> List[str]:
-    """Run inference on the prompts and return generated texts"""
-    outputs = llm.generate(prompts, sampling_params)
-    results = []
+            outputs = llm.generate([query], sampling_params, log_detailed_stats=True)
+            response = outputs[0].outputs[0].text
+            elapsed_time = time.time() - start_time
+            
+            # Print the response and stats
+            print(f"\n{'='*60}")
+            print(f"QUERY {i+1}: {query[:50]}...")
+            print(f"{'='*60}")
+            print(f"{response}")
+            print(f"{'='*60}")
+            
+            # Get and print current stats
+            stats = llm.get_current_stats()
+            print(f"vLLM Stats:")
+            
+            # Print KV cache usage
+            if 'engine_kv_cache_usage' in stats:
+                print(f"• KV Cache Usage: {stats['engine_kv_cache_usage']:.2%}")
+            
+            # Print prefix cache hit rate
+            if 'engine_prefix_cache_stats_hits' in stats and 'engine_prefix_cache_stats_queries' in stats:
+                hits = stats['engine_prefix_cache_stats_hits']
+                queries = stats['engine_prefix_cache_stats_queries']
+                hit_rate = (hits / queries * 100) if queries > 0 else 0
+                print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries})")
+            
+            # Print token stats
+            prompt_tokens = len(outputs[0].prompt_token_ids)
+            output_tokens = len(outputs[0].outputs[0].token_ids)
+            print(f"• Tokens: {prompt_tokens} prompt + {output_tokens} output = {prompt_tokens + output_tokens} total")
+            
+            # Print throughput
+            if elapsed_time > 0:
+                tokens_per_sec = output_tokens / elapsed_time
+                print(f"• Throughput: {tokens_per_sec:.2f} tokens/sec")
+            
+            print(f"• Response time: {elapsed_time:.2f}s")
+            print(f"{'='*60}\n")
+            
+            # Sleep briefly to make sure we get updated stats
+            time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"❌ Error during generation: {e}")
+            continue
     
-    for output in outputs:
-        generated_text = output.outputs[0].text.strip()
-        results.append(generated_text)
+    # Print final stats
+    final_stats = llm.get_current_stats()
+    logger.info("📊 Final vLLM Stats Summary:")
     
-    return results
-
-
-def print_metrics(llm: LLM):
-    """Print all metrics from the LLM"""
-    print("\n" + "="*80)
-    print("METRICS")
-    print("="*80)
+    # Print KV cache usage
+    if 'engine_kv_cache_usage' in final_stats:
+        logger.info(f"• Final KV Cache Usage: {final_stats['engine_kv_cache_usage']:.2%}")
     
-    for metric in llm.get_metrics():
-        if isinstance(metric, Gauge):
-            print(f"{metric.name} (gauge) = {metric.value}")
-        elif isinstance(metric, Counter):
-            print(f"{metric.name} (counter) = {metric.value}")
-        elif isinstance(metric, Vector):
-            print(f"{metric.name} (vector) = {metric.values}")
-        elif isinstance(metric, Histogram):
-            print(f"{metric.name} (histogram)")
-            print(f"    sum = {metric.sum}")
-            print(f"    count = {metric.count}")
-            for bucket_le, value in metric.buckets.items():
-                print(f"    {bucket_le} = {value}")
-
+    # Print prefix cache hit rate
+    if 'engine_prefix_cache_stats_hits' in final_stats and 'engine_prefix_cache_stats_queries' in final_stats:
+        hits = final_stats['engine_prefix_cache_stats_hits']
+        queries = final_stats['engine_prefix_cache_stats_queries']
+        hit_rate = (hits / queries * 100) if queries > 0 else 0
+        logger.info(f"• Final Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries})")
+    
+    logger.info("✅ Dummy test completed successfully!")
 
 def main():
-    parser = argparse.ArgumentParser(description="Run LLM inference experiment with metrics")
-    parser.add_argument("--prompt", type=str, required=True, 
-                       help="Prompt template name from QUERY_TEMPLATES or custom prompt string")
-    parser.add_argument("--dataset_path", type=str, required=True,
-                       help="Path to dataset file (JSON or CSV)")
-    parser.add_argument("--model_path", type=str, required=True,
-                       help="Path to the model or model name")
-    parser.add_argument("--gpu_devices", type=str, default="0",
-                       help="Comma-separated GPU device IDs (e.g., '0,1,2')")
-    parser.add_argument("--temperature", type=float, default=0.8,
-                       help="Sampling temperature")
-    parser.add_argument("--top_p", type=float, default=0.95,
-                       help="Top-p sampling parameter")
-    parser.add_argument("--max_tokens", type=int, default=512,
-                       help="Maximum tokens to generate")
-    parser.add_argument("--batch_size", type=int, default=None,
-                       help="Batch size for inference")
+    parser = argparse.ArgumentParser(description="Run a dummy test with vLLM stats logging")
+    parser.add_argument("--model", type=str, default="Qwen/Qwen1.5-7B-Chat",
+                        help="Model path or name")
+    parser.add_argument("--gpus", type=str, default=None,
+                        help="Comma-separated GPU IDs (e.g., '0,1,2,3' or '4,5,6,7')")
+    parser.add_argument("--tensor-parallel-size", type=int, default=None,
+                        help="Number of GPUs to use for tensor parallelism (calculated from --gpus if not specified)")
+    parser.add_argument("--gpu-memory", type=float, default=0.7,
+                        help="GPU memory utilization (0.0 to 1.0, default: 0.7)")
+    parser.add_argument("--max-model-len", type=int, default=2048,
+                        help="Maximum model context length (default: 2048)")
     
     args = parser.parse_args()
     
-    # Set GPU devices
-    if args.gpu_devices:
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_devices
-        print(f"Using GPU devices: {args.gpu_devices}")
-    
-    # Load dataset
-    print(f"Loading dataset from: {args.dataset_path}")
-    dataset = load_dataset(args.dataset_path)
-    print(f"Loaded {len(dataset)} rows")
-    
-    # Create sampling parameters
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens
+    # Run the dummy test
+    run_dummy_test(
+        model_path=args.model,
+        gpu_ids=args.gpus,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory,
+        max_model_len=args.max_model_len
     )
-    
-    # Initialize LLM
-    print(f"Initializing LLM with model: {args.model_path}")
-    llm_kwargs = {
-        "model": args.model_path,
-        "disable_log_stats": False,
-    }
-    
-    if args.batch_size:
-        llm_kwargs["max_num_batched_tokens"] = args.batch_size
-    
-    llm = LLM(**llm_kwargs)
-    
-    # Format prompts for each row
-    print("Formatting prompts...")
-    prompts = []
-    for i, row in enumerate(dataset):
-        formatted_prompt = format_prompt(args.prompt, row)
-        prompts.append(formatted_prompt)
-        if i < 3:  # Show first 3 prompts as examples
-            print(f"\nExample prompt {i+1}:")
-            print("-" * 50)
-            print(formatted_prompt[:200] + "..." if len(formatted_prompt) > 200 else formatted_prompt)
-    
-    print(f"\nRunning inference on {len(prompts)} prompts...")
-    
-    # Run inference
-    results = run_inference(llm, prompts, sampling_params)
-    
-    # Print results
-    print("\n" + "="*80)
-    print("RESULTS")
-    print("="*80)
-    
-    for i, (prompt, result) in enumerate(zip(prompts[:5], results[:5])):  # Show first 5 results
-        print(f"\nResult {i+1}:")
-        print("-" * 50)
-        print(f"Prompt: {prompt[:100]}...")
-        print(f"Generated: {result}")
-    
-    if len(results) > 5:
-        print(f"\n... and {len(results) - 5} more results")
-    
-    # Print metrics
-    print_metrics(llm)
-    
-    # Save results to file
-    output_file = "experiment_results.json"
-    output_data = {
-        "experiment_config": {
-            "prompt": args.prompt,
-            "dataset_path": args.dataset_path,
-            "model_path": args.model_path,
-            "gpu_devices": args.gpu_devices,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "max_tokens": args.max_tokens,
-            "num_samples": len(results)
-        },
-        "results": results
-    }
-    
-    with open(output_file, 'w') as f:
-        json.dump(output_data, f, indent=2)
-    
-    print(f"\nResults saved to: {output_file}")
-
 
 if __name__ == "__main__":
     main()
