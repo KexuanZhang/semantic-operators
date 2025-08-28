@@ -145,14 +145,27 @@ def prepare_prompt(query_template: str, row: pd.Series) -> str:
         if pd.notna(row[column]):
             fields[column] = str(row[column])
     
+    # Log available fields for debugging
+    logger.info(f"Row data has {len(fields)} fields: {list(fields.keys())}")
+    
     # Format the prompt
     try:
         # Try to format with named placeholders first
         formatted_prompt = prompt_template.format(**fields)
-    except KeyError:
-        # If named placeholders fail, append fields as JSON
+    except KeyError as e:
+        logger.info(f"KeyError in format: {e}. Using JSON fields instead.")
+        # Always append fields as JSON for reliability
         fields_json = json.dumps(fields, indent=2)
         formatted_prompt = f"{prompt_template}\n\nData fields:\n{fields_json}"
+    
+    # Ensure we have actual data in the prompt
+    if len(formatted_prompt) <= len(prompt_template) + 10:
+        logger.warning("Prompt seems too short, might be missing data. Adding all fields as JSON.")
+        fields_json = json.dumps(fields, indent=2)
+        formatted_prompt = f"{prompt_template}\n\nData fields:\n{fields_json}"
+    
+    # Log prompt length for debugging
+    logger.info(f"Generated prompt length: {len(formatted_prompt)} chars")
     
     return formatted_prompt
 
