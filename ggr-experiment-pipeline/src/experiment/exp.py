@@ -108,6 +108,7 @@ def run_dummy_test(model_path, gpu_ids=None, tensor_parallel_size=None, gpu_memo
         'max_model_len': max_model_len,
         'gpu_memory_utilization': gpu_memory_utilization,
         'enable_prefix_caching': True,
+        'enable_mix_precision_block': False,  # Disable mixed precision for consistent prefix hashing
     }
     
     logger.info(f"Initializing model with parameters: {llm_kwargs}")
@@ -194,35 +195,46 @@ def run_dummy_test(model_path, gpu_ids=None, tensor_parallel_size=None, gpu_memo
         if test_mode != "batch":
             time.sleep(1)
     
-    # If in batch mode, run all queries at once
+    # If in batch mode, run multiple batches to better test prefix caching
     if test_mode == "batch" and batch_size > 1:
-        logger.info(f"Running batch of {batch_size} identical queries at once...")
-        batch_query = ["Explain the concept of tensor parallelism in large language models."] * batch_size
-        batch_outputs = llm.generate(batch_query, sampling_params, log_detailed_stats=True)
-        
-        # Get final stats after batch
-        final_stats = llm.get_current_stats()
-        print(f"\n{'='*60}")
-        print(f"BATCH RESULT STATS:")
-        print(f"{'='*60}")
-        
-        # KV Cache final usage
-        kv_cache = final_stats.get('engine_kv_cache_usage', 0) * 100
-        print(f"• KV Cache Usage: {kv_cache:.2f}%")
-        
-        # Prefix Cache Hit Rate
-        hits = final_stats.get('engine_prefix_cache_stats_hits', 0)
-        queries_count = final_stats.get('engine_prefix_cache_stats_queries', 0)
-        hit_rate = (hits / queries_count * 100) if queries_count > 0 else 0
-        print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries_count})")
-        
-        # Raw stats for debugging
-        print(f"• Raw Prefix Cache Stats: {final_stats.get('engine_prefix_cache_stats', 'N/A')}")
-        print(f"• Full Stats: {json.dumps(final_stats, indent=2)}")
-        print(f"{'='*60}\n")
+        # Run 3 separate batches of identical queries to test prefix caching across batches
+        for batch_num in range(3):
+            logger.info(f"Running batch #{batch_num+1} of {batch_size} identical queries at once...")
+            batch_query = ["Explain the concept of tensor parallelism in large language models."] * batch_size
+            batch_outputs = llm.generate(batch_query, sampling_params, log_detailed_stats=True)
+            
+            # Get stats after each batch
+            batch_stats = llm.get_current_stats()
+            print(f"\n{'='*60}")
+            print(f"BATCH #{batch_num+1} RESULT STATS:")
+            print(f"{'='*60}")
+            
+            # KV Cache usage
+            kv_cache = batch_stats.get('engine_kv_cache_usage', 0) * 100
+            print(f"• KV Cache Usage: {kv_cache:.2f}%")
+            
+            # Prefix Cache Hit Rate
+            hits = batch_stats.get('engine_prefix_cache_stats_hits', 0)
+            queries_count = batch_stats.get('engine_prefix_cache_stats_queries', 0)
+            hit_rate = (hits / queries_count * 100) if queries_count > 0 else 0
+            print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries_count})")
+            
+            # Raw stats for debugging
+            print(f"• Raw Prefix Cache Stats: {batch_stats.get('engine_prefix_cache_stats', 'N/A')}")
+            print(f"• Enable Prefix Cache Setting: {llm_kwargs.get('enable_prefix_caching', False)}")
+            print(f"• VLLM_USE_PREFIX_CACHE: {os.environ.get('VLLM_USE_PREFIX_CACHE', 'Not set')}")
+            
+            if batch_num > 0 and hits == 0:
+                print(f"WARNING: Prefix cache not working across batches! No hits detected for identical queries.")
+                print(f"         Raw Engine Stats: {json.dumps({k: v for k, v in batch_stats.items() if k.startswith('engine_')}, indent=2)}")
+            
+            print(f"{'='*60}\n")
+            
+            # Short pause between batches
+            time.sleep(1)
 
 def main():
-    parser = argparse.ArgumentParser(description="Run a dummy test with vLLM stats logging")
+    parser = argparse.ArgumentParser(description="Run a diagnostic test with vLLM stats logging")
     parser.add_argument("--model", type=str, default="Qwen/Qwen1.5-7B-Chat",
                         help="Model path or name")
     parser.add_argument("--gpus", type=str, default=None,
@@ -238,6 +250,8 @@ def main():
                        help="Test mode: standard (different queries), identical (same queries), similar (similar queries), batch (process in batch)")
     parser.add_argument("--batch-size", type=int, default=3,
                        help="Batch size for batch mode tests (default: 3)")
+    parser.add_argument("--force-prefix-cache", action="store_true",
+                       help="Force enable prefix caching with additional debug output")
     
     args = parser.parse_args()
     
@@ -246,6 +260,16 @@ def main():
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
+    
+    # Print run command for reference
+    cmd_args = ' '.join(sys.argv[1:])
+    logger.info(f"Run command: python {sys.argv[0]} {cmd_args}")
+    
+    # Print suggested commands for different test modes
+    logger.info("Suggested test commands:")
+    logger.info("  For standard test: python exp.py --model yourmodel --gpus 0,1 --test-mode standard")
+    logger.info("  For identical queries: python exp.py --model yourmodel --gpus 0,1 --test-mode identical")
+    logger.info("  For batch mode: python exp.py --model yourmodel --gpus 0,1 --test-mode batch --batch-size 10")
     
     # Run the test
     run_dummy_test(
