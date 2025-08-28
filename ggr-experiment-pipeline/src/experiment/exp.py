@@ -66,9 +66,9 @@ from vllm.offline_llm_with_stats import OfflineLLMWithStats
 
 def run_dummy_test(model_path, gpu_ids=None, tensor_parallel_size=None, gpu_memory_utilization=0.7, max_model_len=2048):
     """
-    Run a dummy test with three queries and print responses with stats
+    Run a simple test with three queries and print responses with key stats
     """
-    logger.info(f"🚀 Running dummy test with model: {model_path}")
+    logger.info(f"🚀 Running test with model: {model_path}")
     
     # Set GPU devices if specified
     if gpu_ids:
@@ -81,109 +81,63 @@ def run_dummy_test(model_path, gpu_ids=None, tensor_parallel_size=None, gpu_memo
             tensor_parallel_size = len(gpu_id_list)
             logger.info(f"Set tensor_parallel_size={tensor_parallel_size} based on number of GPUs")
     
-    # LLM parameters
+    # Initialize LLM with specified parameters
     llm_kwargs = {
         'tensor_parallel_size': tensor_parallel_size or 1,
         'max_model_len': max_model_len,
         'gpu_memory_utilization': gpu_memory_utilization,
         'enable_prefix_caching': True,
-        'log_stats_interval': 1  # Log stats after each query
     }
     
-    # Initialize LLM
     logger.info(f"Initializing model with parameters: {llm_kwargs}")
-    try:
-        llm = create_enhanced_llm(model_path, **llm_kwargs)
-        logger.info("✅ Model initialized successfully")
-    except Exception as e:
-        logger.error(f"❌ Failed to initialize model: {e}")
-        return
+    llm = create_enhanced_llm(model_path, **llm_kwargs)
     
-    # Define sampling parameters
+    # Simple sampling parameters
     sampling_params = SamplingParams(
         temperature=0.1,
         top_p=0.9,
         max_tokens=200,
-        stop=["</s>", "<|endoftext|>"]
     )
     
-    # Create three test queries with increasing similarity
+    # Three test queries
     queries = [
         "Explain the concept of tensor parallelism in large language models.",
         "How does GPU memory utilization affect the performance of large language models?",
         "What is the impact of context length (max_model_len) on LLM inference speed and memory usage?"
     ]
     
-    logger.info(f"Running inference on {len(queries)} test queries...")
-    
-    # Process each query individually to see stats for each
+    # Run each query
     for i, query in enumerate(queries):
-        logger.info(f"Processing query {i+1}/{len(queries)}...")
-        start_time = time.time()
+        logger.info(f"Running query {i+1}/3...")
         
-        try:
-            outputs = llm.generate([query], sampling_params, log_detailed_stats=True)
-            response = outputs[0].outputs[0].text
-            elapsed_time = time.time() - start_time
-            
-            # Print the response and stats
-            print(f"\n{'='*60}")
-            print(f"QUERY {i+1}: {query[:50]}...")
-            print(f"{'='*60}")
-            print(f"{response}")
-            print(f"{'='*60}")
-            
-            # Get and print current stats
-            stats = llm.get_current_stats()
-            print(f"vLLM Stats:")
-            
-            # Print KV cache usage
-            if 'engine_kv_cache_usage' in stats:
-                print(f"• KV Cache Usage: {stats['engine_kv_cache_usage']:.2%}")
-            
-            # Print prefix cache hit rate
-            if 'engine_prefix_cache_stats_hits' in stats and 'engine_prefix_cache_stats_queries' in stats:
-                hits = stats['engine_prefix_cache_stats_hits']
-                queries = stats['engine_prefix_cache_stats_queries']
-                hit_rate = (hits / queries * 100) if queries > 0 else 0
-                print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries})")
-            
-            # Print token stats
-            prompt_tokens = len(outputs[0].prompt_token_ids)
-            output_tokens = len(outputs[0].outputs[0].token_ids)
-            print(f"• Tokens: {prompt_tokens} prompt + {output_tokens} output = {prompt_tokens + output_tokens} total")
-            
-            # Print throughput
-            if elapsed_time > 0:
-                tokens_per_sec = output_tokens / elapsed_time
-                print(f"• Throughput: {tokens_per_sec:.2f} tokens/sec")
-            
-            print(f"• Response time: {elapsed_time:.2f}s")
-            print(f"{'='*60}\n")
-            
-            # Sleep briefly to make sure we get updated stats
-            time.sleep(1)
-            
-        except Exception as e:
-            logger.error(f"❌ Error during generation: {e}")
-            continue
-    
-    # Print final stats
-    final_stats = llm.get_current_stats()
-    logger.info("📊 Final vLLM Stats Summary:")
-    
-    # Print KV cache usage
-    if 'engine_kv_cache_usage' in final_stats:
-        logger.info(f"• Final KV Cache Usage: {final_stats['engine_kv_cache_usage']:.2%}")
-    
-    # Print prefix cache hit rate
-    if 'engine_prefix_cache_stats_hits' in final_stats and 'engine_prefix_cache_stats_queries' in final_stats:
-        hits = final_stats['engine_prefix_cache_stats_hits']
-        queries = final_stats['engine_prefix_cache_stats_queries']
-        hit_rate = (hits / queries * 100) if queries > 0 else 0
-        logger.info(f"• Final Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries})")
-    
-    logger.info("✅ Dummy test completed successfully!")
+        # Generate response
+        outputs = llm.generate([query], sampling_params, log_detailed_stats=True)
+        response = outputs[0].outputs[0].text
+        
+        # Get stats
+        stats = llm.get_current_stats()
+        
+        # Print response and key stats
+        print(f"\n{'='*60}")
+        print(f"QUERY {i+1}: {query}")
+        print(f"{'='*60}")
+        print(f"{response}")
+        print(f"{'='*60}")
+        print("Stats:")
+        
+        # KV Cache Usage
+        kv_cache = stats.get('engine_kv_cache_usage', 0) * 100
+        print(f"• KV Cache Usage: {kv_cache:.2f}%")
+        
+        # Prefix Cache Hit Rate
+        hits = stats.get('engine_prefix_cache_stats_hits', 0)
+        queries_count = stats.get('engine_prefix_cache_stats_queries', 0)
+        hit_rate = (hits / queries_count * 100) if queries_count > 0 else 0
+        print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries_count})")
+        print(f"{'='*60}\n")
+        
+        # Brief pause between queries
+        time.sleep(1)
 
 def main():
     parser = argparse.ArgumentParser(description="Run a dummy test with vLLM stats logging")
