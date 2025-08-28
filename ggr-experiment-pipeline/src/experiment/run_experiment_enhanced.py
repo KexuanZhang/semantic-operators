@@ -199,7 +199,9 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
     # Set default LLM parameters
     llm_kwargs.setdefault('tensor_parallel_size', 1)
     llm_kwargs.setdefault('max_model_len', 2048)
-    llm_kwargs.setdefault('gpu_memory_utilization', 0.9)
+    # Lower GPU memory utilization to avoid out of memory errors 
+    # (error indicated 16.38 GiB available, was trying to allocate 21.28 GiB)
+    llm_kwargs.setdefault('gpu_memory_utilization', 0.7)  # Reduced from 0.9 to 0.7
     llm_kwargs.setdefault('enable_prefix_caching', True)
     llm_kwargs.setdefault('log_stats_interval', max(1, batch_size // 2))  # Log every few batches
     
