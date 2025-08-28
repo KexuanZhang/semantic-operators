@@ -95,8 +95,15 @@ def create_enhanced_llm(model_path: str, **kwargs):
     Returns:
         OfflineLLMWithStats instance
     """
-    # Ensure stats logging is enabled
-    kwargs.setdefault('log_stats', True)
+    # Handle both log_stats and disable_log_stats parameters for compatibility
+    if 'disable_log_stats' in kwargs:
+        # If disable_log_stats is provided, use it to set log_stats
+        log_stats_enabled = not kwargs.pop('disable_log_stats')
+        kwargs['log_stats'] = log_stats_enabled
+    else:
+        # Otherwise use the default
+        kwargs.setdefault('log_stats', True)
+    
     kwargs.setdefault('log_stats_interval', 1)
     
     # Create the enhanced LLM

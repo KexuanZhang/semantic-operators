@@ -203,6 +203,13 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
     llm_kwargs.setdefault('enable_prefix_caching', True)
     llm_kwargs.setdefault('log_stats_interval', max(1, batch_size // 2))  # Log every few batches
     
+    # Ensure proper handling of stats logging parameters
+    if 'disable_log_stats' in llm_kwargs:
+        # If disable_log_stats exists, make sure we don't have conflicting settings
+        if 'log_stats' in llm_kwargs:
+            logger.warning("Both 'log_stats' and 'disable_log_stats' parameters provided; 'disable_log_stats' takes precedence")
+            llm_kwargs['log_stats'] = not llm_kwargs['disable_log_stats']
+    
     llm = create_enhanced_llm(model_path, **llm_kwargs)
     
     # Create sampling parameters
