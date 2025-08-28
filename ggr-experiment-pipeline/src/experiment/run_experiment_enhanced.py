@@ -29,9 +29,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Import local vLLM setup
-sys.path.insert(0, '/Users/zhang/Desktop/huawei/so1/semantic-operators/ggr-experiment-pipeline')
-from use_local_vllm import initialize_experiment_with_local_vllm, create_enhanced_llm
+# Import local vLLM setup - use a more flexible approach to find the module
+try:
+    # First try the direct import (if script is run from the correct directory)
+    logger.info("Trying direct import of use_local_vllm...")
+    try:
+        from use_local_vllm import initialize_experiment_with_local_vllm, create_enhanced_llm
+    except ImportError:
+        # If that fails, try to find the module by adding potential paths
+        logger.info("Direct import failed, trying to locate module...")
+        
+        # Try to find the module in parent directories
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        potential_paths = [
+            # Try current directory
+            current_dir,
+            # Try one level up
+            os.path.dirname(current_dir),
+            # Try two levels up
+            os.path.dirname(os.path.dirname(current_dir)),
+            # Try hardcoded paths for different environments
+            '/home/data/so/semantic-operators/ggr-experiment-pipeline',
+            '/Users/zhang/Desktop/huawei/so1/semantic-operators/ggr-experiment-pipeline'
+        ]
+        
+        module_found = False
+        for path in potential_paths:
+            if os.path.exists(os.path.join(path, 'use_local_vllm.py')):
+                logger.info(f"Found use_local_vllm.py in: {path}")
+                sys.path.insert(0, path)
+                from use_local_vllm import initialize_experiment_with_local_vllm, create_enhanced_llm
+                module_found = True
+                break
+        
+        if not module_found:
+            raise ImportError("Could not locate use_local_vllm.py in any of the expected paths")
 
 # Initialize local vLLM
 logger.info("Initializing local vLLM with stats logging...")
