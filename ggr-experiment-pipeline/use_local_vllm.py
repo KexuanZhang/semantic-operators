@@ -17,12 +17,41 @@ def setup_local_vllm():
     Setup the local modified vLLM for use in experiments.
     This function should be called before importing any vLLM modules.
     """
-    # Path to the local vLLM installation
-    vllm_path = Path("/Users/zhang/Desktop/huawei/so1/vllm")
+    # Path to the local vLLM installation - try multiple potential locations
+    # First check for environment variable
+    vllm_path = None
+    if 'VLLM_PATH' in os.environ:
+        vllm_path = Path(os.environ['VLLM_PATH'])
+        logger.info(f"Using vLLM path from VLLM_PATH environment variable: {vllm_path}")
     
-    # Check if local vLLM exists
-    if not vllm_path.exists():
-        raise FileNotFoundError(f"Local vLLM not found at {vllm_path}")
+    # If not set via environment variable, try common relative paths
+    if vllm_path is None or not vllm_path.exists():
+        # Try relative to the current script's location
+        current_dir = Path(os.path.dirname(os.path.abspath(__file__)))
+        candidates = [
+            # Original path for backward compatibility
+            Path("/Users/zhang/Desktop/huawei/so1/vllm"),
+            # Server path based on error message
+            Path("/home/data/so/vllm"),
+            # One level up from the current directory
+            current_dir.parent / "vllm",
+            # Two levels up from the current directory
+            current_dir.parent.parent / "vllm",
+            # Adjacent to semantic-operators
+            current_dir.parent.parent / "vllm"
+        ]
+        
+        for candidate in candidates:
+            if candidate.exists():
+                vllm_path = candidate
+                logger.info(f"Found vLLM at: {vllm_path}")
+                break
+    
+    # Check if local vLLM exists after all attempts
+    if vllm_path is None or not vllm_path.exists():
+        raise FileNotFoundError(
+            f"Local vLLM not found. Tried multiple locations. "
+            f"Please set VLLM_PATH environment variable to point to your vLLM installation.")
     
     # Add to Python path (insert at beginning to take priority)
     vllm_path_str = str(vllm_path)
