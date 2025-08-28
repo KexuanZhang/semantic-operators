@@ -585,54 +585,40 @@ class VLLMMetricsCollector:
             engine = self.llm.llm_engine
             stats_data['debug_info']['engine_type'] = type(engine).__name__
             
-            # Method 1: Use the proven approach from your example
+            # Method 1: Try to access _get_stats() directly (V0 and some V1 engines)
             if hasattr(engine, '_get_stats'):
                 try:
-                    # Access internal stats (not a public API, may change)
-                    stats = engine._get_stats()
-                    stats_data['debug_info']['stats_method'] = '_get_stats() - direct approach'
+                    # Call the private _get_stats method
+                    stats = engine._get_stats(scheduler_outputs=None)
+                    stats_data['debug_info']['stats_method'] = '_get_stats()'
                     
                     if stats:
-                        # Extract all available metrics from Stats object using proven approach
+                        # Extract all available metrics from Stats object
                         metrics = {}
                         
-                        # KV Cache metrics - MOST IMPORTANT - using exact approach from your example
+                        # KV Cache metrics - MOST IMPORTANT
                         if hasattr(stats, 'gpu_cache_usage_sys'):
-                            gpu_cache_usage = stats.gpu_cache_usage_sys
-                            metrics['gpu_cache_usage_sys'] = gpu_cache_usage
-                            metrics['vllm:gpu_cache_usage_perc'] = gpu_cache_usage  # Also provide in standard format
-                            
-                        # Prefix cache hit rate - using getattr with default as in your example
-                        prefix_hit_rate = getattr(stats, 'gpu_prefix_cache_hit_rate', 0)
-                        if prefix_hit_rate > 0:
-                            metrics['gpu_prefix_cache_hit_rate'] = prefix_hit_rate
-                            metrics['vllm:gpu_prefix_cache_hit_rate'] = prefix_hit_rate
-                            
-                        # CPU cache metrics (if available)
+                            metrics['gpu_cache_usage_sys'] = stats.gpu_cache_usage_sys
+                        if hasattr(stats, 'gpu_prefix_cache_hit_rate'):
+                            metrics['gpu_prefix_cache_hit_rate'] = stats.gpu_prefix_cache_hit_rate
                         if hasattr(stats, 'cpu_cache_usage_sys'):
                             metrics['cpu_cache_usage_sys'] = stats.cpu_cache_usage_sys
-                        cpu_prefix_hit_rate = getattr(stats, 'cpu_prefix_cache_hit_rate', 0)
-                        if cpu_prefix_hit_rate > 0:
-                            metrics['cpu_prefix_cache_hit_rate'] = cpu_prefix_hit_rate
+                        if hasattr(stats, 'cpu_prefix_cache_hit_rate'):
+                            metrics['cpu_prefix_cache_hit_rate'] = stats.cpu_prefix_cache_hit_rate
                         
                         # Scheduler state
                         if hasattr(stats, 'num_running_sys'):
                             metrics['num_running_sys'] = stats.num_running_sys
-                            metrics['vllm:num_requests_running'] = stats.num_running_sys
                         if hasattr(stats, 'num_waiting_sys'):
                             metrics['num_waiting_sys'] = stats.num_waiting_sys
-                            metrics['vllm:num_requests_waiting'] = stats.num_waiting_sys
                         if hasattr(stats, 'num_swapped_sys'):
                             metrics['num_swapped_sys'] = stats.num_swapped_sys
-                            metrics['vllm:num_requests_swapped'] = stats.num_swapped_sys
                         
                         # Token processing
                         if hasattr(stats, 'num_prompt_tokens_iter'):
                             metrics['prompt_tokens_total'] = stats.num_prompt_tokens_iter
-                            metrics['vllm:prompt_tokens_total'] = stats.num_prompt_tokens_iter
                         if hasattr(stats, 'num_generation_tokens_iter'):
                             metrics['generation_tokens_total'] = stats.num_generation_tokens_iter
-                            metrics['vllm:generation_tokens_total'] = stats.num_generation_tokens_iter
                         if hasattr(stats, 'num_tokens_iter'):
                             metrics['tokens_total'] = stats.num_tokens_iter
                         
@@ -654,7 +640,7 @@ class VLLMMetricsCollector:
                         stats_data['stats_available'] = True
                         stats_data['debug_info']['metrics_extracted'] = len(metrics)
                         
-                        logger.debug(f"✅ Extracted {len(metrics)} metrics from internal Stats object using proven approach")
+                        logger.debug(f"✅ Extracted {len(metrics)} metrics from internal Stats object")
                         if 'gpu_cache_usage_sys' in metrics:
                             logger.debug(f"🗄️ GPU Cache Usage: {metrics['gpu_cache_usage_sys']*100:.1f}%")
                         if 'gpu_prefix_cache_hit_rate' in metrics:
@@ -1477,7 +1463,38 @@ class SimpleLLMExperiment:
                  gpu_ids: List[int] = None,
                  gpu_id: int = None):  # Keep for backward compatibility
         
-        // ...existing code...
+        # Handle GPU specification (backward compatible)
+        if gpu_ids is None:
+            if gpu_id is not None:
+                self.gpu_ids = [gpu_id]
+                self.gpu_id = gpu_id  # Primary GPU for monitoring
+            else:
+                self.gpu_ids = [0]  # Default to GPU 0
+                self.gpu_id = 0
+        else:
+            self.gpu_ids = gpu_ids
+            self.gpu_id = gpu_ids[0]  # Use first GPU as primary for monitoring
+        
+        # Resolve model path (local or HuggingFace)
+        self.model_name = resolve_model_path(model_name)
+        self.is_local_model = os.path.exists(self.model_name)
+        
+        self.output_dir = output_dir
+        self.llm = None
+        self.sampling_params = None
+        
+        # Initialize configuration attributes
+        self.gpu_memory_utilization = 0.85  # Default value
+        self.max_tokens = 512
+        self.temperature = 0.1
+        self.top_p = 0.9
+        
+        # Use optimized monitoring intervals for fair comparison
+        self.resource_monitor = ResourceMonitor(gpu_id=self.gpu_id, sampling_interval=10.0)  # 10 second intervals
+        self.vllm_metrics_collector = VLLMMetricsCollector(
+            llm_instance=None,  # Will be updated after model init
+            collection_interval=15.0  # 15 second intervals for vLLM metrics
+        )
         
         # Validate local model if it's a local path
         if self.is_local_model:
@@ -1486,14 +1503,53 @@ class SimpleLLMExperiment:
                 sys.exit(1)
             logger.info(f"Using local model: {self.model_name}")
         
-        // ...existing code...
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Check and set GPUs
+        gpu_available, gpu_count = check_gpu_availability()
+        if gpu_available:
+            # Validate all requested GPUs are available
+            for gpu_id in self.gpu_ids:
+                if gpu_id >= gpu_count:
+                    logger.error(f"GPU {gpu_id} not available. Available GPUs: 0-{gpu_count-1}")
+                    sys.exit(1)
+            
+            if set_gpu_devices(self.gpu_ids):
+                if len(self.gpu_ids) == 1:
+                    logger.info(f"Using single GPU {self.gpu_ids[0]} for inference")
+                else:
+                    logger.info(f"Using multi-GPU setup: {self.gpu_ids} for inference")
+            else:
+                logger.error(f"Failed to set GPUs {self.gpu_ids}")
+                sys.exit(1)
+        else:
+            logger.warning("No GPU available, will use CPU (very slow)")
     
     def load_dataset(self, dataset_path: str, max_rows: Optional[int] = None) -> pd.DataFrame:
         """Load dataset from file"""
         logger.info(f"Loading dataset from: {dataset_path}")
         
         try:
-            // ...existing code...
+            # Support multiple file formats
+            if dataset_path.endswith('.csv'):
+                df = pd.read_csv(dataset_path)
+            elif dataset_path.endswith('.json'):
+                df = pd.read_json(dataset_path)
+            elif dataset_path.endswith('.jsonl'):
+                df = pd.read_json(dataset_path, lines=True)
+            elif dataset_path.endswith('.parquet'):
+                df = pd.read_parquet(dataset_path)
+            else:
+                logger.error(f"Unsupported file format: {dataset_path}")
+                return pd.DataFrame()
+                
+            logger.info(f"Dataset loaded: {df.shape[0]} rows x {df.shape[1]} columns")
+            logger.info(f"Columns: {list(df.columns)}")
+            
+            if max_rows and len(df) > max_rows:
+                df = df.head(max_rows)
+                logger.info(f"Limited to {max_rows} rows")
                 
             return df
             
@@ -1505,18 +1561,158 @@ class SimpleLLMExperiment:
                         max_tokens: int = 512,
                         temperature: float = 0.1,
                         top_p: float = 0.9,
-                        gpu_memory_utilization: float = 0.85,
-                        max_model_len: int = None,
+                        gpu_memory_utilization: float = 0.7,
+                        max_model_len: int = 4096,
+                        tensor_parallel_size: int = 1,
                         **kwargs):
         """Initialize vLLM model with GPU configuration and memory optimization"""
-        // ...existing code...
+        # Store configuration parameters as instance variables
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.max_tokens = max_tokens
+        self.temperature = temperature
+        self.top_p = top_p
+        self.tensor_parallel_size = tensor_parallel_size
+        
+        logger.info(f"Initializing vLLM model: {self.model_name}")
+        logger.info(f"Model type: {'Local' if self.is_local_model else 'HuggingFace'}")
+        logger.info(f"Target GPUs: {self.gpu_ids}")
+        
+        # Check if user wants to force legacy engine for better stats compatibility
+        use_legacy_engine = os.getenv('VLLM_USE_V1', '1') == '0'
+        if use_legacy_engine:
+            logger.info("🔧 Using legacy vLLM engine (VLLM_USE_V1=0) for better stats compatibility")
+        else:
+            logger.info("🚀 Using modern vLLM V1 engine (default)")
+            logger.info("💡 Tip: Set VLLM_USE_V1=0 environment variable to use legacy engine with direct stats access")
+        
+        # Calculate memory requirements if local model
+        if self.is_local_model:
+            memory_info = calculate_memory_requirements(self.model_name, max_model_len)
+            logger.info(f"Memory estimates - Model: {memory_info['model_memory_gb']:.1f}GB, "
+                       f"KV Cache: {memory_info['kv_cache_gb']:.1f}GB, "
+                       f"Total: {memory_info['total_estimated_gb']:.1f}GB")
+            
+            # Calculate total available GPU memory
+            if torch.cuda.is_available():
+                total_gpu_memory = sum(
+                    torch.cuda.get_device_properties(gpu_id).total_memory / 1e9 
+                    for gpu_id in self.gpu_ids
+                )
+                logger.info(f"Total available GPU memory: {total_gpu_memory:.1f}GB across {len(self.gpu_ids)} GPUs")
+                
+                # Auto-adjust max_model_len if not specified and memory is tight
+                if max_model_len is None and memory_info['total_estimated_gb'] > total_gpu_memory * gpu_memory_utilization:
+                    # Calculate a safer max_model_len based on available memory
+                    available_memory = total_gpu_memory * gpu_memory_utilization - memory_info['model_memory_gb']
+                    safe_max_len = int(available_memory / memory_info['kv_cache_per_token_gb'])
+                    safe_max_len = min(safe_max_len, memory_info['max_seq_len'])
+                    max_model_len = safe_max_len
+                    logger.info(f"Auto-adjusting max_model_len to {max_model_len} based on available memory")
+        
+        try:
+            # vLLM configuration for GPU inference with prefix caching enabled
+            llm_config = {
+                'model': self.model_name,
+                'gpu_memory_utilization': gpu_memory_utilization,
+                'max_num_seqs': 16,
+                'enable_prefix_caching': True,  # Enable for KV cache reuse
+                'disable_log_stats': False,     # Enable statistics logging for modern metrics
+                'seed': 42,
+                **kwargs
+            }
+            
+            # Force legacy engine mode if requested for better stats compatibility
+            if use_legacy_engine:
+                # Try to force legacy engine by setting environment variable
+                os.environ['VLLM_USE_V1'] = '0'
+                logger.info("🔧 Forcing vLLM legacy engine mode for better stats access")
+            
+            # Multi-GPU configuration
+            if len(self.gpu_ids) > 1:
+                llm_config['tensor_parallel_size'] = len(self.gpu_ids)
+                logger.info(f"Using tensor parallelism across {len(self.gpu_ids)} GPUs")
+            
+            # Set max_model_len if specified
+            if max_model_len is not None:
+                llm_config['max_model_len'] = max_model_len
+                logger.info(f"Setting max_model_len to {max_model_len}")
+            
+            # Add local model specific configurations if needed
+            if self.is_local_model:
+                # For local models, we might need to be more explicit about tokenizer
+                tokenizer_path = self.model_name
+                if os.path.exists(os.path.join(self.model_name, 'tokenizer.json')):
+                    llm_config['tokenizer'] = tokenizer_path
+                    logger.info(f"Using tokenizer from: {tokenizer_path}")
+            
+            logger.info(f"vLLM Configuration: {llm_config}")
+            
+            self.llm = LLM(**llm_config)
+            
+            # Sampling parameters
+            self.sampling_params = SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                seed=42
+            )
+            
+            # Log GPU memory usage after model loading
+            if torch.cuda.is_available():
+                for i, gpu_id in enumerate(self.gpu_ids):
+                    allocated = torch.cuda.memory_allocated(gpu_id) / 1e9
+                    reserved = torch.cuda.memory_reserved(gpu_id) / 1e9
+                    total = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+                    utilization = (allocated / total) * 100
+                    logger.info(f"GPU {gpu_id} Memory: {allocated:.1f}GB allocated, {reserved:.1f}GB reserved, "
+                               f"{total:.1f}GB total ({utilization:.1f}% util)")
+            
+            logger.info("vLLM model initialized successfully!")
+            
+            # Update and initialize the vLLM metrics collector
+            self.vllm_metrics_collector.llm = self.llm
+            metrics_init_success = self.vllm_metrics_collector.initialize_logging()
+            if metrics_init_success:
+                logger.info("Modern vLLM metrics collection enabled")
+            else:
+                logger.info("Using legacy vLLM metrics collection")
             
             return True
             
         except Exception as e:
             logger.error(f"Failed to initialize vLLM model: {e}")
             
-            // ...existing code...
+            # Log memory usage on all GPUs for debugging
+            if torch.cuda.is_available():
+                for gpu_id in self.gpu_ids:
+                    try:
+                        allocated = torch.cuda.memory_allocated(gpu_id) / 1e9
+                        total = torch.cuda.get_device_properties(gpu_id).total_memory / 1e9
+                        logger.error(f"GPU {gpu_id} Memory: {allocated:.1f}GB allocated, {total:.1f}GB total")
+                    except:
+                        pass
+            
+            # Provide helpful error messages and suggestions
+            if self.is_local_model:
+                logger.error(f"Local model loading failed. Please check:")
+                logger.error(f"1. Model files exist in: {self.model_name}")
+                logger.error(f"2. Model format is compatible with vLLM")
+                logger.error(f"3. All required files (config.json, model weights) are present")
+            
+            # Memory-related suggestions
+            if "KV cache" in str(e) or "memory" in str(e).lower():
+                logger.error("Memory optimization suggestions:")
+                logger.error("1. Try using more GPUs: --gpus 4,5,6,7")
+                logger.error("2. Increase gpu_memory_utilization: --gpu-memory 0.95")
+                logger.error("3. Reduce max_model_len: --max-model-len 8192")
+                logger.error("4. Reduce batch size: --batch-size 4")
+                
+                if torch.cuda.is_available():
+                    total_memory = sum(
+                        torch.cuda.get_device_properties(gpu_id).total_memory / 1e9 
+                        for gpu_id in self.gpu_ids
+                    )
+                    logger.error(f"Total GPU memory available: {total_memory:.1f}GB across {len(self.gpu_ids)} GPUs")
             
             return False
 
@@ -1548,7 +1744,15 @@ class SimpleLLMExperiment:
         f.write(f"**Run Folder**: `{os.path.basename(exp_info.get('dataset_path', 'unknown'))}`  \n")
         f.write(f"**Experiment**: {exp_info.get('query_key', 'N/A')} on {os.path.basename(exp_info.get('dataset_path', 'unknown'))}  \n\n")
         
-        // ...existing code...
+        # Dataset type detection
+        dataset_name = os.path.basename(exp_info.get('dataset_path', '')).lower()
+        if any(keyword in dataset_name for keyword in ['reordered', 'ggr', 'ordered', 'sorted']):
+            f.write(f"🚀 **Dataset Type**: Reordered/Optimized (likely using GGR or similar algorithm)  \n")
+        elif any(keyword in dataset_name for keyword in ['shuffled', 'random', 'baseline']):
+            f.write(f"🔀 **Dataset Type**: Shuffled/Random (baseline comparison)  \n")
+        else:
+            f.write(f"📁 **Dataset Type**: Original/Natural order  \n")
+        f.write(f"\n")
     
     def _write_table_of_contents(self, f):
         """Write the table of contents"""
@@ -1628,7 +1832,52 @@ class SimpleLLMExperiment:
         """Write KV cache analysis subsection"""
         f.write(f"### 🎯 KV Cache Performance\n\n")
         
-        // ...existing code...
+        # GPU Cache Usage
+        if 'gpu_cache_usage_percent' in key_metrics:
+            f.write(f"- **GPU Cache Usage**: {key_metrics['gpu_cache_usage_percent']:.1f}%\n")
+        elif 'gpu_cache_usage_sys' in key_metrics:
+            f.write(f"- **GPU Cache Usage (sys)**: {key_metrics['gpu_cache_usage_sys']:.1f}%\n")
+        
+        # Prefix Cache Hit Rate Analysis
+        hit_rate_found = False
+        if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+            hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+            hits = key_metrics.get('gpu_prefix_cache_hits', 0)
+            queries = key_metrics.get('gpu_prefix_cache_queries', 0)
+            
+            # Validate hit rate data
+            if queries > 10 or hit_rate < 99:  # Avoid reporting 100% from tiny values
+                hit_rate_found = True
+                if hits > 0 and queries > 0:
+                    f.write(f"- **GPU Prefix Cache Hit Rate**: {hit_rate:.2f}% ({hits:,} hits / {queries:,} queries)\n")
+                else:
+                    f.write(f"- **GPU Prefix Cache Hit Rate**: {hit_rate:.2f}%\n")
+                
+                # Performance analysis
+                dataset_name = os.path.basename(experiment_results.get('experiment_info', {}).get('dataset_path', '')).lower()
+                is_reordered = any(keyword in dataset_name for keyword in ['reordered', 'ggr', 'ordered', 'sorted'])
+                
+                if hit_rate > 70:
+                    f.write(f"  - 🏆 **EXCELLENT** - Very high hit rate indicates extremely effective data ordering!\n")
+                    if is_reordered:
+                        f.write(f"  - The optimized data ordering is providing substantial prefix reuse benefits.\n")
+                elif hit_rate > 40:
+                    f.write(f"  - ✅ **GOOD** - High hit rate shows effective prefix caching benefits!\n")
+                elif hit_rate > 15:
+                    f.write(f"  - ⚠️ **MODERATE** - Some prefix reuse detected, room for optimization.\n")
+                elif hit_rate > 5:
+                    f.write(f"  - ⚠️ **LOW** - Minimal prefix reuse, limited caching effectiveness.\n")
+                else:
+                    f.write(f"  - ❌ **VERY LOW** - Almost no prefix reuse detected.\n")
+        
+        if not hit_rate_found:
+            f.write(f"- **Prefix Cache Hit Rate**: Not available\n")
+            f.write(f"  - This may be due to:\n")
+            f.write(f"    • vLLM version compatibility (try setting VLLM_USE_V1=0)\n")
+            f.write(f"    • Insufficient requests processed yet\n")
+            f.write(f"    • Prefix caching not fully enabled\n")
+        
+        f.write(f"\n")
     
     def _write_token_processing_stats(self, f, key_metrics: Dict[str, Any]):
         """Write token processing statistics"""
@@ -1638,7 +1887,18 @@ class SimpleLLMExperiment:
         if 'generation_tokens_total' in key_metrics:
             f.write(f"- **Total Generation Tokens**: {key_metrics['generation_tokens_total']:,}\n")
         
-        // ...existing code...
+        # Performance latencies if available
+        histogram_summary = key_metrics.get('histogram_summary', {})
+        if histogram_summary:
+            f.write(f"\n#### Performance Latencies\n")
+            if 'avg_time_to_first_token_seconds' in histogram_summary:
+                f.write(f"- **Average Time to First Token**: {histogram_summary['avg_time_to_first_token_seconds']:.3f}s\n")
+            if 'avg_time_per_output_token_seconds' in histogram_summary:
+                f.write(f"- **Average Time per Output Token**: {histogram_summary['avg_time_per_output_token_seconds']:.4f}s\n")
+            if 'avg_e2e_latency_seconds' in histogram_summary:
+                f.write(f"- **Average E2E Request Latency**: {histogram_summary['avg_e2e_latency_seconds']:.3f}s\n")
+        
+        f.write(f"\n")
     
     def _write_request_queue_stats(self, f, key_metrics: Dict[str, Any]):
         """Write request queue statistics"""
@@ -1694,20 +1954,104 @@ class SimpleLLMExperiment:
         """Write KV cache visualizations section"""
         f.write(f"## 6. KV Cache Visualizations\n\n")
         
-        // ...existing code...
+        # Try to generate KV cache plots
+        try:
+            if hasattr(self, 'vllm_metrics_collector') and self.vllm_metrics_collector:
+                plot_paths = self.plot_kv_cache_metrics(output_folder)
+                if plot_paths:
+                    f.write(f"### 📊 Cache Performance Plots\n\n")
+                    for plot_type, plot_path in plot_paths.items():
+                        if os.path.exists(plot_path):
+                            plot_name = os.path.basename(plot_path)
+                            f.write(f"#### {plot_type.replace('_', ' ').title()}\n\n")
+                            f.write(f"![{plot_type}](./{plot_name})\n\n")
+                            f.write(f"*Plot saved as: `{plot_name}`*\n\n")
+                else:
+                    f.write(f"KV cache plots could not be generated (insufficient metrics data).\n\n")
+            else:
+                f.write(f"KV cache visualization not available (metrics collector not initialized).\n\n")
+        except Exception as e:
+            f.write(f"KV cache visualization failed: {str(e)}\n\n")
     
     def _write_analysis_and_recommendations(self, f, experiment_results: Dict[str, Any]):
         """Write analysis and recommendations section"""
         f.write(f"## 7. Analysis & Recommendations\n\n")
         
-        // ...existing code...
+        # Dataset analysis
+        dataset_name = os.path.basename(experiment_results.get('experiment_info', {}).get('dataset_path', '')).lower()
+        is_reordered = any(keyword in dataset_name for keyword in ['reordered', 'ggr', 'ordered', 'sorted'])
+        is_shuffled = any(keyword in dataset_name for keyword in ['shuffled', 'random', 'baseline'])
+        
+        f.write(f"### 🔍 Dataset Analysis\n\n")
+        if is_reordered:
+            f.write(f"- **Dataset Type**: Optimized/Reordered\n")
+            f.write(f"- **Expected Benefits**: High prefix cache hit rates due to data ordering\n")
+            f.write(f"- **Use Case**: Production inference with maximum efficiency\n")
+        elif is_shuffled:
+            f.write(f"- **Dataset Type**: Shuffled/Baseline\n")
+            f.write(f"- **Expected Benefits**: Lower hit rates, useful for comparison\n")
+            f.write(f"- **Use Case**: Baseline measurements and algorithm validation\n")
+        else:
+            f.write(f"- **Dataset Type**: Original/Natural order\n")
+            f.write(f"- **Optimization Potential**: May benefit from GGR reordering\n")
+            f.write(f"- **Use Case**: Starting point for optimization experiments\n")
+        
+        # Performance recommendations
+        f.write(f"\n### 🚀 Performance Recommendations\n\n")
+        vllm_metrics = experiment_results.get('vllm_metrics', {})
+        final_stats = vllm_metrics.get('final_stats', {})
+        
+        if final_stats.get('vllm_stats_available', False):
+            key_metrics = final_stats.get('key_metrics', {})
+            hit_rate = key_metrics.get('gpu_prefix_cache_hit_rate_percent', 0)
+            
+            if hit_rate > 50:
+                f.write(f"✅ **Excellent Cache Performance** ({hit_rate:.1f}% hit rate)\n")
+                f.write(f"- Current configuration is optimal\n")
+                f.write(f"- Consider using this dataset ordering for production\n")
+            elif hit_rate > 20:
+                f.write(f"⚠️ **Moderate Cache Performance** ({hit_rate:.1f}% hit rate)\n")
+                f.write(f"- Consider applying GGR reordering algorithm\n")
+                f.write(f"- Experiment with different functional dependencies\n")
+            else:
+                f.write(f"❌ **Low Cache Performance** ({hit_rate:.1f}% hit rate)\n")
+                f.write(f"- Apply GGR algorithm to reorder the dataset\n")
+                f.write(f"- Verify prefix caching is properly enabled\n")
+        else:
+            f.write(f"⚠️ **Metrics Collection Issues**\n")
+            f.write(f"- Enable vLLM metrics collection for better insights\n")
+            f.write(f"- Try setting VLLM_USE_V1=0 for legacy compatibility\n")
+        
+        f.write(f"\n")
     
     def _write_data_exports(self, f, output_folder: str):
         """Write data exports section"""
         f.write(f"## 8. Data Exports\n\n")
         f.write(f"The following data files have been generated for further analysis:\n\n")
         
-        // ...existing code...
+        # List expected export files
+        expected_files = [
+            ("experiment_results.json", "Complete experiment results in JSON format"),
+            ("query_results.csv", "Individual query results and processing times"),
+            ("resource_metrics.csv", "System resource utilization over time"),
+            ("vllm_metrics.json", "vLLM engine metrics and statistics")
+        ]
+        
+        f.write(f"### 📁 Generated Files\n\n")
+        for filename, description in expected_files:
+            file_path = os.path.join(output_folder, filename)
+            if os.path.exists(file_path):
+                f.write(f"✅ **{filename}**: {description}\n")
+            else:
+                f.write(f"⚠️ **{filename}**: {description} *(file not found)*\n")
+        
+        f.write(f"\n### 🔧 Usage Instructions\n\n")
+        f.write(f"```bash\n")
+        f.write(f"# View JSON results\n")
+        f.write(f"jq . {output_folder}/experiment_results.json\n\n")
+        f.write(f"# Analyze CSV data with pandas\n")
+        f.write(f"python -c \"import pandas as pd; df = pd.read_csv('{output_folder}/query_results.csv'); print(df.describe())\"\n")
+        f.write(f"```\n\n")
         
         f.write(f"---\n\n")
         f.write(f"**Report Generated**: {datetime.now().isoformat()}  \n")
@@ -1717,7 +2061,17 @@ class SimpleLLMExperiment:
     def create_prompt(self, template: Dict[str, str], data_fields: str, query: str = None) -> str:
         """Create prompt from template and data"""
         if query:
-            // ...existing code...
+            # Use custom query
+            prompt = template.get("prompt", SYSTEM_PROMPT.replace("{QUERY}", query))
+        else:
+            # Use template prompt
+            prompt = template.get("prompt", "Process the following data:")
+        
+        # Format with data fields  
+        if "{fields}" in SYSTEM_PROMPT:
+            full_prompt = SYSTEM_PROMPT.replace("{QUERY}", prompt).replace("{fields}", data_fields)
+        else:
+            full_prompt = f"{prompt}\n\nData: {data_fields}"
             
         return full_prompt
     
@@ -1726,18 +2080,33 @@ class SimpleLLMExperiment:
         fields = {}
         for col, val in row.items():
             if pd.notna(val):
-                // ...existing code...
+                # Truncate long text fields
+                str_val = str(val)
+                if len(str_val) > max_length:
+                    str_val = str_val[:max_length] + "..."
+                fields[col] = str_val
         
         return json.dumps(fields, indent=2)
     
     def run_batch_inference(self, prompts: List[str], batch_size: int = 8) -> List[str]:
-        """Run inference on a batch of prompts and collect KV cache stats immediately after"""
+        """Run inference on a batch of prompts"""
         if not self.llm:
             logger.error("Model not initialized!")
             return []
         
         try:
-            // ...existing code...
+            # vLLM handles batching internally, but we can limit the batch size
+            results = self.llm.generate(prompts, self.sampling_params, use_tqdm=True)
+            
+            # Extract generated text from results
+            outputs = []
+            for result in results:
+                if result.outputs:
+                    # Get the first (and typically only) output
+                    generated_text = result.outputs[0].text.strip()
+                    outputs.append(generated_text)
+                else:
+                    outputs.append("")
             
             return outputs
             
@@ -1745,61 +2114,6 @@ class SimpleLLMExperiment:
             logger.error(f"Error in batch inference: {e}")
             return [""] * len(prompts)
     
-    def get_kv_cache_and_prefix_stats(self) -> Dict[str, float]:
-        """
-        Get KV cache and prefix hit statistics using the proven offline inference approach.
-        This follows the exact pattern from the user's example:
-        
-        # Access internal stats (not a public API, may change)
-        stats = llm.llm_engine._get_stats()
-        print(f"GPU KV cache usage: {stats.gpu_cache_usage_sys * 100:.2f}%")
-        print(f"Prefix cache hit rate: {getattr(stats, 'gpu_prefix_cache_hit_rate', 0) * 100:.2f}%")
-        """
-        if not self.llm or not hasattr(self.llm, 'llm_engine'):
-            logger.warning("LLM or llm_engine not available for stats collection")
-            return {}
-        
-        try:
-            # Access internal stats (not a public API, may change) - exact approach from example
-            stats = self.llm.llm_engine._get_stats()
-            
-            if not stats:
-                logger.warning("No stats returned from _get_stats()")
-                return {}
-            
-            # Extract the key metrics using the exact approach from the example
-            result = {}
-            
-            # GPU KV cache usage - direct attribute access
-            if hasattr(stats, 'gpu_cache_usage_sys'):
-                gpu_cache_usage_pct = stats.gpu_cache_usage_sys * 100
-                result['gpu_kv_cache_usage_percent'] = gpu_cache_usage_pct
-                logger.info(f"GPU KV cache usage: {gpu_cache_usage_pct:.2f}%")
-            
-            # Prefix cache hit rate - using getattr with default as in example
-            prefix_hit_rate_pct = getattr(stats, 'gpu_prefix_cache_hit_rate', 0) * 100
-            if prefix_hit_rate_pct > 0:
-                result['prefix_cache_hit_rate_percent'] = prefix_hit_rate_pct
-                logger.info(f"Prefix cache hit rate: {prefix_hit_rate_pct:.2f}%")
-            else:
-                result['prefix_cache_hit_rate_percent'] = 0.0
-                logger.info("Prefix cache hit rate: 0.00% (no hits detected or not available)")
-            
-            # Additional useful metrics if available
-            if hasattr(stats, 'cpu_cache_usage_sys'):
-                cpu_cache_usage_pct = stats.cpu_cache_usage_sys * 100
-                result['cpu_kv_cache_usage_percent'] = cpu_cache_usage_pct
-            
-            cpu_prefix_hit_rate_pct = getattr(stats, 'cpu_prefix_cache_hit_rate', 0) * 100
-            if cpu_prefix_hit_rate_pct > 0:
-                result['cpu_prefix_cache_hit_rate_percent'] = cpu_prefix_hit_rate_pct
-            
-            return result
-            
-        except Exception as e:
-            logger.warning(f"Failed to collect KV cache and prefix stats: {e}")
-            return {}
-
     def estimate_tokens(self, text: str) -> int:
         """Rough token estimation (4 characters ≈ 1 token)"""
         return len(text) // 4
@@ -1813,7 +2127,209 @@ class SimpleLLMExperiment:
                       output_prefix: str = None) -> Dict[str, Any]:
         """Run complete experiment with comprehensive monitoring and reporting"""
         
-        // ...existing code...
+        # Experiment setup
+        experiment_start_time = time.time()
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        if output_prefix:
+            output_folder = os.path.join(self.output_dir, f"{output_prefix}_{timestamp}")
+        else:
+            output_folder = os.path.join(self.output_dir, f"experiment_{timestamp}")
+        os.makedirs(output_folder, exist_ok=True)
+        
+        logger.info(f"🚀 Starting experiment: {query_key}")
+        logger.info(f"📁 Output folder: {output_folder}")
+        logger.info(f"🔧 Batch size: {batch_size}")
+        
+        try:
+            # Load dataset
+            logger.info("📊 Loading dataset...")
+            df = self.load_dataset(dataset_path, max_rows=max_rows)
+            if df.empty:
+                raise ValueError("Failed to load dataset or dataset is empty")
+            
+            # Get query template or use custom query
+            if query_key in QUERY_TEMPLATES:
+                template = QUERY_TEMPLATES[query_key]
+                logger.info(f"📝 Using template query: {query_key} ({template['type']})")
+            else:
+                if custom_query:
+                    template = {"prompt": custom_query, "type": "custom"}
+                    logger.info(f"📝 Using custom query: {custom_query[:100]}...")
+                else:
+                    raise ValueError(f"Query key '{query_key}' not found and no custom query provided")
+            
+            # Start monitoring
+            logger.info("🔍 Starting resource monitoring...")
+            self.resource_monitor.start_monitoring()
+            
+            # Start vLLM metrics monitoring
+            if self.vllm_metrics_collector:
+                logger.info("📊 Starting vLLM metrics collection...")
+                initial_vllm_stats = self.vllm_metrics_collector.collect_current_stats()
+                self.vllm_metrics_collector.start_monitoring()
+                
+                # Log initial metrics availability
+                if initial_vllm_stats.get('stats_available', False):
+                    metrics_count = len(initial_vllm_stats.get('metrics_found', {}))
+                    logger.info(f"✅ vLLM metrics collection active ({metrics_count} metrics available)")
+                else:
+                    logger.warning("⚠️ vLLM metrics collection limited - some features may not be available")
+                    logger.info("💡 Try setting VLLM_USE_V1=0 for better legacy metrics compatibility")
+            
+            # Prepare prompts
+            logger.info("🔤 Creating prompts...")
+            prompt_start_time = time.time()
+            prompts = []
+            
+            for idx, row in df.iterrows():
+                data_fields = self.format_data_fields(row)
+                prompt = self.create_prompt(template, data_fields, custom_query)
+                prompts.append(prompt)
+            
+            prompt_creation_time = time.time() - prompt_start_time
+            logger.info(f"✅ Created {len(prompts)} prompts in {prompt_creation_time:.2f}s")
+            
+            # Run inference
+            logger.info("🧠 Starting inference...")
+            inference_start_time = time.time()
+            
+            all_results = []
+            
+            # Process all prompts directly
+            logger.info(f"Processing {len(prompts)} prompts...")
+            
+            try:
+                all_results = self.run_batch_inference(prompts, batch_size)
+                if len(all_results) != len(prompts):
+                    logger.error(f"Result count mismatch: expected {len(prompts)}, got {len(all_results)}")
+                    all_results = ["ERROR"] * len(prompts)
+                else:
+                    logger.info(f"✅ Inference completed successfully")
+                    
+            except Exception as e:
+                logger.error(f"Inference failed with error: {e}")
+                all_results = ["ERROR"] * len(prompts)
+            
+            total_inference_time = time.time() - inference_start_time
+            logger.info(f"🎉 Inference completed in {total_inference_time:.2f}s")
+            
+            # Stop monitoring
+            logger.info("🔍 Stopping monitoring and collecting final metrics...")
+            self.resource_monitor.stop_monitoring()
+            resource_stats = self.resource_monitor.get_summary_stats()
+            
+            # Collect final vLLM metrics
+            final_vllm_stats = None
+            if self.vllm_metrics_collector:
+                self.vllm_metrics_collector.stop_monitoring()
+                final_vllm_stats = self.vllm_metrics_collector.get_comprehensive_stats()
+                logger.info(f"📊 vLLM metrics collected: {len(self.vllm_metrics_collector.stats_history)} data points")
+            
+            # Calculate performance metrics
+            total_experiment_time = time.time() - experiment_start_time
+            estimated_input_tokens = sum(self.estimate_tokens(p) for p in prompts)
+            estimated_output_tokens = sum(self.estimate_tokens(r) for r in all_results if r != "ERROR")
+            estimated_total_tokens = estimated_input_tokens + estimated_output_tokens
+            
+            # Create comprehensive experiment results JSON
+            experiment_results = {
+                'experiment_metadata': {
+                    'timestamp': timestamp,
+                    'dataset_path': dataset_path,
+                    'output_folder': output_folder,  # Add output folder to metadata
+                    'query_key': query_key,
+                    'query_type': template.get('type', 'unknown'),
+                    'custom_query': custom_query,
+                    'model_name': self.model_name,
+                    'gpu_config': {
+                        'gpu_id': self.gpu_id,
+                        'gpu_ids': self.gpu_ids,
+                        'gpu_memory_utilization': self.gpu_memory_utilization
+                    },
+                    'inference_config': {
+                        'batch_size': batch_size,
+                        'max_tokens': self.max_tokens,
+                        'temperature': self.temperature,
+                        'top_p': self.top_p
+                    },
+                    'dataset_stats': {
+                        'total_rows': len(df),
+                        'processed_rows': len(all_results),
+                        'max_rows_limit': max_rows
+                    }
+                },
+                'inference_performance': {
+                    'total_experiment_time_seconds': total_experiment_time,
+                    'total_inference_time_seconds': total_inference_time,
+                    'prompt_creation_time_seconds': prompt_creation_time,
+                    'avg_time_per_row_seconds': total_inference_time / len(df) if len(df) > 0 else 0,
+                    'estimated_total_tokens': estimated_total_tokens,
+                    'estimated_input_tokens': estimated_input_tokens,
+                    'estimated_output_tokens': estimated_output_tokens,
+                    'overall_throughput_tokens_per_sec': estimated_total_tokens / total_inference_time if total_inference_time > 0 else 0
+                },
+                'system_resource_usage': resource_stats or {},
+                'vllm_metrics': {
+                    'metrics_available': final_vllm_stats is not None and final_vllm_stats.get('latest_stats', {}).get('stats_available', False),
+                    'collection_method': final_vllm_stats.get('collection_method', 'none') if final_vllm_stats else 'none',
+                    'monitoring_active': final_vllm_stats.get('monitoring_active', False) if final_vllm_stats else False,
+                    'total_collections': final_vllm_stats.get('total_collections', 0) if final_vllm_stats else 0,
+                    'key_metrics': final_vllm_stats.get('key_metrics', {}) if final_vllm_stats else {},
+                    'histogram_analysis': final_vllm_stats.get('histogram_analysis', {}) if final_vllm_stats else {}
+                },
+                'results_summary': {
+                    'total_prompts': len(prompts),
+                    'successful_responses': len([r for r in all_results if r != "ERROR"]),
+                    'failed_responses': len([r for r in all_results if r == "ERROR"]),
+                    'average_response_length_chars': sum(len(r) for r in all_results if r != "ERROR") / len([r for r in all_results if r != "ERROR"]) if any(r != "ERROR" for r in all_results) else 0,
+                    'sample_responses': all_results[:5] if len(all_results) > 0 else []
+                }
+            }
+            
+            # Save comprehensive experiment results as JSON
+            results_json_path = os.path.join(output_folder, "experiment_stats.json")
+            with open(results_json_path, 'w') as f:
+                json.dump(experiment_results, f, indent=2, default=str)
+            logger.info(f"📋 Comprehensive experiment stats saved: {results_json_path}")
+            
+            # Also save a minimal results CSV for reference
+            results_df = df.copy()
+            results_df['llm_response'] = all_results
+            results_df['processing_time'] = [total_inference_time / len(df)] * len(df)
+            results_csv_path = os.path.join(output_folder, "query_results.csv") 
+            results_df.to_csv(results_csv_path, index=False)
+            
+            # Final summary
+            logger.info("🎉 Experiment completed successfully!")
+            logger.info(f"📁 Primary output: {results_json_path}")
+            logger.info(f"📊 Processed {len(df)} rows in {total_experiment_time:.2f}s")
+            logger.info(f"⚡ Overall throughput: {experiment_results['inference_performance']['overall_throughput_tokens_per_sec']:.1f} tokens/sec")
+            
+            # Calculate success rate from results
+            successful_responses = len([r for r in all_results if r != "ERROR"])
+            total_responses = len(all_results)
+            success_rate = (successful_responses / total_responses * 100) if total_responses > 0 else 0
+            logger.info(f"✅ Success rate: {success_rate:.1f}%")
+            
+            # Log key vLLM metrics if available
+            if experiment_results['vllm_metrics']['metrics_available']:
+                key_metrics = experiment_results['vllm_metrics']['key_metrics']
+                if 'gpu_cache_usage_percent' in key_metrics:
+                    logger.info(f"🗄️ Final GPU cache usage: {key_metrics['gpu_cache_usage_percent']:.1f}%")
+                if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                    hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                    logger.info(f"🎯 GPU prefix cache hit rate: {hit_rate:.1f}%")
+                    if hit_rate > 50:
+                        logger.info("🏆 Excellent cache performance detected!")
+                    elif hit_rate > 20:
+                        logger.info("✅ Good cache performance detected!")
+                        
+                # Log cache counter details
+                if 'gpu_prefix_cache_hits' in key_metrics and 'gpu_prefix_cache_queries' in key_metrics:
+                    hits = key_metrics['gpu_prefix_cache_hits']
+                    queries = key_metrics['gpu_prefix_cache_queries']
+                    logger.info(f"📈 Cache counters: {hits} hits / {queries} queries")
             
             return experiment_results
 
@@ -1821,7 +2337,34 @@ class SimpleLLMExperiment:
         except Exception as e:
             logger.error(f"❌ Experiment failed: {e}")
             
-            // ...existing code...
+            # Stop monitoring on error
+            try:
+                self.resource_monitor.stop_monitoring()
+                if self.vllm_metrics_collector:
+                    self.vllm_metrics_collector.stop_monitoring()
+            except:
+                pass
+            
+            # Still try to save partial results
+            error_results = {
+                'experiment_info': {
+                    'dataset_path': dataset_path,
+                    'query_key': query_key,
+                    'error': str(e),
+                    'experiment_timestamp': timestamp,
+                    'output_folder': output_folder
+                },
+                'error': str(e),
+                'partial_results': locals().get('all_results', [])
+            }
+            
+            try:
+                error_json_path = os.path.join(output_folder, "experiment_error.json")
+                with open(error_json_path, 'w') as f:
+                    json.dump(error_results, f, indent=2, default=str)
+                logger.info(f"💾 Error details saved: {error_json_path}")
+            except:
+                pass
             
             raise
     
@@ -1839,14 +2382,99 @@ def main():
     """Main CLI interface"""
     parser = argparse.ArgumentParser(description='Run LLM experiments with vLLM and comprehensive monitoring')
     
-    // ...existing code...
+    # Required arguments
+    parser.add_argument('dataset_path', help='Path to the dataset file (CSV, JSON, JSONL, or Parquet)')
+    parser.add_argument('query_key', help='Query template key or "custom" for custom query')
+    
+    # Model configuration
+    parser.add_argument('--model', default='Qwen/Qwen2.5-7B-Instruct', 
+                       help='Model name (HuggingFace or local path)')
+    parser.add_argument('--max-tokens', type=int, default=512,
+                       help='Maximum tokens to generate')
+    parser.add_argument('--temperature', type=float, default=0.1,
+                       help='Temperature for generation')
+    parser.add_argument('--top-p', type=float, default=0.9,
+                       help='Top-p for generation')
+    
+    # GPU configuration (enhanced for multi-GPU)
+    parser.add_argument('--gpu', type=int, help='Single GPU ID to use (for backward compatibility)')
+    parser.add_argument('--gpus', type=str, help='Comma-separated GPU IDs to use (e.g., "0,1,2,3" or "4,5,6,7")')
+    parser.add_argument('--tensor-parallel-size', type=int, help='Number of GPUs to use for tensor parallelism (calculated from --gpus if not specified)')
+    parser.add_argument('--gpu-memory', type=float, default=0.7,
+                       help='GPU memory utilization (0.0 to 1.0, default: 0.7)')
+    parser.add_argument('--max-model-len', type=int, default=4096,
+                       help='Maximum model sequence length (default: 4096)')
+    
+    # Experiment configuration
+    parser.add_argument('--custom-query', help='Custom query to use instead of template')
+    parser.add_argument('--max-rows', type=int, help='Maximum rows to process from dataset')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size for inference')
+    parser.add_argument('--output-dir', default='results', help='Output directory')
+    parser.add_argument('--output-prefix', help='Prefix for output folder name')
+    
+    # Advanced options
+    parser.add_argument('--enable-testing-mode', action='store_true',
+                       help='Enable testing mode with simulated metrics (for development)')
+    parser.add_argument('--skip-model-init', action='store_true',
+                       help='Skip model initialization (for testing infrastructure only)')
     
     args = parser.parse_args()
     
-    // ...existing code...
+    # Print welcome message
+    print("=" * 70)
+    print("🚀 vLLM Experiment Runner with Enhanced KV Cache Monitoring")
+    print("=" * 70)
+    
+    # Parse GPU configuration
+    gpu_ids = None
+    tensor_parallel_size = args.tensor_parallel_size
+    
+    if args.gpus:
+        try:
+            gpu_ids = [int(gpu_id.strip()) for gpu_id in args.gpus.split(',')]
+            print(f"🖥️  Multi-GPU mode: Using GPUs {gpu_ids}")
+            
+            # Set tensor parallel size if not specified
+            if tensor_parallel_size is None:
+                tensor_parallel_size = len(gpu_ids)
+                print(f"🔄 Setting tensor parallel size to {tensor_parallel_size} (based on number of GPUs)")
+        except ValueError:
+            print("❌ Error: Invalid GPU IDs format. Use comma-separated integers like '0,1,2,3' or '4,5,6,7'")
+            sys.exit(1)
+    elif args.gpu is not None:
+        gpu_ids = [args.gpu]
+        print(f"🖥️  Single-GPU mode: Using GPU {args.gpu}")
+        
+        # Default tensor parallel size for single GPU
+        if tensor_parallel_size is None:
+            tensor_parallel_size = 1
+    else:
+        gpu_ids = [0]  # Default
+        print(f"🖥️  Using default GPU 0")
+        
+        # Default tensor parallel size for single GPU
+        if tensor_parallel_size is None:
+            tensor_parallel_size = 1
+    
+    print(f"🧠 Tensor parallel size: {tensor_parallel_size}")
+    
+    # Validate query
+    if args.query_key not in QUERY_TEMPLATES and args.query_key != "custom" and not args.custom_query:
+        print(f"❌ Error: Query key '{args.query_key}' not found.")
+        print("Available templates:")
+        for key, template in QUERY_TEMPLATES.items():
+            print(f"  - {key}: {template['type']} query")
+        print("  - custom: Use with --custom-query")
+        sys.exit(1)
     
     try:
-        // ...existing code...
+        # Initialize experiment
+        print(f"🔧 Initializing experiment with model: {args.model}")
+        experiment = SimpleLLMExperiment(
+            model_name=args.model,
+            output_dir=args.output_dir,
+            gpu_ids=gpu_ids
+        )
         
         # Initialize model
         if not args.skip_model_init:
@@ -1856,7 +2484,8 @@ def main():
                 temperature=args.temperature,
                 top_p=args.top_p,
                 gpu_memory_utilization=args.gpu_memory,
-                max_model_len=args.max_model_len
+                max_model_len=args.max_model_len,
+                tensor_parallel_size=tensor_parallel_size
             )
             
             if not success:
@@ -1865,12 +2494,38 @@ def main():
         else:
             print("⚠️  Skipping model initialization (testing mode)")
         
-        // ...existing code...
+        # Enable testing mode if requested
+        if args.enable_testing_mode:
+            print("🧪 Enabling testing mode with simulated metrics")
+            experiment.vllm_metrics_collector.enable_testing_mode()
+        
+        # Run experiment
+        print("🎯 Starting experiment...")
+        results = experiment.run_experiment(
+            dataset_path=args.dataset_path,
+            query_key=args.query_key,
+            custom_query=args.custom_query,
+            max_rows=args.max_rows,
+            batch_size=args.batch_size,
+            output_prefix=args.output_prefix
+        )
         
         print("\n" + "=" * 70)
         print("🎉 Experiment completed successfully!")
         
-        // ...existing code...
+        # Handle different return structures (success vs error)
+        if 'experiment_info' in results:
+            # Error case structure
+            output_folder = results['experiment_info']['output_folder']
+        elif 'experiment_metadata' in results:
+            # Success case structure
+            output_folder = results['experiment_metadata']['output_folder']
+        else:
+            # Fallback
+            output_folder = "experiment_results"
+            
+        print(f"📁 Results saved in: {output_folder}")
+        print("=" * 70)
         
     except KeyboardInterrupt:
         print("\n❌ Experiment interrupted by user")

@@ -238,6 +238,13 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
     if gpu_ids:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
         logger.info(f"Set CUDA_VISIBLE_DEVICES={gpu_ids}")
+        
+        # Parse GPU IDs and set tensor_parallel_size if not explicitly specified
+        gpu_id_list = [int(gpu.strip()) for gpu in gpu_ids.split(',')]
+        if 'tensor_parallel_size' not in llm_kwargs:
+            tensor_parallel_size = len(gpu_id_list)
+            llm_kwargs['tensor_parallel_size'] = tensor_parallel_size
+            logger.info(f"Set tensor_parallel_size={tensor_parallel_size} based on number of GPUs")
     
     # Initialize enhanced LLM with stats logging
     logger.info(f"Initializing enhanced LLM with model: {model_path}")
