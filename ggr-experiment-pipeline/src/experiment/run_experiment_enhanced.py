@@ -25,7 +25,7 @@ from pathlib import Path
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(name)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -145,16 +145,18 @@ def prepare_prompt(query_template: str, row: pd.Series) -> str:
         if pd.notna(row[column]):
             fields[column] = str(row[column])
     
-    # Log available fields for debugging
-    logger.info(f"Row data has {len(fields)} fields: {list(fields.keys())}")
+    # Add diagnostic logging for empty fields
+    if not fields:
+        logger.warning(f"No valid fields found in row: {row.to_dict()}")
     
     # Format the prompt
     try:
         # Try to format with named placeholders first
         formatted_prompt = prompt_template.format(**fields)
     except KeyError as e:
-        logger.info(f"KeyError in format: {e}. Using JSON fields instead.")
-        # Always append fields as JSON for reliability
+        # Log the missing keys
+        logger.warning(f"KeyError in prompt formatting: {e}. Available keys: {list(fields.keys())}")
+        # If named placeholders fail, append fields as JSON
         fields_json = json.dumps(fields, indent=2)
         formatted_prompt = f"{prompt_template}\n\nData fields:\n{fields_json}"
     
@@ -164,8 +166,7 @@ def prepare_prompt(query_template: str, row: pd.Series) -> str:
         fields_json = json.dumps(fields, indent=2)
         formatted_prompt = f"{prompt_template}\n\nData fields:\n{fields_json}"
     
-    # Log prompt length for debugging
-    logger.info(f"Generated prompt length: {len(formatted_prompt)} chars")
+    logger.debug(f"Prepared prompt (length: {len(formatted_prompt)}): {formatted_prompt[:100]}...")
     
     return formatted_prompt
 
@@ -212,18 +213,9 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
     # Set default LLM parameters
     llm_kwargs.setdefault('tensor_parallel_size', 1)
     llm_kwargs.setdefault('max_model_len', 2048)
-    # Lower GPU memory utilization to avoid out of memory errors 
-    # (error indicated 16.38 GiB available, was trying to allocate 21.28 GiB)
-    llm_kwargs.setdefault('gpu_memory_utilization', 0.7)  # Reduced from 0.9 to 0.7
+    llm_kwargs.setdefault('gpu_memory_utilization', 0.9)
     llm_kwargs.setdefault('enable_prefix_caching', True)
     llm_kwargs.setdefault('log_stats_interval', max(1, batch_size // 2))  # Log every few batches
-    
-    # Ensure proper handling of stats logging parameters
-    if 'disable_log_stats' in llm_kwargs:
-        # If disable_log_stats exists, make sure we don't have conflicting settings
-        if 'log_stats' in llm_kwargs:
-            logger.warning("Both 'log_stats' and 'disable_log_stats' parameters provided; 'disable_log_stats' takes precedence")
-            llm_kwargs['log_stats'] = not llm_kwargs['disable_log_stats']
     
     llm = create_enhanced_llm(model_path, **llm_kwargs)
     
@@ -251,18 +243,34 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
         
         # Prepare prompts for this batch
         batch_prompts = []
-        for _, row in batch_df.iterrows():
+        for idx, row in batch_df.iterrows():
             prompt = prepare_prompt(query_key, row)
+            if not prompt or len(prompt.strip()) < 10:
+                logger.warning(f"Row {idx}: Generated an empty or very short prompt")
+                # Try to create a backup prompt with raw data
+                fields_json = json.dumps(row.to_dict(), indent=2)
+                prompt = f"{QUERY_TEMPLATES[query_key]['prompt']}\n\nRAW DATA:\n{fields_json}"
+                logger.info(f"Created backup prompt with raw data for row {idx}")
+            
+            # Log prompt length for diagnostics
+            logger.debug(f"Row {idx}: Prompt length = {len(prompt)} characters")
             batch_prompts.append(prompt)
         
         # Run inference with detailed stats logging
         batch_start_time = time.time()
-        outputs = llm.generate(
-            batch_prompts, 
-            sampling_params, 
-            log_detailed_stats=True
-        )
-        batch_end_time = time.time()
+        try:
+            outputs = llm.generate(
+                batch_prompts, 
+                sampling_params, 
+                log_detailed_stats=True
+            )
+            batch_end_time = time.time()
+        except Exception as e:
+            logger.error(f"Error during batch generation: {e}")
+            logger.error(f"First prompt in batch: {batch_prompts[0][:200]}...")
+            logger.error(f"Batch size: {len(batch_prompts)}")
+            logger.error("This could be due to CUDA errors, model loading issues, or prompt formatting problems")
+            raise
         
         # Process results
         for i, output in enumerate(outputs):
@@ -377,18 +385,25 @@ def main():
                        help='Output directory for results (default: results_enhanced)')
     parser.add_argument('--max-model-len', type=int, default=2048,
                        help='Maximum model length (default: 2048)')
-    parser.add_argument('--gpu-memory', type=float, default=0.9,
-                       help='GPU memory utilization (default: 0.9)')
+    parser.add_argument('--gpu-memory', type=float, default=0.7,
+                       help='GPU memory utilization (default: 0.7)')
     parser.add_argument('--tensor-parallel-size', type=int, default=1,
                        help='Tensor parallel size (default: 1)')
     parser.add_argument('--gpus', type=str, default=None,
                        help='Comma-separated list of GPU IDs to use (e.g., "6,7")')
     parser.add_argument('--log-stats', action='store_true',
-                       help='Enable detailed stats logging (default: True)')
+                       help='Enable detailed stats logging (default)')
     parser.add_argument('--disable-log-stats', action='store_true',
-                       help='Disable detailed stats logging (overrides --log-stats)')
+                       help='Disable detailed stats logging')
+    parser.add_argument('--log-level', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                       default='INFO', help='Set the logging level (default: INFO)')
     
     args = parser.parse_args()
+    
+    # Set logging level
+    logging_level = getattr(logging, args.log_level)
+    logging.getLogger().setLevel(logging_level)
+    logger.info(f"Set logging level to {args.log_level}")
     
     # Check if files exist
     if not os.path.exists(args.csv_file):
@@ -396,19 +411,6 @@ def main():
         sys.exit(1)
     
     try:
-        # Set up LLM kwargs including stats logging options
-        llm_kwargs = {
-            'max_model_len': args.max_model_len,
-            'tensor_parallel_size': args.tensor_parallel_size,
-            'gpu_memory_utilization': args.gpu_memory,
-        }
-        
-        # Handle stats logging flags
-        if args.log_stats:
-            llm_kwargs['log_stats'] = True
-        if args.disable_log_stats:
-            llm_kwargs['disable_log_stats'] = True
-            
         # Run enhanced experiment
         results_df, detailed_stats = run_enhanced_experiment(
             csv_file=args.csv_file,
@@ -418,7 +420,11 @@ def main():
             max_rows=args.max_rows,
             output_dir=args.output_dir,
             gpu_ids=args.gpus,
-            **llm_kwargs
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory,
+            tensor_parallel_size=args.tensor_parallel_size,
+            log_stats=not args.disable_log_stats,
+            disable_log_stats=args.disable_log_stats
         )
         
         logger.info("✅ Enhanced experiment completed successfully!")
