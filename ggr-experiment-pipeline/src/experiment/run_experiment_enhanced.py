@@ -370,6 +370,10 @@ def main():
                        help='Tensor parallel size (default: 1)')
     parser.add_argument('--gpus', type=str, default=None,
                        help='Comma-separated list of GPU IDs to use (e.g., "6,7")')
+    parser.add_argument('--log-stats', action='store_true',
+                       help='Enable detailed stats logging (default: True)')
+    parser.add_argument('--disable-log-stats', action='store_true',
+                       help='Disable detailed stats logging (overrides --log-stats)')
     
     args = parser.parse_args()
     
@@ -379,6 +383,19 @@ def main():
         sys.exit(1)
     
     try:
+        # Set up LLM kwargs including stats logging options
+        llm_kwargs = {
+            'max_model_len': args.max_model_len,
+            'tensor_parallel_size': args.tensor_parallel_size,
+            'gpu_memory_utilization': args.gpu_memory,
+        }
+        
+        # Handle stats logging flags
+        if args.log_stats:
+            llm_kwargs['log_stats'] = True
+        if args.disable_log_stats:
+            llm_kwargs['disable_log_stats'] = True
+            
         # Run enhanced experiment
         results_df, detailed_stats = run_enhanced_experiment(
             csv_file=args.csv_file,
@@ -388,9 +405,7 @@ def main():
             max_rows=args.max_rows,
             output_dir=args.output_dir,
             gpu_ids=args.gpus,
-            max_model_len=args.max_model_len,
-            gpu_memory_utilization=args.gpu_memory,
-            tensor_parallel_size=args.tensor_parallel_size
+            **llm_kwargs
         )
         
         logger.info("✅ Enhanced experiment completed successfully!")
