@@ -314,11 +314,33 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
         # Process results
         for i, output in enumerate(outputs):
             row_idx = batch_idx + i
+            generated_text = output.outputs[0].text
+            
+            # Print each LLM response with current stats
+            print(f"\n{'='*50}")
+            print(f"Response {row_idx+1}/{len(df)}:")
+            print(f"{'='*50}")
+            print(f"{generated_text}")
+            print(f"{'='*50}")
+            
+            # Get and print current stats
+            current_batch_stats = llm.get_current_stats()
+            print(f"Current Stats:")
+            if 'engine_kv_cache_usage' in current_batch_stats:
+                print(f"• KV Cache Usage: {current_batch_stats['engine_kv_cache_usage']:.2%}")
+            if 'engine_prefix_cache_stats_hits' in current_batch_stats and 'engine_prefix_cache_stats_queries' in current_batch_stats:
+                hits = current_batch_stats['engine_prefix_cache_stats_hits']
+                queries = current_batch_stats['engine_prefix_cache_stats_queries']
+                hit_rate = (hits / queries * 100) if queries > 0 else 0
+                print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}% ({hits}/{queries})")
+            print(f"• Tokens - Prompt: {len(output.prompt_token_ids)}, Generated: {len(output.outputs[0].token_ids)}")
+            print(f"{'='*50}\n")
+            
             result = {
                 'row_id': row_idx,
                 'query_type': query_key,
                 'prompt': batch_prompts[i][:200] + "..." if len(batch_prompts[i]) > 200 else batch_prompts[i],
-                'generated_text': output.outputs[0].text,
+                'generated_text': generated_text,
                 'finish_reason': str(output.outputs[0].finish_reason),
                 'prompt_tokens': len(output.prompt_token_ids),
                 'generated_tokens': len(output.outputs[0].token_ids),
@@ -356,11 +378,12 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
     # Save results
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Save main results
-    results_df = pd.DataFrame(results)
+    # Save only LLM responses to CSV
+    llm_responses = [result['generated_text'] for result in results]
+    results_df = pd.DataFrame({'llm_response': llm_responses})
     results_file = os.path.join(output_dir, f"{query_key}_results_{timestamp}.csv")
     results_df.to_csv(results_file, index=False)
-    logger.info(f"Results saved to: {results_file}")
+    logger.info(f"Results saved to: {results_file} (contains only LLM response column)")
     
     # Save detailed stats
     stats_file = os.path.join(output_dir, f"{query_key}_detailed_stats_{timestamp}.json")

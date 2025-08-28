@@ -2207,6 +2207,29 @@ class SimpleLLMExperiment:
                 else:
                     logger.info(f"✅ Inference completed successfully")
                     
+                    # Print each LLM response with current stats
+                    for i, response in enumerate(all_results):
+                        print(f"\n{'='*50}")
+                        print(f"Response {i+1}/{len(all_results)}:")
+                        print(f"{'='*50}")
+                        print(f"{response}")
+                        print(f"{'='*50}")
+                        
+                        # Get and print current vLLM stats if available
+                        if self.vllm_metrics_collector:
+                            current_stats = self.vllm_metrics_collector.collect_current_stats()
+                            if current_stats.get('stats_available', False):
+                                key_metrics = current_stats.get('metrics_found', {})
+                                print(f"Current Stats:")
+                                if 'gpu_cache_usage_percent' in key_metrics:
+                                    print(f"• KV Cache Usage: {key_metrics['gpu_cache_usage_percent']:.2f}%")
+                                if 'gpu_prefix_cache_hit_rate_percent' in key_metrics:
+                                    hit_rate = key_metrics['gpu_prefix_cache_hit_rate_percent']
+                                    print(f"• Prefix Cache Hit Rate: {hit_rate:.2f}%")
+                                if 'requests_running' in key_metrics:
+                                    print(f"• Requests Running: {key_metrics['requests_running']}")
+                                print(f"{'='*50}\n")
+                    
             except Exception as e:
                 logger.error(f"Inference failed with error: {e}")
                 all_results = ["ERROR"] * len(prompts)
@@ -2293,12 +2316,13 @@ class SimpleLLMExperiment:
                 json.dump(experiment_results, f, indent=2, default=str)
             logger.info(f"📋 Comprehensive experiment stats saved: {results_json_path}")
             
-            # Also save a minimal results CSV for reference
-            results_df = df.copy()
-            results_df['llm_response'] = all_results
-            results_df['processing_time'] = [total_inference_time / len(df)] * len(df)
+            # Save only the LLM responses to CSV
+            results_df = pd.DataFrame({
+                'llm_response': all_results
+            })
             results_csv_path = os.path.join(output_folder, "query_results.csv") 
             results_df.to_csv(results_csv_path, index=False)
+            logger.info(f"📄 LLM responses saved to: {results_csv_path} (contains only response column)")
             
             # Final summary
             logger.info("🎉 Experiment completed successfully!")
