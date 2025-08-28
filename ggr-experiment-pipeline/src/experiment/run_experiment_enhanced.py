@@ -158,7 +158,7 @@ def prepare_prompt(query_template: str, row: pd.Series) -> str:
 
 def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qwen/Qwen1.5-14B",
                           batch_size: int = 10, max_rows: Optional[int] = None, 
-                          output_dir: str = "results", **llm_kwargs):
+                          output_dir: str = "results", gpu_ids: Optional[str] = None, **llm_kwargs):
     """
     Run experiment with enhanced stats logging using local vLLM.
     
@@ -169,6 +169,7 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
         batch_size: Batch size for inference
         max_rows: Maximum number of rows to process
         output_dir: Output directory for results
+        gpu_ids: Comma-separated list of GPU IDs to use
         **llm_kwargs: Additional LLM arguments
     """
     # Validate query key
@@ -186,6 +187,11 @@ def run_enhanced_experiment(csv_file: str, query_key: str, model_path: str = "Qw
         df = df.head(max_rows)
     
     logger.info(f"Dataset loaded: {len(df)} rows")
+    
+    # Set GPU devices if specified
+    if gpu_ids:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        logger.info(f"Set CUDA_VISIBLE_DEVICES={gpu_ids}")
     
     # Initialize enhanced LLM with stats logging
     logger.info(f"Initializing enhanced LLM with model: {model_path}")
@@ -353,6 +359,8 @@ def main():
                        help='GPU memory utilization (default: 0.9)')
     parser.add_argument('--tensor-parallel-size', type=int, default=1,
                        help='Tensor parallel size (default: 1)')
+    parser.add_argument('--gpus', type=str, default=None,
+                       help='Comma-separated list of GPU IDs to use (e.g., "6,7")')
     
     args = parser.parse_args()
     
@@ -370,6 +378,7 @@ def main():
             batch_size=args.batch_size,
             max_rows=args.max_rows,
             output_dir=args.output_dir,
+            gpu_ids=args.gpus,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory,
             tensor_parallel_size=args.tensor_parallel_size
