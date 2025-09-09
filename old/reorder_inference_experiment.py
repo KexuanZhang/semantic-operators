@@ -88,7 +88,7 @@ def reorder_dataset(df, perform_sort=True, perform_dedup=True, content_column='r
     return reordered_df
 
 def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None, 
-                max_model_len=None, gpu_memory_utilization=None):
+                max_model_len=None, gpu_memory_utilization=None, gpu_ids=None):
     """Initialize the LLM with vLLM
     
     Args:
@@ -97,9 +97,15 @@ def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None,
         tokenizer_name (str, optional): Name or path of the tokenizer (useful for local models)
         max_model_len (int, optional): Maximum model context length
         gpu_memory_utilization (float, optional): Fraction of GPU memory to use (0.0-1.0)
+        gpu_ids (str, optional): Comma-separated GPU IDs to use (e.g., "0,1" or "6,7")
     """
     # Set environment variable for cached outputs
     os.environ["VLLM_USE_CACHED_OUTPUTS"] = "True"
+    
+    # Set specific GPU devices if specified
+    if gpu_ids:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        print(f"Using specific GPU IDs: {gpu_ids}")
     
     # Clear GPU memory
     torch.cuda.empty_cache()
@@ -145,17 +151,179 @@ def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None,
         llm = LLM(**llm_params)
         print("Fallback model loaded successfully")
     
-    # Define sampling parameters
-    sampling_params = SamplingParams(temperature=0.7, top_p=0.95)
+    # Define sampling parameters based on model type
+    if model_name:
+        model_name_lower = model_name.lower()
+        
+        # For smaller models, use more conservative parameters
+        if any(name in model_name_lower for name in ["tiny", "small", "base"]):
+            sampling_params = SamplingParams(
+                temperature=0.1,  # Lower temperature for more predictable outputs
+                top_p=0.9,
+                max_tokens=100
+            )
+        else:
+            # For larger models, we can use slightly higher temperature
+            sampling_params = SamplingParams(
+                temperature=0.3,
+                top_p=0.95,
+                max_tokens=200
+            )
+    else:
+        # Default sampling parameters
+        sampling_params = SamplingParams(
+            temperature=0.1,
+            top_p=0.9,
+            max_tokens=150
+        )
+    
+    print(f"Initialized sampling parameters: temp={sampling_params.temperature}, top_p={sampling_params.top_p}, max_tokens={sampling_params.max_tokens}")
     
     return llm, sampling_params
 
-def llm_inference(llm, sampling_params, prompt):
-    """Run inference with the LLM and return the result"""
-    output = llm.generate(prompt, sampling_params)
-    return output[0].outputs[0].text
+def llm_inference(llm, sampling_params, prompt, model_name=None):
+    """Run inference with the LLM and return the result
+    
+    Args:
+        llm: The vLLM model instance
+        sampling_params: SamplingParams for generation
+        prompt: The text prompt to send to the model
+        model_name: Name/path of the model (used for format detection)
+    """
+    # Format prompt based on model type (instruction formatting)
+    if model_name:
+        model_name_lower = model_name.lower()
+        
+        # Qwen models
+        if "qwen" in model_name_lower:
+            formatted_prompt = f"<|im_start|>system\nYou are a helpful assistant that provides clear, concise, and accurate answers.\n<|im_end|>\n<|im_start|>user\n{prompt}\n<|im_end|>\n<|im_start|>assistant\n"
+        
+        # LLaMA family models (LLaMA, Mistral, Vicuna, etc)
+        elif any(name in model_name_lower for name in ["llama", "mistral", "vicuna"]):
+            formatted_prompt = f"<s>[INST] {prompt} [/INST]"
+        
+        # ChatGLM models
+        elif "chatglm" in model_name_lower:
+            formatted_prompt = f"[gMASK]system\nYou are a helpful assistant that provides accurate answers.\n\nuser\n{prompt}\n\nassistant\n"
+        
+        # Gemma models
+        elif "gemma" in model_name_lower:
+            formatted_prompt = f"<start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n"
+        
+        # TinyLlama Chat models
+        elif "tinyllama" in model_name_lower and "chat" in model_name_lower:
+            formatted_prompt = f"<|system|>\nYou are a helpful assistant. Answer directly and concisely.\n<|user|>\n{prompt}\n<|assistant|>"
+        
+        # Mixtral models
+        elif "mixtral" in model_name_lower:
+            formatted_prompt = f"<s>[INST] {prompt} [/INST]"
+        
+        # Yi models
+        elif "yi" in model_name_lower:
+            formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        
+        # GPT models (typically use straightforward prompting)
+        elif any(name in model_name_lower for name in ["gpt", "opt"]):
+            formatted_prompt = f"User: {prompt}\nAssistant:"
+        
+        # BERT/T5/Flan models (use direct prompting)
+        elif any(name in model_name_lower for name in ["bert", "t5", "flan"]):
+            formatted_prompt = f"{prompt}"
+        
+        # Generic instruction format for other models
+        else:
+            formatted_prompt = f"### Instruction:\n{prompt}\n\n### Response:\n"
+            
+        print(f"Using prompt format for model type: {model_name_lower}")
+    else:
+        # Fallback to direct prompt with explicit instruction
+        formatted_prompt = f"Answer the following question directly and concisely: {prompt}\n"
+        print("Using default prompt format (no model specified)")
+        
+    # Print the first part of the prompt (for debugging)
+    print(f"Formatted prompt preview: {formatted_prompt[:50]}...")
+    
+    # Adjust sampling params for better, more controlled outputs
+    adjusted_params = SamplingParams(
+        temperature=0.1,  # Lower temperature for more deterministic responses
+        top_p=0.9,
+        max_tokens=200,   # Increased response length for more complete answers
+        stop=["<|im_end|>", "</s>", "<|endoftext|>", "<|end|>", "<|user|>"]  # Stop tokens for various models
+    )
+    
+    # Generate the response
+    try:
+        # Use the adjusted parameters instead of the passed sampling_params
+        print(f"\n----- INFERENCE REQUEST -----")
+        print(f"Model: {model_name if model_name else 'Unknown'}")
+        print(f"Prompt length: {len(formatted_prompt)} chars")
+        print(f"Prompt preview: {formatted_prompt[:100]}...\n")
+        
+        # Run the actual inference
+        output = llm.generate(formatted_prompt, adjusted_params)
+        
+        if not output or len(output) == 0 or len(output[0].outputs) == 0:
+            print("ERROR: Model returned empty output")
+            return "Error: Model returned empty output. Please try again with different parameters."
+        
+        response = output[0].outputs[0].text
+        print(f"----- RAW RESPONSE -----\n{response[:100]}...\n")
+        
+        # Clean up response based on model type
+        if model_name:
+            model_name_lower = model_name.lower()
+            
+            # Clean Qwen responses
+            if "qwen" in model_name_lower and "<|im_end|>" in response:
+                response = response.split("<|im_end|>")[0].strip()
+            
+            # Clean Llama responses
+            elif any(name in model_name_lower for name in ["llama", "mistral", "vicuna"]):
+                # Sometimes responses include the instruction prefix
+                if "[/INST]" in response:
+                    parts = response.split("[/INST]")
+                    if len(parts) > 1:
+                        response = parts[1].strip()
+            
+            # Clean TinyLlama responses
+            elif "tinyllama" in model_name_lower:
+                if "<|assistant|>" in response:
+                    response = response.replace("<|assistant|>", "").strip()
+                elif "<|user|>" in response:
+                    # If the model starts generating a new user turn, cut it off
+                    response = response.split("<|user|>")[0].strip()
+                    
+            # Clean ChatGLM responses
+            elif "chatglm" in model_name_lower and "assistant" in response:
+                try:
+                    response = response.split("assistant\n", 1)[1].strip()
+                except IndexError:
+                    pass
+            
+            # Check for empty response after cleaning
+            if not response or response.isspace():
+                print("WARNING: Response was empty after cleaning")
+                return "Error: Model returned an empty response after formatting."
+        
+        print(f"----- CLEANED RESPONSE -----\n{response[:100]}...\n")
+        return response.strip()
+    except Exception as e:
+        error_msg = f"Error during inference: {e}"
+        print(error_msg)
+        
+        # Attempt to recover with a simpler prompt if there was an error
+        try:
+            print("Attempting recovery with simpler prompt...")
+            simple_prompt = f"Answer briefly: {prompt}"
+            simple_output = llm.generate(simple_prompt, adjusted_params)
+            if len(simple_output) > 0 and len(simple_output[0].outputs) > 0:
+                return f"[RECOVERED RESPONSE] {simple_output[0].outputs[0].text.strip()}"
+            else:
+                return f"Error generating response: {str(e)}"
+        except:
+            return f"Error generating response: {str(e)}"
 
-def process_dataset(df, llm, sampling_params, prompt_template, columns_to_include):
+def process_dataset(df, llm, sampling_params, prompt_template, columns_to_include, model_name=None):
     """Process each row in the dataset with LLM inference"""
     results = []
     start_time = time.time()
@@ -202,7 +370,8 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
             
         # Run inference
         inference_start = time.time()
-        response = llm_inference(llm, sampling_params, prompt)
+        # Pass the model_name parameter rather than using args.model directly
+        response = llm_inference(llm, sampling_params, prompt, model_name)
         inference_end = time.time()
         
         # Calculate tokens (approximate)
@@ -236,7 +405,7 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
     
     return results, stats
 
-def save_results(results, stats, dataset, result_dir):
+def save_results(results, stats, dataset, result_dir, original_dataset=None):
     """Save results and stats to the specified directory"""
     # Save processed results as JSON
     results_path = os.path.join(result_dir, "inference_results.json")
@@ -252,6 +421,26 @@ def save_results(results, stats, dataset, result_dir):
     dataset_path = os.path.join(result_dir, "processed_dataset.csv")
     dataset.to_csv(dataset_path, index=False)
     
+    # If original dataset is provided, save it for comparison
+    if original_dataset is not None:
+        original_path = os.path.join(result_dir, "original_dataset.csv")
+        original_dataset.to_csv(original_path, index=False)
+        
+        # Generate a basic diff report
+        reordering_stats = {
+            "original_columns": original_dataset.columns.tolist(),
+            "processed_columns": dataset.columns.tolist(),
+            "columns_reordered": original_dataset.columns.tolist() != dataset.columns.tolist(),
+            "original_row_count": len(original_dataset),
+            "processed_row_count": len(dataset),
+            "rows_changed": len(original_dataset) != len(dataset),
+        }
+        
+        # Save reordering stats
+        reordering_path = os.path.join(result_dir, "reordering_stats.json")
+        with open(reordering_path, 'w') as f:
+            json.dump(reordering_stats, f, indent=2)
+    
     # Save summary as text
     summary_path = os.path.join(result_dir, "experiment_summary.txt")
     with open(summary_path, 'w') as f:
@@ -263,6 +452,15 @@ def save_results(results, stats, dataset, result_dir):
         f.write(f"Average Time per Row: {stats['avg_time_per_row']:.4f} seconds\n")
         f.write(f"Total Tokens Processed: {stats['total_tokens']}\n")
         f.write(f"Average Tokens per Row: {stats['avg_tokens_per_row']:.2f}\n")
+        
+        if original_dataset is not None:
+            f.write("\nReordering Information:\n")
+            f.write(f"- Original column count: {len(original_dataset.columns)}\n")
+            f.write(f"- Processed column count: {len(dataset.columns)}\n")
+            f.write(f"- Columns reordered: {'Yes' if reordering_stats['columns_reordered'] else 'No'}\n")
+            f.write(f"- Original row count: {reordering_stats['original_row_count']}\n")
+            f.write(f"- Processed row count: {reordering_stats['processed_row_count']}\n")
+            f.write(f"- Rows changed: {'Yes' if reordering_stats['rows_changed'] else 'No'}\n")
     
     print(f"Results saved to {result_dir}")
 
@@ -284,6 +482,8 @@ def main():
                         help='HuggingFace model name or path to local model directory.')
     parser.add_argument('--tp_size', type=int, default=None,
                         help='Tensor parallel size (number of GPUs to use).')
+    parser.add_argument('--gpu_ids', type=str, default=None,
+                        help='Specific GPU IDs to use, comma-separated (e.g., "0,1" or "6,7").')
     parser.add_argument('--tokenizer', type=str, default=None,
                         help='Optional tokenizer name or path (useful for local models).')
     parser.add_argument('--max_model_len', type=int, default=None,
@@ -312,12 +512,15 @@ def main():
     
     # Load dataset
     print(f"Loading dataset from {args.dataset}")
-    dataset = pd.read_csv(args.dataset)
+    original_dataset = pd.read_csv(args.dataset)
     
     # Apply max rows limit if specified
     if args.max_rows is not None:
-        dataset = dataset.head(args.max_rows)
+        original_dataset = original_dataset.head(args.max_rows)
         print(f"Limited dataset to {args.max_rows} rows")
+    
+    # Create a copy for processing
+    dataset = original_dataset.copy()
     
     # Apply reordering if requested
     if args.reorder:
@@ -328,6 +531,21 @@ def main():
             perform_dedup=not args.no_dedup,
             content_column=args.content_column
         )
+        
+        # Compare before and after to verify changes
+        columns_changed = original_dataset.columns.tolist() != dataset.columns.tolist()
+        rows_changed = len(original_dataset) != len(dataset)
+        
+        print("\nReordering Results:")
+        print(f"- Columns reordered: {'Yes' if columns_changed else 'No'}")
+        if columns_changed:
+            print(f"  Before: {original_dataset.columns.tolist()[:3]}... ({len(original_dataset.columns)} columns)")
+            print(f"  After:  {dataset.columns.tolist()[:3]}... ({len(dataset.columns)} columns)")
+        print(f"- Row count changed: {'Yes' if rows_changed else 'No'}")
+        if rows_changed:
+            print(f"  Before: {len(original_dataset)} rows")
+            print(f"  After:  {len(dataset)} rows")
+        print()
     else:
         print("Skipping reordering as per command line argument")
     
@@ -337,7 +555,8 @@ def main():
         tensor_parallel_size=args.tp_size,
         tokenizer_name=args.tokenizer,
         max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory
+        gpu_memory_utilization=args.gpu_memory,
+        gpu_ids=args.gpu_ids
     )
     
     # Process dataset with LLM inference
@@ -347,7 +566,8 @@ def main():
         llm,
         sampling_params,
         args.prompt_template,
-        args.include_columns
+        args.include_columns,
+        args.model  # Pass the model name to properly format prompts
     )
     
     # End timing and update stats
@@ -358,7 +578,7 @@ def main():
     print(f"Total experiment time: {total_time:.2f} seconds")
     
     # Save results
-    save_results(results, stats, dataset, result_dir)
+    save_results(results, stats, dataset, result_dir, original_dataset)
     
     # Cleanup
     if dist.is_initialized():
