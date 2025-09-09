@@ -206,7 +206,7 @@ def main():
     parser.add_argument('--no_dedup', action='store_true', help='Skip deduplication step when reordering.')
     
     # LLM configuration
-    parser.add_argument('--model', type=str, default='meta-llama/Llama-2-7b-hf',
+    parser.add_argument('--model', type=str, default='Qwen/Qwen1.5-7B',
                         help='HuggingFace model to use for inference.')
     parser.add_argument('--prompt_template', type=str, 
                         default='Analyze whether this movie would be suitable for kids based on {movie_info} and {review_content}.',
