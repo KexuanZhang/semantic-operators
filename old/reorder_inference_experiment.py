@@ -87,8 +87,13 @@ def reorder_dataset(df, perform_sort=True, perform_dedup=True, content_column='r
     
     return reordered_df
 
-def initialize_llm(model_name):
-    """Initialize the LLM with vLLM"""
+def initialize_llm(model_name, tensor_parallel_size=None):
+    """Initialize the LLM with vLLM
+    
+    Args:
+        model_name (str): HuggingFace model name or path
+        tensor_parallel_size (int, optional): Number of GPUs to use for tensor parallelism
+    """
     # Set environment variable for cached outputs
     os.environ["VLLM_USE_CACHED_OUTPUTS"] = "True"
     
@@ -96,10 +101,27 @@ def initialize_llm(model_name):
     torch.cuda.empty_cache()
     
     print(f"Initializing LLM: {model_name}")
-    llm = LLM(
-        model=model_name,
-        trust_remote_code=True
-    )
+    
+    # Default parameters
+    llm_params = {
+        "model": model_name,
+        "trust_remote_code": True,
+    }
+    
+    # Add tensor parallel size if specified
+    if tensor_parallel_size is not None:
+        llm_params["tensor_parallel_size"] = tensor_parallel_size
+        print(f"Using tensor parallelism with {tensor_parallel_size} GPUs")
+    
+    try:
+        llm = LLM(**llm_params)
+        print(f"Model {model_name} loaded successfully")
+    except Exception as e:
+        print(f"Error loading model {model_name}: {e}")
+        print("Attempting to fallback to TinyLlama model...")
+        llm_params["model"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        llm = LLM(**llm_params)
+        print("Fallback model loaded successfully")
     
     # Define sampling parameters
     sampling_params = SamplingParams(temperature=0.7, top_p=0.95)
@@ -206,8 +228,10 @@ def main():
     parser.add_argument('--no_dedup', action='store_true', help='Skip deduplication step when reordering.')
     
     # LLM configuration
-    parser.add_argument('--model', type=str, default='Qwen/Qwen1.5-7B',
+    parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
                         help='HuggingFace model to use for inference.')
+    parser.add_argument('--tp_size', type=int, default=None,
+                        help='Tensor parallel size (number of GPUs to use).')
     parser.add_argument('--prompt_template', type=str, 
                         default='Analyze whether this movie would be suitable for kids based on {movie_info} and {review_content}.',
                         help='Prompt template for LLM inference.')
@@ -250,7 +274,7 @@ def main():
         print("Skipping reordering as per command line argument")
     
     # Initialize LLM
-    llm, sampling_params = initialize_llm(args.model)
+    llm, sampling_params = initialize_llm(args.model, args.tp_size)
     
     # Process dataset with LLM inference
     print("Running LLM inference on dataset...")
