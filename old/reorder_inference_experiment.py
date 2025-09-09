@@ -87,12 +87,16 @@ def reorder_dataset(df, perform_sort=True, perform_dedup=True, content_column='r
     
     return reordered_df
 
-def initialize_llm(model_name, tensor_parallel_size=None):
+def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None, 
+                max_model_len=None, gpu_memory_utilization=None):
     """Initialize the LLM with vLLM
     
     Args:
-        model_name (str): HuggingFace model name or path
+        model_name (str): HuggingFace model name or local path to model
         tensor_parallel_size (int, optional): Number of GPUs to use for tensor parallelism
+        tokenizer_name (str, optional): Name or path of the tokenizer (useful for local models)
+        max_model_len (int, optional): Maximum model context length
+        gpu_memory_utilization (float, optional): Fraction of GPU memory to use (0.0-1.0)
     """
     # Set environment variable for cached outputs
     os.environ["VLLM_USE_CACHED_OUTPUTS"] = "True"
@@ -100,7 +104,10 @@ def initialize_llm(model_name, tensor_parallel_size=None):
     # Clear GPU memory
     torch.cuda.empty_cache()
     
-    print(f"Initializing LLM: {model_name}")
+    # Check if model_name is a local path
+    is_local = os.path.exists(model_name)
+    model_source = "local path" if is_local else "Hugging Face Hub"
+    print(f"Initializing LLM from {model_source}: {model_name}")
     
     # Default parameters
     llm_params = {
@@ -108,10 +115,22 @@ def initialize_llm(model_name, tensor_parallel_size=None):
         "trust_remote_code": True,
     }
     
-    # Add tensor parallel size if specified
+    # Add optional parameters if provided
     if tensor_parallel_size is not None:
         llm_params["tensor_parallel_size"] = tensor_parallel_size
         print(f"Using tensor parallelism with {tensor_parallel_size} GPUs")
+    
+    if tokenizer_name is not None:
+        llm_params["tokenizer"] = tokenizer_name
+        print(f"Using custom tokenizer: {tokenizer_name}")
+    
+    if max_model_len is not None:
+        llm_params["max_model_len"] = max_model_len
+        print(f"Using custom context length: {max_model_len}")
+    
+    if gpu_memory_utilization is not None:
+        llm_params["gpu_memory_utilization"] = gpu_memory_utilization
+        print(f"Using GPU memory utilization: {gpu_memory_utilization}")
     
     try:
         llm = LLM(**llm_params)
@@ -120,6 +139,9 @@ def initialize_llm(model_name, tensor_parallel_size=None):
         print(f"Error loading model {model_name}: {e}")
         print("Attempting to fallback to TinyLlama model...")
         llm_params["model"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+        # Remove tokenizer param for fallback model if it was set
+        if "tokenizer" in llm_params:
+            del llm_params["tokenizer"]
         llm = LLM(**llm_params)
         print("Fallback model loaded successfully")
     
@@ -259,9 +281,15 @@ def main():
     
     # LLM configuration
     parser.add_argument('--model', type=str, default='TinyLlama/TinyLlama-1.1B-Chat-v1.0',
-                        help='HuggingFace model to use for inference.')
+                        help='HuggingFace model name or path to local model directory.')
     parser.add_argument('--tp_size', type=int, default=None,
                         help='Tensor parallel size (number of GPUs to use).')
+    parser.add_argument('--tokenizer', type=str, default=None,
+                        help='Optional tokenizer name or path (useful for local models).')
+    parser.add_argument('--max_model_len', type=int, default=None,
+                        help='Maximum model context length.')
+    parser.add_argument('--gpu_memory', type=float, default=None,
+                        help='Fraction of GPU memory to use (0.0-1.0).')
     parser.add_argument('--prompt_template', type=str, 
                         default='Analyze the movie review: {review_content}. Is this a positive review?',
                         help='Prompt template for LLM inference.')
@@ -304,7 +332,13 @@ def main():
         print("Skipping reordering as per command line argument")
     
     # Initialize LLM
-    llm, sampling_params = initialize_llm(args.model, args.tp_size)
+    llm, sampling_params = initialize_llm(
+        model_name=args.model, 
+        tensor_parallel_size=args.tp_size,
+        tokenizer_name=args.tokenizer,
+        max_model_len=args.max_model_len,
+        gpu_memory_utilization=args.gpu_memory
+    )
     
     # Process dataset with LLM inference
     print("Running LLM inference on dataset...")
