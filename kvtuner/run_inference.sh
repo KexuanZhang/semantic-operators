@@ -20,7 +20,7 @@ echo "GPUs: $GPU_IDS"
 echo ""
 
 # Build the command
-CMD="python kvtuner_inference_fixed.py --model_path \"$MODEL_PATH\" --dataset \"$DATASET_PATH\" --scheme $SCHEME --gpu_ids \"$GPU_IDS\" --text_column $TEXT_COLUMN"
+CMD="python kvtuner_inference_revised.py --model_path \"$MODEL_PATH\" --dataset \"$DATASET_PATH\" --scheme $SCHEME --gpu_ids \"$GPU_IDS\" --text_column $TEXT_COLUMN --cache_type auto"
 
 # Add max_rows if specified
 if [ -n "$MAX_ROWS" ]; then
