@@ -1,0 +1,3 @@
+[submodule "kvtuner/KVTuner"]
+	path = kvtuner/KVTuner
+	url = https://github.com/cmd2001/KVTuner.git
