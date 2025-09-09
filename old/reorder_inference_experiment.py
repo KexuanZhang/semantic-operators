@@ -139,15 +139,45 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
     start_time = time.time()
     total_tokens = 0
     
+    # Check if required columns exist in the dataset
+    available_columns = df.columns.tolist()
+    used_columns = [col for col in columns_to_include if col in available_columns]
+    
+    if not used_columns:
+        print(f"Warning: None of the specified columns {columns_to_include} found in dataset!")
+        print(f"Available columns are: {available_columns}")
+        print("Using first column as default input")
+        used_columns = [available_columns[0]]
+        
+    print(f"Using columns for inference: {used_columns}")
+    
+    # Check if prompt template is valid with available columns
+    try:
+        # Test formatting with dummy values
+        test_values = {col: f"test_{col}" for col in used_columns}
+        prompt_template.format(**test_values)
+    except KeyError as e:
+        print(f"Error: Prompt template references column {e} which is not available in the dataset")
+        print(f"Available columns: {available_columns}")
+        print("Falling back to a simple template using available columns")
+        # Create a simple fallback template using the first available column
+        prompt_template = f"Analyze this: {{{used_columns[0]}}}"
+        print(f"New template: '{prompt_template}'")
+    
     for index, row in df.iterrows():
         row_data = {}
         
         # Extract values for specified columns
-        input_values = {col: str(row[col]) for col in columns_to_include if col in row}
+        input_values = {col: str(row[col]) for col in used_columns}
         
         # Create prompt using template and row values
-        prompt = prompt_template.format(**input_values)
-        
+        try:
+            prompt = prompt_template.format(**input_values)
+        except KeyError as e:
+            print(f"Error formatting prompt at row {index}: {e}")
+            # Use a simple fallback prompt with the first column
+            prompt = f"Analyze this: {row[used_columns[0]]}"
+            
         # Run inference
         inference_start = time.time()
         response = llm_inference(llm, sampling_params, prompt)
@@ -233,10 +263,10 @@ def main():
     parser.add_argument('--tp_size', type=int, default=None,
                         help='Tensor parallel size (number of GPUs to use).')
     parser.add_argument('--prompt_template', type=str, 
-                        default='Analyze whether this movie would be suitable for kids based on {movie_info} and {review_content}.',
+                        default='Analyze the movie review: {review_content}. Is this a positive review?',
                         help='Prompt template for LLM inference.')
     parser.add_argument('--include_columns', type=str, nargs='+', 
-                        default=['movie_title', 'movie_info', 'review_content'],
+                        default=['review_content', 'critic_name', 'publisher_name', 'review_type'],
                         help='Columns to include in the prompt template.')
     
     # Execution options
