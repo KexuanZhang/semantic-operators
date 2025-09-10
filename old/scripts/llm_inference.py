@@ -22,6 +22,7 @@ import torch
 import datetime
 from vllm import LLM, SamplingParams
 import torch.distributed as dist
+from tqdm import tqdm
 
 def setup_directories(timestamp):
     """Create result directory with timestamp"""
@@ -48,15 +49,12 @@ def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None,
     # Set specific GPU devices if specified
     if gpu_ids:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
-        print(f"Using specific GPU IDs: {gpu_ids}")
     
     # Clear GPU memory
     torch.cuda.empty_cache()
     
     # Check if model_name is a local path
     is_local = os.path.exists(model_name)
-    model_source = "local path" if is_local else "Hugging Face Hub"
-    print(f"Initializing LLM from {model_source}: {model_name}")
     
     # Default parameters
     llm_params = {
@@ -67,32 +65,25 @@ def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None,
     # Add optional parameters if provided
     if tensor_parallel_size is not None:
         llm_params["tensor_parallel_size"] = tensor_parallel_size
-        print(f"Using tensor parallelism with {tensor_parallel_size} GPUs")
     
     if tokenizer_name is not None:
         llm_params["tokenizer"] = tokenizer_name
-        print(f"Using custom tokenizer: {tokenizer_name}")
     
     if max_model_len is not None:
         llm_params["max_model_len"] = max_model_len
-        print(f"Using custom context length: {max_model_len}")
     
     if gpu_memory_utilization is not None:
         llm_params["gpu_memory_utilization"] = gpu_memory_utilization
-        print(f"Using GPU memory utilization: {gpu_memory_utilization}")
     
     try:
         llm = LLM(**llm_params)
-        print(f"Model {model_name} loaded successfully")
     except Exception as e:
-        print(f"Error loading model {model_name}: {e}")
-        print("Attempting to fallback to TinyLlama model...")
+        # Fallback to TinyLlama model
         llm_params["model"] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
         # Remove tokenizer param for fallback model if it was set
         if "tokenizer" in llm_params:
             del llm_params["tokenizer"]
         llm = LLM(**llm_params)
-        print("Fallback model loaded successfully")
     
     # Define sampling parameters based on model type
     if model_name:
@@ -119,8 +110,6 @@ def initialize_llm(model_name, tensor_parallel_size=None, tokenizer_name=None,
             top_p=0.9,
             max_tokens=150
         )
-    
-    print(f"Initialized sampling parameters: temp={sampling_params.temperature}, top_p={sampling_params.top_p}, max_tokens={sampling_params.max_tokens}")
     
     return llm, sampling_params
 
@@ -177,14 +166,10 @@ def llm_inference(llm, sampling_params, prompt, model_name=None):
         else:
             formatted_prompt = f"### Instruction:\n{prompt}\n\n### Response:\n"
             
-        print(f"Using prompt format for model type: {model_name_lower}")
+        # Using prompt format for model type silently
     else:
         # Fallback to direct prompt with explicit instruction
         formatted_prompt = f"Answer the following question directly and concisely: {prompt}\n"
-        print("Using default prompt format (no model specified)")
-        
-    # Print the first part of the prompt (for debugging)
-    print(f"Formatted prompt preview: {formatted_prompt[:50]}...")
     
     # Adjust sampling params for better, more controlled outputs
     adjusted_params = SamplingParams(
@@ -197,20 +182,14 @@ def llm_inference(llm, sampling_params, prompt, model_name=None):
     # Generate the response
     try:
         # Use the adjusted parameters instead of the passed sampling_params
-        print(f"\n----- INFERENCE REQUEST -----")
-        print(f"Model: {model_name if model_name else 'Unknown'}")
-        print(f"Prompt length: {len(formatted_prompt)} chars")
-        print(f"Prompt preview: {formatted_prompt[:100]}...\n")
         
         # Run the actual inference
         output = llm.generate(formatted_prompt, adjusted_params)
         
         if not output or len(output) == 0 or len(output[0].outputs) == 0:
-            print("ERROR: Model returned empty output")
             return "Error: Model returned empty output. Please try again with different parameters."
         
         response = output[0].outputs[0].text
-        print(f"----- RAW RESPONSE -----\n{response[:100]}...\n")
         
         # Clean up response based on model type
         if model_name:
@@ -245,18 +224,12 @@ def llm_inference(llm, sampling_params, prompt, model_name=None):
             
             # Check for empty response after cleaning
             if not response or response.isspace():
-                print("WARNING: Response was empty after cleaning")
                 return "Error: Model returned an empty response after formatting."
         
-        print(f"----- CLEANED RESPONSE -----\n{response[:100]}...\n")
         return response.strip()
     except Exception as e:
-        error_msg = f"Error during inference: {e}"
-        print(error_msg)
-        
         # Attempt to recover with a simpler prompt if there was an error
         try:
-            print("Attempting recovery with simpler prompt...")
             simple_prompt = f"Answer briefly: {prompt}"
             simple_output = llm.generate(simple_prompt, adjusted_params)
             if len(simple_output) > 0 and len(simple_output[0].outputs) > 0:
@@ -277,12 +250,7 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
     used_columns = [col for col in columns_to_include if col in available_columns]
     
     if not used_columns:
-        print(f"Warning: None of the specified columns {columns_to_include} found in dataset!")
-        print(f"Available columns are: {available_columns}")
-        print("Using first column as default input")
         used_columns = [available_columns[0]]
-        
-    print(f"Using columns for inference: {used_columns}")
     
     # Check if prompt template is valid with available columns
     try:
@@ -290,50 +258,50 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
         test_values = {col: f"test_{col}" for col in used_columns}
         prompt_template.format(**test_values)
     except KeyError as e:
-        print(f"Error: Prompt template references column {e} which is not available in the dataset")
-        print(f"Available columns: {available_columns}")
-        print("Falling back to a simple template using available columns")
         # Create a simple fallback template using the first available column
         prompt_template = f"Analyze this: {{{used_columns[0]}}}"
-        print(f"New template: '{prompt_template}'")
     
-    for index, row in df.iterrows():
-        row_data = {}
-        
-        # Extract values for specified columns
-        input_values = {col: str(row[col]) for col in used_columns}
-        
-        # Create prompt using template and row values
-        try:
-            prompt = prompt_template.format(**input_values)
-        except KeyError as e:
-            print(f"Error formatting prompt at row {index}: {e}")
-            # Use a simple fallback prompt with the first column
-            prompt = f"Analyze this: {row[used_columns[0]]}"
+    # Add progress bar for inference
+    with tqdm(total=len(df), desc="Running inference", unit="rows") as pbar:
+        for index, row in df.iterrows():
+            row_data = {}
             
-        # Run inference
-        inference_start = time.time()
-        # Pass the model_name parameter rather than using args.model directly
-        response = llm_inference(llm, sampling_params, prompt, model_name)
-        inference_end = time.time()
-        
-        # Calculate tokens (approximate)
-        prompt_tokens = len(prompt.split())
-        response_tokens = len(response.split())
-        total_tokens += prompt_tokens + response_tokens
-        
-        # Store results
-        row_data.update(input_values)
-        row_data["llm_response"] = response.strip()
-        row_data["inference_time"] = inference_end - inference_start
-        row_data["prompt_tokens"] = prompt_tokens
-        row_data["response_tokens"] = response_tokens
-        
-        results.append(row_data)
-        
-        # Print progress every 10 rows
-        if index % 10 == 0:
-            print(f"Processed {index} rows. Latest inference time: {row_data['inference_time']:.2f}s")
+            # Extract values for specified columns
+            input_values = {col: str(row[col]) for col in used_columns}
+            
+            # Create prompt using template and row values
+            try:
+                prompt = prompt_template.format(**input_values)
+            except KeyError as e:
+                # Use a simple fallback prompt with the first column
+                prompt = f"Analyze this: {row[used_columns[0]]}"
+                
+            # Run inference
+            inference_start = time.time()
+            # Pass the model_name parameter rather than using args.model directly
+            response = llm_inference(llm, sampling_params, prompt, model_name)
+            inference_end = time.time()
+            
+            # Calculate tokens (approximate)
+            prompt_tokens = len(prompt.split())
+            response_tokens = len(response.split())
+            total_tokens += prompt_tokens + response_tokens
+            
+            # Store results
+            row_data.update(input_values)
+            row_data["llm_response"] = response.strip()
+            row_data["inference_time"] = inference_end - inference_start
+            row_data["prompt_tokens"] = prompt_tokens
+            row_data["response_tokens"] = response_tokens
+            
+            results.append(row_data)
+            
+            # Update progress bar
+            pbar.update(1)
+            pbar.set_postfix({
+                'Time/row': f'{row_data["inference_time"]:.2f}s',
+                'Tokens': f'{prompt_tokens + response_tokens}'
+            })
     
     end_time = time.time()
     
@@ -372,7 +340,7 @@ def save_results(results, stats, dataset, result_dir, filename_prefix):
         f.write(f"Total Tokens Processed: {stats['total_tokens']}\n")
         f.write(f"Average Tokens per Row: {stats['avg_tokens_per_row']:.2f}\n")
         
-    print(f"Results saved to {result_dir}")
+    # Results saved silently
 
 def main():
     parser = argparse.ArgumentParser(description='Run LLM inference on a dataset.')
@@ -415,7 +383,6 @@ def main():
     start_time = time.time()
     
     # Load dataset
-    print(f"Loading dataset from {args.dataset}")
     dataset = pd.read_csv(args.dataset)
     
     # Get dataset filename without extension for output naming
@@ -426,7 +393,6 @@ def main():
     # Apply max rows limit if specified
     if args.max_rows is not None:
         dataset = dataset.head(args.max_rows)
-        print(f"Limited dataset to {args.max_rows} rows")
     
     # If no columns specified, use all columns
     if args.include_columns is None:
@@ -435,10 +401,8 @@ def main():
                           ['content', 'text', 'review', 'description', 'comment', 'body'])]
         if content_columns:
             args.include_columns = content_columns
-            print(f"Auto-detected content columns: {content_columns}")
         else:
             args.include_columns = dataset.columns.tolist()
-            print(f"Using all columns for inference")
     
     # Initialize LLM
     llm, sampling_params = initialize_llm(
@@ -451,7 +415,6 @@ def main():
     )
     
     # Process dataset with LLM inference
-    print("Running LLM inference on dataset...")
     results, stats = process_dataset(
         dataset,
         llm,
@@ -466,8 +429,6 @@ def main():
     total_time = end_time - start_time
     stats["total_experiment_time"] = total_time
     
-    print(f"Total experiment time: {total_time:.2f} seconds")
-    
     # Save results
     save_results(results, stats, dataset, result_dir, filename_prefix)
     
@@ -475,7 +436,8 @@ def main():
     if dist.is_initialized():
         dist.destroy_process_group()
     
-    print(f"All results saved to directory: {result_dir}")
+    # Print only the final results directory
+    print(f"Results saved to: {result_dir}")
 
 if __name__ == "__main__":
     main()
