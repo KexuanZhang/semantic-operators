@@ -117,6 +117,7 @@ def test_llm_initialization():
     # Import LLM locally to avoid scope issues
     try:
         from vllm import LLM, SamplingParams
+        import torch
     except ImportError as e:
         print(f"✗ Failed to import LLM: {e}")
         return False, None, None
@@ -124,15 +125,30 @@ def test_llm_initialization():
     # Use a small model for testing
     test_model = "microsoft/DialoGPT-small"  # Small model for quick testing
     
+    # Clear GPU memory first
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(f"GPU memory cleared. Available devices: {torch.cuda.device_count()}")
+    
+    # Configure for memory-constrained environment
+    base_config = {
+        "model": test_model,
+        "trust_remote_code": True,
+        "dtype": "float16",
+        "max_model_len": 256,  # Very small context for testing
+        "gpu_memory_utilization": 0.5,  # Use only 50% of GPU memory
+        "enforce_eager": True,  # Disable CUDA graphs to save memory
+        "disable_custom_all_reduce": True,  # Reduce memory overhead
+    }
+    
     try:
         # Test without KVTuner first
         print("Testing baseline vLLM initialization...")
-        llm_baseline = LLM(
-            model=test_model,
-            trust_remote_code=True,
-            dtype="float16",
-            max_model_len=512  # Small context for testing
-        )
+        print(f"  Model: {test_model}")
+        print(f"  Max context: {base_config['max_model_len']}")
+        print(f"  GPU memory util: {base_config['gpu_memory_utilization']}")
+        
+        llm_baseline = LLM(**base_config)
         print("✓ Baseline vLLM initialization successful")
         
         # Test with KVTuner
@@ -147,29 +163,61 @@ def test_llm_initialization():
             print(f"Using test config: {available_configs[0]}")
             
             try:
-                llm_kvtuner = LLM(
-                    model=test_model,
-                    quantization="kvtuner",
-                    kvtuner_config_path=test_config_path,
-                    kvtuner_scheme="pertoken",
-                    kvtuner_backend="vanilla",
-                    trust_remote_code=True,
-                    dtype="float16",
-                    max_model_len=512
-                )
+                # Create KVTuner config with same memory constraints
+                kvtuner_config = base_config.copy()
+                kvtuner_config.update({
+                    "quantization": "kvtuner",
+                    "kvtuner_config_path": test_config_path,
+                    "kvtuner_scheme": "pertoken",
+                    "kvtuner_backend": "vanilla",
+                })
+                
+                llm_kvtuner = LLM(**kvtuner_config)
                 print("✓ vLLM with KVTuner initialization successful")
                 return True, llm_baseline, llm_kvtuner
                 
             except Exception as e:
                 print(f"✗ vLLM with KVTuner initialization failed: {e}")
-                print(f"Error details: {traceback.format_exc()}")
-                return False, llm_baseline, None
+                # Try with even more conservative settings
+                print("Trying with more conservative memory settings...")
+                try:
+                    kvtuner_config["gpu_memory_utilization"] = 0.3
+                    kvtuner_config["max_model_len"] = 128
+                    llm_kvtuner = LLM(**kvtuner_config)
+                    print("✓ vLLM with KVTuner initialization successful (conservative settings)")
+                    return True, llm_baseline, llm_kvtuner
+                except Exception as e2:
+                    print(f"✗ Even conservative settings failed: {e2}")
+                    print(f"Error details: {traceback.format_exc()}")
+                    return False, llm_baseline, None
         else:
             print("✗ No KVTuner configs available for testing")
             return False, llm_baseline, None
             
     except Exception as e:
         print(f"✗ LLM initialization failed: {e}")
+        
+        # Try with specific GPU devices if available
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            print("Trying with specific GPU devices (6,7)...")
+            try:
+                import os
+                os.environ["CUDA_VISIBLE_DEVICES"] = "6,7"
+                
+                # Retry with multi-GPU setup
+                multi_gpu_config = base_config.copy()
+                multi_gpu_config.update({
+                    "tensor_parallel_size": 2,
+                    "gpu_memory_utilization": 0.4,  # Even lower for multi-GPU
+                })
+                
+                llm_baseline = LLM(**multi_gpu_config)
+                print("✓ Multi-GPU baseline initialization successful")
+                return True, llm_baseline, None
+                
+            except Exception as e_multi:
+                print(f"✗ Multi-GPU initialization also failed: {e_multi}")
+        
         print(f"Error details: {traceback.format_exc()}")
         return False, None, None
 

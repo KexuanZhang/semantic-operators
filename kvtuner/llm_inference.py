@@ -154,7 +154,9 @@ def initialize_llm_vllm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=
         "model": model_name,
         "tensor_parallel_size": 1,  # Single GPU by default
         "trust_remote_code": True,
-        "dtype": "float16"
+        "dtype": "float16",
+        "gpu_memory_utilization": 0.75,  # Use 75% of GPU memory to avoid OOM
+        "enforce_eager": True  # Disable CUDA graphs to save memory
     }
     
     # Add KVTuner configuration if available
