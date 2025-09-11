@@ -262,7 +262,8 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
         prompt_template = f"Analyze this: {{{used_columns[0]}}}"
     
     # Add progress bar for inference
-    with tqdm(total=len(df), desc="Running inference", unit="rows") as pbar:
+    with tqdm(total=len(df), desc="Processing queries", unit="queries", 
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
         for index, row in df.iterrows():
             row_data = {}
             
@@ -278,7 +279,6 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
                 
             # Run inference
             inference_start = time.time()
-            # Pass the model_name parameter rather than using args.model directly
             response = llm_inference(llm, sampling_params, prompt, model_name)
             inference_end = time.time()
             
@@ -296,12 +296,8 @@ def process_dataset(df, llm, sampling_params, prompt_template, columns_to_includ
             
             results.append(row_data)
             
-            # Update progress bar
+            # Update progress bar with minimal info
             pbar.update(1)
-            pbar.set_postfix({
-                'Time/row': f'{row_data["inference_time"]:.2f}s',
-                'Tokens': f'{prompt_tokens + response_tokens}'
-            })
     
     end_time = time.time()
     
@@ -339,8 +335,6 @@ def save_results(results, stats, dataset, result_dir, filename_prefix):
         f.write(f"Average Time per Row: {stats['avg_time_per_row']:.4f} seconds\n")
         f.write(f"Total Tokens Processed: {stats['total_tokens']}\n")
         f.write(f"Average Tokens per Row: {stats['avg_tokens_per_row']:.2f}\n")
-        
-    # Results saved silently
 
 def main():
     parser = argparse.ArgumentParser(description='Run LLM inference on a dataset.')
