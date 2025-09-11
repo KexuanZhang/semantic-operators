@@ -443,7 +443,7 @@ def main():
                         choices=['pertoken', 'kivi'],
                         help='KVTuner quantization scheme (default: pertoken).')
     parser.add_argument('--kvtuner_dir', type=str, 
-                        default='/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner',
+                        default='/home/data/so2/KVTuner',
                         help='Path to KVTuner directory.')
     
     # Inference configuration
