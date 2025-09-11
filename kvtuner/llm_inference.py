@@ -25,7 +25,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 # Add KVTuner to Python path
-kvtuner_path = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner"
+kvtuner_path = "/home/data/so2/KVTuner"
 sys.path.insert(0, kvtuner_path)
 
 try:
