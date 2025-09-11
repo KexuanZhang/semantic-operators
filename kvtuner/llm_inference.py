@@ -24,16 +24,32 @@ import yaml
 from tqdm import tqdm
 from pathlib import Path
 
-# Add KVTuner to Python path
+# Add paths for vLLM and KVTuner
+vllm_path = "/home/data/so2/vllm"
 kvtuner_path = "/home/data/so2/KVTuner"
+semantic_operators_path = "/home/data/so2/semantic-operators"
+sys.path.insert(0, vllm_path)
 sys.path.insert(0, kvtuner_path)
 
 try:
-    from flexible_quant.flexible_quantized_cache import FlexibleQuantizedCacheConfig, FlexibleVanillaQuantizedCache
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    # Import vLLM components
+    from vllm import LLM, SamplingParams
+    print("vLLM imported successfully")
+    
+    # Test if KVTuner quantization is properly registered
+    try:
+        from vllm.model_executor.layers.quantization import QuantizationMethods
+        if hasattr(QuantizationMethods, '__args__') and "kvtuner" in QuantizationMethods.__args__:
+            print("KVTuner quantization method registered successfully")
+        else:
+            print("Warning: KVTuner quantization method not found in vLLM")
+    except Exception as e:
+        print(f"Warning: Could not verify KVTuner registration: {e}")
+    
 except ImportError as e:
     print(f"Error importing required modules: {e}")
-    print("Please make sure KVTuner is properly installed and accessible")
+    print("Please make sure vLLM is properly installed and accessible")
+    print("vLLM path:", vllm_path)
     sys.exit(1)
 
 def setup_directories(timestamp):
@@ -83,43 +99,9 @@ def load_kvtuner_config(model_name, scheme, kvtuner_dir):
     print(f"Searched for: {config_filename}")
     return None
 
-def create_kvtuner_cache(model_name, scheme, kvtuner_dir):
-    """Create KVTuner quantized cache"""
-    
-    # Load configuration
-    per_layer_config = load_kvtuner_config(model_name, scheme, kvtuner_dir)
-    
-    # Set axis configuration based on scheme
-    if scheme == "kivi":
-        axis_key = 1  # Per-channel for keys in KiVi
-        axis_value = 0  # Per-token for values in KiVi
-        q_group_size = 32
-        residual_length = 32
-    else:  # pertoken
-        axis_key = 0  # Per-token for keys
-        axis_value = 0  # Per-token for values
-        q_group_size = -1
-        residual_length = 0
-    
-    # Create cache configuration
-    cache_config = FlexibleQuantizedCacheConfig(
-        device="cuda",
-        per_layer_quant=per_layer_config is not None,
-        per_layer_config=per_layer_config,
-        asym=True,
-        axis_key=axis_key,
-        axis_value=axis_value,
-        q_group_size=q_group_size,
-        residual_length=residual_length,
-        compute_dtype=torch.float16
-    )
-    
-    # Create and return the KV cache
-    return FlexibleVanillaQuantizedCache(cache_config=cache_config)
-
-def initialize_llm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=None, 
-                   max_model_len=None, gpu_ids=None):
-    """Initialize the LLM with KVTuner quantized cache
+def initialize_llm_vllm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=None, 
+                        max_model_len=None, gpu_ids=None):
+    """Initialize the LLM using vLLM with KVTuner quantization
     
     Args:
         model_name (str): HuggingFace model name or local path to model
@@ -132,36 +114,94 @@ def initialize_llm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=None,
     # Set specific GPU devices if specified
     if gpu_ids:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
+        print(f"Using GPU devices: {gpu_ids}")
     
-    # Clear GPU memory
-    torch.cuda.empty_cache()
+    # Clear GPU memory if torch is available
+    try:
+        torch.cuda.empty_cache()
+        print("GPU memory cleared")
+    except Exception as e:
+        print(f"Could not clear GPU memory: {e}")
     
-    print(f"Loading model: {model_name}")
+    print(f"Loading model with vLLM: {model_name}")
     print(f"KVTuner scheme: {kvtuner_scheme}")
     
-    # Load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map="auto",
-        trust_remote_code=True
-    )
+    # Get KVTuner config path
+    model_basename = get_model_basename(model_name)
+    config_filename = f"{model_basename}_{kvtuner_scheme}_KVTuner4_0.yaml"
+    kvtuner_config_path = os.path.join(kvtuner_dir, "calibration_presets", config_filename)
     
-    # Load tokenizer
-    tokenizer_path = tokenizer_name if tokenizer_name else model_name
-    tokenizer = AutoTokenizer.from_pretrained(
-        tokenizer_path,
-        use_fast=False,
-        trust_remote_code=True
-    )
+    # Check if config exists, try alternatives if not
+    if not os.path.exists(kvtuner_config_path):
+        alternative_names = [
+            f"{model_basename}_{kvtuner_scheme}_KVTuner6_0.yaml",
+            f"{model_basename}_{kvtuner_scheme}_KVTuner4_1.yaml",
+            f"{model_basename}_{kvtuner_scheme}_KVTuner6_1.yaml"
+        ]
+        
+        for alt_name in alternative_names:
+            alt_path = os.path.join(kvtuner_dir, "calibration_presets", alt_name)
+            if os.path.exists(alt_path):
+                kvtuner_config_path = alt_path
+                break
+        else:
+            print(f"Warning: No KVTuner config found for {model_basename} with {kvtuner_scheme} scheme")
+            print(f"Searched for: {config_filename}")
+            kvtuner_config_path = None
     
-    # Add pad token if not present
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Initialize vLLM with KVTuner quantization
+    llm_kwargs = {
+        "model": model_name,
+        "tensor_parallel_size": 1,  # Single GPU by default
+        "trust_remote_code": True,
+        "dtype": "float16"
+    }
     
-    print("Model and tokenizer loaded successfully")
+    # Add KVTuner configuration if available
+    if kvtuner_config_path:
+        print(f"Using KVTuner config: {kvtuner_config_path}")
+        llm_kwargs.update({
+            "quantization": "kvtuner",
+            "kvtuner_config_path": kvtuner_config_path,
+            "kvtuner_scheme": kvtuner_scheme,
+            "kvtuner_backend": "vanilla"
+        })
+    else:
+        print("No KVTuner config found, using default vLLM settings")
     
-    return model, tokenizer
+    # Add optional parameters
+    if max_model_len:
+        llm_kwargs["max_model_len"] = max_model_len
+    
+    if tokenizer_name:
+        llm_kwargs["tokenizer"] = tokenizer_name
+    
+    # Set tensor parallel size based on GPU count
+    if gpu_ids:
+        gpu_count = len(gpu_ids.split(','))
+        if gpu_count > 1:
+            llm_kwargs["tensor_parallel_size"] = gpu_count
+            print(f"Using tensor parallelism with {gpu_count} GPUs")
+    
+    try:
+        # Create LLM instance
+        llm = LLM(**llm_kwargs)
+        print("vLLM model loaded successfully")
+        
+        # Print model info
+        print(f"Model configuration:")
+        for key, value in llm_kwargs.items():
+            if key != "model":  # Already printed above
+                print(f"  {key}: {value}")
+                
+        return llm
+        
+    except Exception as e:
+        print(f"Error initializing vLLM model: {e}")
+        print("Model kwargs:")
+        for key, value in llm_kwargs.items():
+            print(f"  {key}: {value}")
+        raise
 
 def format_prompt_by_model(model_name, text):
     """Format prompt based on model type"""
@@ -244,45 +284,43 @@ def clean_response_by_model(model_name, response):
     
     return response.strip()
 
-def llm_inference_kvtuner(model, tokenizer, kv_cache, prompt, model_name=None, max_new_tokens=200):
-    """Run inference with KVTuner quantized cache"""
+def llm_inference_vllm(llm, prompt, model_name=None, max_new_tokens=200):
+    """Run inference with vLLM and KVTuner quantization"""
     
-    # Format prompt based on model type
-    formatted_prompt = format_prompt_by_model(model_name, prompt)
-    
-    # Tokenize input
-    inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model.device)
-    
-    # Generate response
-    with torch.no_grad():
-        outputs = model.generate(
-            inputs.input_ids,
-            past_key_values=kv_cache,
-            use_cache=True,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,  # Deterministic generation
+    try:
+        # Format prompt based on model type
+        formatted_prompt = format_prompt_by_model(model_name, prompt)
+        
+        # Create sampling parameters
+        sampling_params = SamplingParams(
             temperature=0.1,
             top_p=0.9,
-            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id
+            max_tokens=max_new_tokens,
+            skip_special_tokens=True
         )
-    
-    # Extract generated text (skip prompt)
-    generated_text = tokenizer.decode(
-        outputs[0][inputs.input_ids.shape[1]:], 
-        skip_special_tokens=True
-    )
-    
-    # Clean response based on model type
-    cleaned_response = clean_response_by_model(model_name, generated_text)
-    
-    # Calculate token counts
-    prompt_tokens = inputs.input_ids.shape[1]
-    response_tokens = outputs.shape[1] - inputs.input_ids.shape[1]
-    
-    return cleaned_response, prompt_tokens, response_tokens
+        
+        # Generate response using vLLM
+        outputs = llm.generate([formatted_prompt], sampling_params)
+        
+        # Extract response
+        output = outputs[0]
+        generated_text = output.outputs[0].text
+        
+        # Clean response based on model type
+        cleaned_response = clean_response_by_model(model_name, generated_text)
+        
+        # Calculate token counts (approximate from vLLM output)
+        prompt_tokens = len(output.prompt_token_ids) if hasattr(output, 'prompt_token_ids') else 0
+        response_tokens = len(output.outputs[0].token_ids) if hasattr(output.outputs[0], 'token_ids') else len(generated_text.split())
+        
+        return cleaned_response, prompt_tokens, response_tokens
+        
+    except Exception as e:
+        print(f"Error during inference: {e}")
+        print(f"Prompt (first 100 chars): {prompt[:100]}...")
+        return f"Error: {str(e)}", 0, 0
 
-def process_dataset(df, model, tokenizer, kvtuner_scheme, kvtuner_dir, prompt_template, 
+def process_dataset(df, llm, kvtuner_scheme, kvtuner_dir, prompt_template, 
                    columns_to_include, model_name=None, max_new_tokens=200):
     """Process each row in the dataset with KVTuner inference"""
     results = []
@@ -316,9 +354,6 @@ def process_dataset(df, model, tokenizer, kvtuner_scheme, kvtuner_dir, prompt_te
               bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
         
         for index, row in df.iterrows():
-            # Create a fresh KV cache for each row to avoid cross-contamination
-            kv_cache = create_kvtuner_cache(model_name, kvtuner_scheme, kvtuner_dir)
-            
             row_data = {}
             
             # Extract values for specified columns
@@ -334,8 +369,8 @@ def process_dataset(df, model, tokenizer, kvtuner_scheme, kvtuner_dir, prompt_te
             # Run inference with timing
             inference_start = time.time()
             try:
-                response, prompt_tokens, response_tokens = llm_inference_kvtuner(
-                    model, tokenizer, kv_cache, prompt, model_name, max_new_tokens
+                response, prompt_tokens, response_tokens = llm_inference_vllm(
+                    llm, prompt, model_name, max_new_tokens
                 )
             except Exception as e:
                 print(f"Error processing row {index}: {str(e)}")
@@ -507,7 +542,7 @@ def main():
             print(f"Using first column as text input: {dataset.columns[0]}")
     
     # Initialize LLM with KVTuner
-    model, tokenizer = initialize_llm(
+    llm = initialize_llm_vllm(
         model_name=args.model,
         kvtuner_scheme=args.kvtuner_scheme,
         kvtuner_dir=args.kvtuner_dir,
@@ -519,8 +554,7 @@ def main():
     # Process dataset with KVTuner inference
     results, stats = process_dataset(
         dataset,
-        model,
-        tokenizer,
+        llm,
         args.kvtuner_scheme,
         args.kvtuner_dir,
         args.prompt_template,
