@@ -171,9 +171,6 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         "gpu_memory_utilization": gpu_memory_utilization,  # Configurable memory usage
         "enforce_eager": True,  # Disable CUDA graphs to save memory
         "disable_log_stats": True,  # Disable internal logging/stats
-        "disable_log_requests": True,  # Disable request logging
-        "disable_sliding_window": True,  # Additional verbose output suppression
-        "disable_frontend_multiprocessing": True,  # Reduce multiprocessing overhead
     }
     
     # Configure cache mode
