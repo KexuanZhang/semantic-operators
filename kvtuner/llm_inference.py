@@ -56,9 +56,9 @@ tqdm.tqdm.__enter__ = lambda self: self
 tqdm.tqdm.__exit__ = lambda self, *args, **kwargs: None
 
 # Add paths for vLLM and KVTuner
-vllm_path = "/home/data/so2/vllm"
-kvtuner_path = "/home/data/so2/KVTuner"
-semantic_operators_path = "/home/data/so2/semantic-operators"
+vllm_path = "/Users/zhang/Desktop/huawei/untitled folder 6/vllm"
+kvtuner_path = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner"
+semantic_operators_path = "/Users/zhang/Desktop/huawei/untitled folder 6/semantic-operators"
 sys.path.insert(0, vllm_path)
 sys.path.insert(0, kvtuner_path)
 
@@ -256,11 +256,13 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
             print("\n" + "="*60)
             print("KVTUNER INTEGRATION ERROR DETECTED")
             print("="*60)
-            print("This error indicates the KVTuner integration in vLLM needs a fix.")
-            print("The get_config_filenames() method should be a @classmethod.")
-            print("\nTo fix this:")
-            print("1. Update vLLM to the latest kvt branch")
-            print("2. Or use --cache_mode basic to bypass KVTuner")
+            print("This error indicates the KVTuner integration in vLLM has a method signature issue.")
+            print("The get_config_filenames() method signature is inconsistent between base and implementation.")
+            print("\nThis issue should be fixed in the current vLLM installation.")
+            print("If you're seeing this error, the fix may not have been applied correctly.")
+            print("\nTo work around this:")
+            print("1. Use --cache_mode basic to bypass KVTuner")
+            print("2. Or verify the vLLM quantization configs are properly fixed")
             print("="*60)
             
             if cache_mode == 'kvtuner':
@@ -591,7 +593,7 @@ def main():
                         choices=['pertoken', 'kivi'],
                         help='KVTuner quantization scheme (default: pertoken). Only used with --cache_mode kvtuner.')
     parser.add_argument('--kvtuner_dir', type=str, 
-                        default='/home/data/so2/KVTuner',
+                        default='/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner',
                         help='Path to KVTuner directory. Only used with --cache_mode kvtuner.')
     
     # Inference configuration
