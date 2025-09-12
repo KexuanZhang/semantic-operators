@@ -1,15 +1,26 @@
 #!/usr/bin/env python3
 """
-LLM Inference Script with KVTuner Integration
+LLM Inference Script with Dual Cache Support
 
-This script runs LLM inference on a dataset with KVTuner quantization:
+This script runs LLM inference on a dataset with configurable cache modes:
 1. Loads a dataset from a CSV file
-2. Initializes an LLM model with KVTuner quantized cache
+2. Initializes an LLM model with either KVTuner quantized cache or basic vLLM cache
 3. Runs inference on each row using a specified prompt template
 4. Saves the results and statistics
 
+Cache Modes:
+- kvtuner: Uses KVTuner's mixed precision quantized cache for memory efficiency
+- basic: Uses vLLM's default cache implementation
+
 Usage:
-    python llm_inference.py --dataset path/to/dataset.csv --model model_name --kvtuner_scheme pertoken [--gpu_ids "0,1"]
+    # With KVTuner quantized cache (default)
+    python llm_inference.py --dataset path/to/dataset.csv --model model_name --cache_mode kvtuner --kvtuner_scheme pertoken
+    
+    # With basic vLLM cache
+    python llm_inference.py --dataset path/to/dataset.csv --model model_name --cache_mode basic
+    
+    # With custom GPU memory settings
+    python llm_inference.py --dataset path/to/dataset.csv --model model_name --gpu_memory_utilization 0.6 --gpu_ids "0,1"
 """
 
 import os
@@ -99,17 +110,20 @@ def load_kvtuner_config(model_name, scheme, kvtuner_dir):
     print(f"Searched for: {config_filename}")
     return None
 
-def initialize_llm_vllm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=None, 
-                        max_model_len=None, gpu_ids=None):
-    """Initialize the LLM using vLLM with KVTuner quantization
+def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertoken', 
+                        kvtuner_dir=None, tokenizer_name=None, max_model_len=None, 
+                        gpu_ids=None, gpu_memory_utilization=0.75):
+    """Initialize the LLM using vLLM with configurable cache mode
     
     Args:
         model_name (str): HuggingFace model name or local path to model
+        cache_mode (str): Cache mode - 'kvtuner' for quantized cache, 'basic' for default vLLM cache
         kvtuner_scheme (str): KVTuner quantization scheme ('pertoken' or 'kivi')
-        kvtuner_dir (str): Path to KVTuner directory
+        kvtuner_dir (str): Path to KVTuner directory (required for kvtuner mode)
         tokenizer_name (str, optional): Name or path of the tokenizer
         max_model_len (int, optional): Maximum model context length
         gpu_ids (str, optional): Comma-separated GPU IDs to use
+        gpu_memory_utilization (float): Fraction of GPU memory to use (0.1 to 1.0)
     """
     # Set specific GPU devices if specified
     if gpu_ids:
@@ -124,52 +138,65 @@ def initialize_llm_vllm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=
         print(f"Could not clear GPU memory: {e}")
     
     print(f"Loading model with vLLM: {model_name}")
-    print(f"KVTuner scheme: {kvtuner_scheme}")
+    print(f"Cache mode: {cache_mode}")
+    if cache_mode == 'kvtuner':
+        print(f"KVTuner scheme: {kvtuner_scheme}")
     
-    # Get KVTuner config path
-    model_basename = get_model_basename(model_name)
-    config_filename = f"{model_basename}_{kvtuner_scheme}_KVTuner4_0.yaml"
-    kvtuner_config_path = os.path.join(kvtuner_dir, "calibration_presets", config_filename)
-    
-    # Check if config exists, try alternatives if not
-    if not os.path.exists(kvtuner_config_path):
-        alternative_names = [
-            f"{model_basename}_{kvtuner_scheme}_KVTuner6_0.yaml",
-            f"{model_basename}_{kvtuner_scheme}_KVTuner4_1.yaml",
-            f"{model_basename}_{kvtuner_scheme}_KVTuner6_1.yaml"
-        ]
-        
-        for alt_name in alternative_names:
-            alt_path = os.path.join(kvtuner_dir, "calibration_presets", alt_name)
-            if os.path.exists(alt_path):
-                kvtuner_config_path = alt_path
-                break
-        else:
-            print(f"Warning: No KVTuner config found for {model_basename} with {kvtuner_scheme} scheme")
-            print(f"Searched for: {config_filename}")
-            kvtuner_config_path = None
-    
-    # Initialize vLLM with KVTuner quantization
+    # Initialize vLLM with base configuration
     llm_kwargs = {
         "model": model_name,
         "tensor_parallel_size": 1,  # Single GPU by default
         "trust_remote_code": True,
         "dtype": "float16",
-        "gpu_memory_utilization": 0.75,  # Use 75% of GPU memory to avoid OOM
+        "gpu_memory_utilization": gpu_memory_utilization,  # Configurable memory usage
         "enforce_eager": True  # Disable CUDA graphs to save memory
     }
     
-    # Add KVTuner configuration if available
-    if kvtuner_config_path:
-        print(f"Using KVTuner config: {kvtuner_config_path}")
-        llm_kwargs.update({
-            "quantization": "kvtuner",
-            "kvtuner_config_path": kvtuner_config_path,
-            "kvtuner_scheme": kvtuner_scheme,
-            "kvtuner_backend": "vanilla"
-        })
-    else:
-        print("No KVTuner config found, using default vLLM settings")
+    # Configure cache mode
+    if cache_mode == 'kvtuner':
+        if not kvtuner_dir:
+            raise ValueError("kvtuner_dir is required when using cache_mode='kvtuner'")
+            
+        # Get KVTuner config path
+        model_basename = get_model_basename(model_name)
+        config_filename = f"{model_basename}_{kvtuner_scheme}_KVTuner4_0.yaml"
+        kvtuner_config_path = os.path.join(kvtuner_dir, "calibration_presets", config_filename)
+        
+        # Check if config exists, try alternatives if not
+        if not os.path.exists(kvtuner_config_path):
+            alternative_names = [
+                f"{model_basename}_{kvtuner_scheme}_KVTuner6_0.yaml",
+                f"{model_basename}_{kvtuner_scheme}_KVTuner4_1.yaml",
+                f"{model_basename}_{kvtuner_scheme}_KVTuner6_1.yaml"
+            ]
+            
+            for alt_name in alternative_names:
+                alt_path = os.path.join(kvtuner_dir, "calibration_presets", alt_name)
+                if os.path.exists(alt_path):
+                    kvtuner_config_path = alt_path
+                    break
+            else:
+                print(f"Warning: No KVTuner config found for {model_basename} with {kvtuner_scheme} scheme")
+                print(f"Searched for: {config_filename}")
+                print("Falling back to basic cache mode...")
+                cache_mode = 'basic'
+        
+        # Add KVTuner configuration if available
+        if cache_mode == 'kvtuner' and os.path.exists(kvtuner_config_path):
+            print(f"Using KVTuner config: {kvtuner_config_path}")
+            llm_kwargs.update({
+                "quantization": "kvtuner",
+                "kvtuner_config_path": kvtuner_config_path,
+                "kvtuner_scheme": kvtuner_scheme,
+                "kvtuner_backend": "vanilla"
+            })
+        else:
+            print("KVTuner config not found, using basic cache mode")
+            cache_mode = 'basic'
+    
+    if cache_mode == 'basic':
+        print("Using default vLLM cache (no quantization)")
+        # No additional configuration needed for basic cache
     
     # Add optional parameters
     if max_model_len:
@@ -199,7 +226,34 @@ def initialize_llm_vllm(model_name, kvtuner_scheme, kvtuner_dir, tokenizer_name=
         return llm
         
     except Exception as e:
+        error_msg = str(e)
         print(f"Error initializing vLLM model: {e}")
+        
+        # Check for common KVTuner integration issues
+        if "get_config_filenames() missing 1 required positional argument" in error_msg:
+            print("\n" + "="*60)
+            print("KVTUNER INTEGRATION ERROR DETECTED")
+            print("="*60)
+            print("This error indicates the KVTuner integration in vLLM needs a fix.")
+            print("The get_config_filenames() method should be a @classmethod.")
+            print("\nTo fix this:")
+            print("1. Update vLLM to the latest kvt branch")
+            print("2. Or use --cache_mode basic to bypass KVTuner")
+            print("="*60)
+            
+            if cache_mode == 'kvtuner':
+                print("\nAttempting automatic fallback to basic cache mode...")
+                try:
+                    # Retry with basic cache mode
+                    basic_kwargs = {k: v for k, v in llm_kwargs.items() 
+                                  if k not in ['quantization', 'kvtuner_config_path', 
+                                             'kvtuner_scheme', 'kvtuner_backend']}
+                    llm = LLM(**basic_kwargs)
+                    print("✓ Successfully initialized with basic cache mode")
+                    return llm
+                except Exception as fallback_error:
+                    print(f"✗ Fallback to basic cache also failed: {fallback_error}")
+        
         print("Model kwargs:")
         for key, value in llm_kwargs.items():
             print(f"  {key}: {value}")
@@ -322,9 +376,9 @@ def llm_inference_vllm(llm, prompt, model_name=None, max_new_tokens=200):
         print(f"Prompt (first 100 chars): {prompt[:100]}...")
         return f"Error: {str(e)}", 0, 0
 
-def process_dataset(df, llm, kvtuner_scheme, kvtuner_dir, prompt_template, 
+def process_dataset(df, llm, cache_mode, kvtuner_scheme, kvtuner_dir, prompt_template, 
                    columns_to_include, model_name=None, max_new_tokens=200):
-    """Process each row in the dataset with KVTuner inference"""
+    """Process each row in the dataset with configurable cache inference"""
     results = []
     start_time = time.time()
     total_tokens = 0
@@ -349,7 +403,9 @@ def process_dataset(df, llm, kvtuner_scheme, kvtuner_dir, prompt_template,
         prompt_template = f"Analyze this: {{{used_columns[0]}}}"
         print(f"Invalid prompt template, using fallback: {prompt_template}")
     
-    print(f"Processing {len(df)} rows with KVTuner ({kvtuner_scheme} scheme)")
+    print(f"Processing {len(df)} rows with {cache_mode} cache")
+    if cache_mode == 'kvtuner':
+        print(f"KVTuner scheme: {kvtuner_scheme}")
     
     # Add progress bar for inference
     with tqdm(total=len(df), desc="Processing queries", unit="queries", 
@@ -394,7 +450,8 @@ def process_dataset(df, llm, kvtuner_scheme, kvtuner_dir, prompt_template,
             row_data["prompt_tokens"] = prompt_tokens
             row_data["response_tokens"] = response_tokens
             row_data["total_tokens"] = prompt_tokens + response_tokens
-            row_data["kvtuner_scheme"] = kvtuner_scheme
+            row_data["kvtuner_scheme"] = kvtuner_scheme if cache_mode == 'kvtuner' else 'none'
+            row_data["cache_mode"] = cache_mode
             
             results.append(row_data)
             
@@ -414,32 +471,38 @@ def process_dataset(df, llm, kvtuner_scheme, kvtuner_dir, prompt_template,
         "avg_tokens_per_row": total_tokens / len(df) if len(df) > 0 else 0,
         "avg_prompt_tokens_per_row": total_prompt_tokens / len(df) if len(df) > 0 else 0,
         "avg_response_tokens_per_row": total_response_tokens / len(df) if len(df) > 0 else 0,
-        "kvtuner_scheme": kvtuner_scheme,
+        "kvtuner_scheme": kvtuner_scheme if cache_mode == 'kvtuner' else 'none',
+        "cache_mode": cache_mode,
         "model_name": model_name
     }
     
     return results, stats
 
-def save_results(results, stats, dataset, result_dir, filename_prefix):
+def save_results(results, stats, dataset, result_dir, filename_prefix, cache_mode):
     """Save inference results and stats to the specified directory"""
+    # Use cache mode in filename
+    cache_suffix = f"_{cache_mode}" if cache_mode == 'basic' else "_kvtuner"
+    
     # Save processed results as JSON
-    results_path = os.path.join(result_dir, f"{filename_prefix}_kvtuner_inference_results.json")
+    results_path = os.path.join(result_dir, f"{filename_prefix}{cache_suffix}_inference_results.json")
     with open(results_path, 'w') as f:
         json.dump(results, f, indent=2)
     
     # Save stats as JSON
-    stats_path = os.path.join(result_dir, f"{filename_prefix}_kvtuner_stats.json")
+    stats_path = os.path.join(result_dir, f"{filename_prefix}{cache_suffix}_stats.json")
     with open(stats_path, 'w') as f:
         json.dump(stats, f, indent=2)
     
     # Save summary as text
-    summary_path = os.path.join(result_dir, f"{filename_prefix}_kvtuner_summary.txt")
+    summary_path = os.path.join(result_dir, f"{filename_prefix}{cache_suffix}_summary.txt")
     with open(summary_path, 'w') as f:
-        f.write("LLM Inference with KVTuner Summary\n")
-        f.write("===================================\n\n")
+        f.write(f"LLM Inference with {cache_mode.title()} Cache Summary\n")
+        f.write("=" * (30 + len(cache_mode)) + "\n\n")
         f.write(f"Date: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Model: {stats['model_name']}\n")
-        f.write(f"KVTuner Scheme: {stats['kvtuner_scheme']}\n")
+        f.write(f"Cache Mode: {stats['cache_mode']}\n")
+        if stats['cache_mode'] == 'kvtuner':
+            f.write(f"KVTuner Scheme: {stats['kvtuner_scheme']}\n")
         f.write(f"Dataset Size: {stats['total_rows']} rows\n")
         f.write(f"Total Processing Time: {stats['total_time']:.2f} seconds\n")
         f.write(f"Average Time per Row: {stats['avg_time_per_row']:.4f} seconds\n")
@@ -450,7 +513,7 @@ def save_results(results, stats, dataset, result_dir, filename_prefix):
     
     # Save results as CSV for easier analysis
     results_df = pd.DataFrame(results)
-    csv_path = os.path.join(result_dir, f"{filename_prefix}_kvtuner_results.csv")
+    csv_path = os.path.join(result_dir, f"{filename_prefix}{cache_suffix}_results.csv")
     results_df.to_csv(csv_path, index=False)
     
     print(f"Results saved to: {result_dir}")
@@ -460,7 +523,7 @@ def save_results(results, stats, dataset, result_dir, filename_prefix):
     print(f"  - Summary: {summary_path}")
 
 def main():
-    parser = argparse.ArgumentParser(description='Run LLM inference with KVTuner quantization on a dataset.')
+    parser = argparse.ArgumentParser(description='Run LLM inference with configurable cache modes (KVTuner quantized or basic vLLM cache) on a dataset.')
     
     # Dataset configuration
     parser.add_argument('--dataset', type=str, required=True, help='Path to the dataset CSV file.')
@@ -474,14 +537,21 @@ def main():
                         help='Maximum model context length.')
     parser.add_argument('--gpu_ids', type=str, default=None,
                         help='Specific GPU IDs to use, comma-separated (e.g., "0,1" or "6,7").')
+    parser.add_argument('--gpu_memory_utilization', type=float, default=0.75,
+                        help='Fraction of GPU memory to use (0.1 to 1.0, default: 0.75).')
+    
+    # Cache configuration
+    parser.add_argument('--cache_mode', type=str, default='kvtuner',
+                        choices=['kvtuner', 'basic'],
+                        help='Cache mode: "kvtuner" for quantized cache, "basic" for default vLLM cache (default: kvtuner).')
     
     # KVTuner configuration
     parser.add_argument('--kvtuner_scheme', type=str, default='pertoken', 
                         choices=['pertoken', 'kivi'],
-                        help='KVTuner quantization scheme (default: pertoken).')
+                        help='KVTuner quantization scheme (default: pertoken). Only used with --cache_mode kvtuner.')
     parser.add_argument('--kvtuner_dir', type=str, 
                         default='/home/data/so2/KVTuner',
-                        help='Path to KVTuner directory.')
+                        help='Path to KVTuner directory. Only used with --cache_mode kvtuner.')
     
     # Inference configuration
     parser.add_argument('--prompt_template', type=str, 
@@ -500,9 +570,17 @@ def main():
     
     args = parser.parse_args()
     
-    # Validate KVTuner directory
-    if not os.path.exists(args.kvtuner_dir):
-        print(f"Error: KVTuner directory not found: {args.kvtuner_dir}")
+    # Validate cache mode configuration
+    if args.cache_mode == 'kvtuner':
+        # Validate KVTuner directory
+        if not os.path.exists(args.kvtuner_dir):
+            print(f"Error: KVTuner directory not found: {args.kvtuner_dir}")
+            print("Either install KVTuner or use --cache_mode basic")
+            sys.exit(1)
+    
+    # Validate GPU memory utilization
+    if not (0.1 <= args.gpu_memory_utilization <= 1.0):
+        print(f"Error: gpu_memory_utilization must be between 0.1 and 1.0, got {args.gpu_memory_utilization}")
         sys.exit(1)
     
     # Create timestamped result directory
@@ -513,7 +591,7 @@ def main():
     start_time = time.time()
     
     print("="*60)
-    print("LLM Inference with KVTuner")
+    print(f"LLM Inference with {args.cache_mode.title()} Cache")
     print("="*60)
     
     # Load dataset
@@ -543,20 +621,23 @@ def main():
             args.include_columns = [dataset.columns[0]]
             print(f"Using first column as text input: {dataset.columns[0]}")
     
-    # Initialize LLM with KVTuner
+    # Initialize LLM with configurable cache
     llm = initialize_llm_vllm(
         model_name=args.model,
+        cache_mode=args.cache_mode,
         kvtuner_scheme=args.kvtuner_scheme,
-        kvtuner_dir=args.kvtuner_dir,
+        kvtuner_dir=args.kvtuner_dir if args.cache_mode == 'kvtuner' else None,
         tokenizer_name=args.tokenizer,
         max_model_len=args.max_model_len,
-        gpu_ids=args.gpu_ids
+        gpu_ids=args.gpu_ids,
+        gpu_memory_utilization=args.gpu_memory_utilization
     )
     
-    # Process dataset with KVTuner inference
+    # Process dataset with configurable cache inference
     results, stats = process_dataset(
         dataset,
         llm,
+        args.cache_mode,
         args.kvtuner_scheme,
         args.kvtuner_dir,
         args.prompt_template,
@@ -571,14 +652,17 @@ def main():
     stats["total_experiment_time"] = total_time
     
     # Save results
-    save_results(results, stats, dataset, result_dir, filename_prefix)
+    save_results(results, stats, dataset, result_dir, filename_prefix, args.cache_mode)
     
     # Print summary
     print("\n" + "="*60)
     print("INFERENCE COMPLETED")
     print("="*60)
     print(f"Model: {args.model}")
-    print(f"KVTuner Scheme: {args.kvtuner_scheme}")
+    print(f"Cache Mode: {args.cache_mode}")
+    if args.cache_mode == 'kvtuner':
+        print(f"KVTuner Scheme: {args.kvtuner_scheme}")
+    print(f"GPU Memory Utilization: {args.gpu_memory_utilization:.1%}")
     print(f"Processed: {stats['total_rows']} rows")
     print(f"Total Time: {stats['total_time']:.2f}s")
     print(f"Average Time per Row: {stats['avg_time_per_row']:.3f}s")
