@@ -56,9 +56,9 @@ tqdm.tqdm.__enter__ = lambda self: self
 tqdm.tqdm.__exit__ = lambda self, *args, **kwargs: None
 
 # Add paths for vLLM and KVTuner
-vllm_path = "/home/data/so2/vllm"
-kvtuner_path = "/home/data/so2/KVTuner"
-semantic_operators_path = "/home/data/so2/semantic-operators"
+vllm_path = "/Users/zhang/Desktop/huawei/untitled folder 6/vllm"
+kvtuner_path = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner"
+semantic_operators_path = "/Users/zhang/Desktop/huawei/untitled folder 6/semantic-operators"
 sys.path.insert(0, vllm_path)
 sys.path.insert(0, kvtuner_path)
 
@@ -316,6 +316,11 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
             print(f"Using tensor parallelism with {gpu_count} GPUs")
     
     try:
+        print("Initializing vLLM model...")
+        print(f"Model kwargs:")
+        for key, value in llm_kwargs.items():
+            print(f"  {key}: {value}")
+        
         # Create LLM instance
         llm = LLM(**llm_kwargs)
         print("✓ vLLM model loaded successfully")
@@ -336,6 +341,11 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
     except Exception as e:
         error_msg = str(e)
         print(f"Error initializing vLLM model: {e}")
+        
+        # Print the full traceback for debugging
+        import traceback
+        print("Full error traceback:")
+        traceback.print_exc()
         
         # Check for common KVTuner integration issues
         if "get_config_filenames() missing 1 required positional argument" in error_msg:
@@ -679,7 +689,7 @@ def main():
                         choices=['pertoken', 'kivi'],
                         help='KVTuner quantization scheme (default: pertoken). Only used with --cache_mode kvtuner.')
     parser.add_argument('--kvtuner_dir', type=str, 
-                        default='/home/data/so2/KVTuner',
+                        default='/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner',
                         help='Path to KVTuner directory. Only used with --cache_mode kvtuner.')
     
     # Inference configuration
