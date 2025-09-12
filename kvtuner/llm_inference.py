@@ -209,30 +209,71 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         if cache_mode == 'kvtuner' and os.path.exists(kvtuner_config_path):
             print(f"Using KVTuner config: {kvtuner_config_path}")
             
-            # KVTuner integration requires the config file to be named "kvtuner_config.yaml" 
-            # and located in the model directory. We need to copy it there.
+            # KVTuner integration requires the config file to be in JSON format and 
+            # named "kvtuner_config.yaml" in the model directory. However, vLLM's 
+            # quantization loading system expects JSON, so we need to convert YAML to JSON.
             import shutil
+            import json
             model_dir = model_name if os.path.isdir(model_name) else None
             
             if model_dir and os.access(model_dir, os.W_OK):
-                # For local models, copy the config file to the model directory
-                target_config_path = os.path.join(model_dir, "kvtuner_config.yaml")
-                temp_config_file = target_config_path  # Track for cleanup
+                # Load the YAML config and convert to JSON
                 try:
-                    shutil.copy2(kvtuner_config_path, target_config_path)
-                    print(f"Copied KVTuner config to: {target_config_path}")
+                    with open(kvtuner_config_path, 'r') as f:
+                        yaml_config = yaml.safe_load(f)
+                    
+                    # Create both YAML and JSON versions in the model directory
+                    target_yaml_path = os.path.join(model_dir, "kvtuner_config.yaml")
+                    target_json_path = os.path.join(model_dir, "kvtuner_config.json")
+                    temp_config_file = target_yaml_path  # Track for cleanup message
+                    
+                    # Copy the original YAML file (needed by KVTuner implementation)
+                    shutil.copy2(kvtuner_config_path, target_yaml_path)
+                    print(f"Copied KVTuner YAML config to: {target_yaml_path}")
+                    
+                    # Also create a JSON version (for vLLM's quantization loader)
+                    with open(target_json_path, 'w') as f:
+                        json.dump(yaml_config, f, indent=2)
+                    print(f"Created KVTuner JSON config at: {target_json_path}")
+                    
+                    # Verify files exist and show directory contents
+                    print(f"Verifying files in model directory: {model_dir}")
+                    yaml_exists = os.path.exists(target_yaml_path)
+                    json_exists = os.path.exists(target_json_path)
+                    print(f"YAML file exists: {yaml_exists}")
+                    print(f"JSON file exists: {json_exists}")
+                    
+                    # List all config-like files in the directory
+                    config_files = [f for f in os.listdir(model_dir) if f.endswith(('.json', '.yaml', '.yml'))]
+                    print(f"All config files in model dir: {config_files}")
+                    
                     llm_kwargs.update({
                         "quantization": "kvtuner"
                     })
+                    
                 except Exception as e:
-                    print(f"Failed to copy KVTuner config: {e}")
+                    print(f"Failed to process KVTuner config: {e}")
                     print("Trying symlink approach...")
                     try:
-                        # Try creating a symlink instead
-                        if os.path.exists(target_config_path):
-                            os.remove(target_config_path)
-                        os.symlink(kvtuner_config_path, target_config_path)
-                        print(f"Created symlink to KVTuner config: {target_config_path}")
+                        # Try creating symlinks instead
+                        target_yaml_path = os.path.join(model_dir, "kvtuner_config.yaml")
+                        if os.path.exists(target_yaml_path):
+                            os.remove(target_yaml_path)
+                        os.symlink(kvtuner_config_path, target_yaml_path)
+                        print(f"Created symlink to KVTuner config: {target_yaml_path}")
+                        temp_config_file = target_yaml_path
+                        
+                        # Also try to create JSON version
+                        try:
+                            with open(kvtuner_config_path, 'r') as f:
+                                yaml_config = yaml.safe_load(f)
+                            target_json_path = os.path.join(model_dir, "kvtuner_config.json")
+                            with open(target_json_path, 'w') as f:
+                                json.dump(yaml_config, f, indent=2)
+                            print(f"Created KVTuner JSON config at: {target_json_path}")
+                        except Exception as json_error:
+                            print(f"Could not create JSON version: {json_error}")
+                        
                         llm_kwargs.update({
                             "quantization": "kvtuner"
                         })
