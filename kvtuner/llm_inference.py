@@ -312,8 +312,15 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
     if gpu_ids:
         gpu_count = len(gpu_ids.split(','))
         if gpu_count > 1:
-            llm_kwargs["tensor_parallel_size"] = gpu_count
-            print(f"Using tensor parallelism with {gpu_count} GPUs")
+            # Important: KVTuner quantization may have issues with tensor parallelism
+            # Start with single GPU for KVTuner mode, use tensor parallelism for basic mode
+            if cache_mode == 'kvtuner':
+                print(f"Warning: KVTuner quantization with tensor parallelism may be unstable.")
+                print(f"Attempting tensor parallelism with {gpu_count} GPUs for KVTuner...")
+                llm_kwargs["tensor_parallel_size"] = gpu_count
+            else:
+                llm_kwargs["tensor_parallel_size"] = gpu_count
+                print(f"Using tensor parallelism with {gpu_count} GPUs")
     
     try:
         print("Initializing vLLM model...")
@@ -373,6 +380,78 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
                     return llm
                 except Exception as fallback_error:
                     print(f"✗ Fallback to basic cache also failed: {fallback_error}")
+        
+        # Check for engine core initialization failure (likely multi-GPU + KVTuner issue)
+        elif "Engine core initialization failed" in error_msg or "RuntimeError" in error_msg:
+            print("\n" + "="*60)
+            print("ENGINE CORE INITIALIZATION FAILED")
+            print("="*60)
+            print("This error often occurs when:")
+            print("1. KVTuner quantization is incompatible with tensor parallelism")
+            print("2. Multi-GPU setup has distributed communication issues")
+            print("3. GPU memory or CUDA context issues")
+            print("\nTrying fallback strategies...")
+            print("="*60)
+            
+            # Strategy 1: Try basic cache mode with same GPU config
+            if cache_mode == 'kvtuner':
+                print("\n🔄 Strategy 1: Trying basic cache mode with same GPU configuration...")
+                try:
+                    basic_kwargs = {k: v for k, v in llm_kwargs.items() 
+                                  if k not in ['quantization', 'kvtuner_config_path', 
+                                             'kvtuner_scheme', 'kvtuner_backend']}
+                    llm = LLM(**basic_kwargs)
+                    print("✓ Successfully initialized with basic cache mode + tensor parallelism")
+                    return llm
+                except Exception as fallback_error:
+                    print(f"✗ Basic cache + tensor parallelism failed: {fallback_error}")
+            
+            # Strategy 2: Try single GPU with KVTuner
+            if cache_mode == 'kvtuner' and llm_kwargs.get("tensor_parallel_size", 1) > 1:
+                print("\n🔄 Strategy 2: Trying KVTuner with single GPU...")
+                try:
+                    single_gpu_kwargs = llm_kwargs.copy()
+                    single_gpu_kwargs["tensor_parallel_size"] = 1
+                    # Use only the first GPU
+                    if gpu_ids:
+                        first_gpu = gpu_ids.split(',')[0]
+                        import os
+                        os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
+                        print(f"   Using only GPU {first_gpu}")
+                    llm = LLM(**single_gpu_kwargs)
+                    print("✓ Successfully initialized KVTuner with single GPU")
+                    return llm
+                except Exception as fallback_error:
+                    print(f"✗ KVTuner single GPU failed: {fallback_error}")
+            
+            # Strategy 3: Try single GPU with basic cache
+            if llm_kwargs.get("tensor_parallel_size", 1) > 1:
+                print("\n🔄 Strategy 3: Trying single GPU with basic cache...")
+                try:
+                    single_gpu_basic_kwargs = {k: v for k, v in llm_kwargs.items() 
+                                             if k not in ['quantization', 'kvtuner_config_path', 
+                                                         'kvtuner_scheme', 'kvtuner_backend']}
+                    single_gpu_basic_kwargs["tensor_parallel_size"] = 1
+                    # Use only the first GPU
+                    if gpu_ids:
+                        first_gpu = gpu_ids.split(',')[0]
+                        import os
+                        os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
+                        print(f"   Using only GPU {first_gpu}")
+                    llm = LLM(**single_gpu_basic_kwargs)
+                    print("✓ Successfully initialized with single GPU + basic cache")
+                    return llm
+                except Exception as fallback_error:
+                    print(f"✗ Single GPU + basic cache failed: {fallback_error}")
+            
+            print("\n❌ All fallback strategies failed.")
+            print("Recommendations:")
+            print("1. Check GPU availability: nvidia-smi")
+            print("2. Reduce GPU memory utilization (try 0.5)")
+            print("3. Use a smaller model")
+            print("4. Use single GPU: remove --gpu_ids or set to single GPU")
+            print("5. Use basic cache mode: --cache_mode basic")
+            print("="*60)
         
         print("Model kwargs:")
         for key, value in llm_kwargs.items():
