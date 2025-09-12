@@ -173,6 +173,9 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         "disable_log_stats": True,  # Disable internal logging/stats
     }
     
+    # Track temporary config file for cleanup
+    temp_config_file = None
+    
     # Configure cache mode
     if cache_mode == 'kvtuner':
         if not kvtuner_dir:
@@ -205,12 +208,50 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         # Add KVTuner configuration if available
         if cache_mode == 'kvtuner' and os.path.exists(kvtuner_config_path):
             print(f"Using KVTuner config: {kvtuner_config_path}")
-            llm_kwargs.update({
-                "quantization": "kvtuner",
-                "kvtuner_config_path": kvtuner_config_path,
-                "kvtuner_scheme": kvtuner_scheme,
-                "kvtuner_backend": "vanilla"
-            })
+            
+            # KVTuner integration requires the config file to be named "kvtuner_config.yaml" 
+            # and located in the model directory. We need to copy it there.
+            import shutil
+            model_dir = model_name if os.path.isdir(model_name) else None
+            
+            if model_dir and os.access(model_dir, os.W_OK):
+                # For local models, copy the config file to the model directory
+                target_config_path = os.path.join(model_dir, "kvtuner_config.yaml")
+                temp_config_file = target_config_path  # Track for cleanup
+                try:
+                    shutil.copy2(kvtuner_config_path, target_config_path)
+                    print(f"Copied KVTuner config to: {target_config_path}")
+                    llm_kwargs.update({
+                        "quantization": "kvtuner"
+                    })
+                except Exception as e:
+                    print(f"Failed to copy KVTuner config: {e}")
+                    print("Trying symlink approach...")
+                    try:
+                        # Try creating a symlink instead
+                        if os.path.exists(target_config_path):
+                            os.remove(target_config_path)
+                        os.symlink(kvtuner_config_path, target_config_path)
+                        print(f"Created symlink to KVTuner config: {target_config_path}")
+                        llm_kwargs.update({
+                            "quantization": "kvtuner"
+                        })
+                    except Exception as e2:
+                        print(f"Failed to create symlink: {e2}")
+                        print("Falling back to basic cache mode...")
+                        cache_mode = 'basic'
+                        temp_config_file = None
+            else:
+                # For HuggingFace models or read-only directories, we can't modify the cache directory easily
+                # Fall back to basic cache mode with a warning
+                if not model_dir:
+                    print("KVTuner requires local model directory to place config file.")
+                    print("For HuggingFace models, download the model locally first.")
+                else:
+                    print(f"Cannot write to model directory: {model_dir}")
+                    print("Check permissions or use a local model copy.")
+                print("Falling back to basic cache mode...")
+                cache_mode = 'basic'
         else:
             print("KVTuner config not found, using basic cache mode")
             cache_mode = 'basic'
@@ -244,6 +285,10 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         if cache_mode == 'kvtuner':
             print(f"  KVTuner scheme: {kvtuner_scheme}")
         print(f"  GPU memory: {gpu_memory_utilization:.1%}")
+        
+        # Note: We leave the KVTuner config file in place as vLLM may need it during operation
+        if temp_config_file:
+            print(f"Note: KVTuner config file created at: {temp_config_file}")
                 
         return llm
         
