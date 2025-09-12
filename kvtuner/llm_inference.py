@@ -415,7 +415,6 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
                     # Use only the first GPU
                     if gpu_ids:
                         first_gpu = gpu_ids.split(',')[0]
-                        import os
                         os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
                         print(f"   Using only GPU {first_gpu}")
                     llm = LLM(**single_gpu_kwargs)
@@ -435,7 +434,6 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
                     # Use only the first GPU
                     if gpu_ids:
                         first_gpu = gpu_ids.split(',')[0]
-                        import os
                         os.environ["CUDA_VISIBLE_DEVICES"] = first_gpu
                         print(f"   Using only GPU {first_gpu}")
                     llm = LLM(**single_gpu_basic_kwargs)
