@@ -35,6 +35,26 @@ import yaml
 from tqdm import tqdm
 from pathlib import Path
 
+# Suppress vLLM's internal progress bars and verbose logging
+os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
+os.environ["VLLM_SHOW_PROGRESS_BARS"] = "0"
+os.environ["VLLM_DISABLE_TQDM"] = "1"
+os.environ["TQDM_DISABLE"] = "1"
+os.environ["VLLM_TRACE_FUNCTION"] = "0"
+
+# Additional logging suppression
+import logging
+logging.getLogger("vllm").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+
+# Disable tqdm globally by monkey-patching
+import tqdm
+tqdm.tqdm.__init__ = lambda self, *args, **kwargs: None
+tqdm.tqdm.update = lambda self, *args, **kwargs: None
+tqdm.tqdm.close = lambda self, *args, **kwargs: None
+tqdm.tqdm.__enter__ = lambda self: self
+tqdm.tqdm.__exit__ = lambda self, *args, **kwargs: None
+
 # Add paths for vLLM and KVTuner
 vllm_path = "/home/data/so2/vllm"
 kvtuner_path = "/home/data/so2/KVTuner"
@@ -149,7 +169,11 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         "trust_remote_code": True,
         "dtype": "float16",
         "gpu_memory_utilization": gpu_memory_utilization,  # Configurable memory usage
-        "enforce_eager": True  # Disable CUDA graphs to save memory
+        "enforce_eager": True,  # Disable CUDA graphs to save memory
+        "disable_log_stats": True,  # Disable internal logging/stats
+        "disable_log_requests": True,  # Disable request logging
+        "disable_sliding_window": True,  # Additional verbose output suppression
+        "disable_frontend_multiprocessing": True,  # Reduce multiprocessing overhead
     }
     
     # Configure cache mode
@@ -215,13 +239,14 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
     try:
         # Create LLM instance
         llm = LLM(**llm_kwargs)
-        print("vLLM model loaded successfully")
+        print("✓ vLLM model loaded successfully")
         
-        # Print model info
-        print(f"Model configuration:")
-        for key, value in llm_kwargs.items():
-            if key != "model":  # Already printed above
-                print(f"  {key}: {value}")
+        # Print model info (minimal)
+        print(f"  Model: {model_name}")
+        print(f"  Cache mode: {cache_mode}")
+        if cache_mode == 'kvtuner':
+            print(f"  KVTuner scheme: {kvtuner_scheme}")
+        print(f"  GPU memory: {gpu_memory_utilization:.1%}")
                 
         return llm
         
@@ -355,8 +380,26 @@ def llm_inference_vllm(llm, prompt, model_name=None, max_new_tokens=200):
             skip_special_tokens=True
         )
         
-        # Generate response using vLLM
-        outputs = llm.generate([formatted_prompt], sampling_params)
+        # Additional runtime suppression to prevent progress bars
+        import sys
+        import io
+        import warnings
+        from contextlib import redirect_stderr, redirect_stdout
+        
+        # Suppress warnings and additional verbose output
+        warnings.filterwarnings("ignore")
+        
+        # Generate response using vLLM with maximum output suppression
+        # Temporarily capture all stdout/stderr to prevent any progress bars
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        try:
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            outputs = llm.generate([formatted_prompt], sampling_params, use_tqdm=False)
+        finally:
+            sys.stdout = old_stdout
+            sys.stderr = old_stderr
         
         # Extract response
         output = outputs[0]
@@ -407,9 +450,10 @@ def process_dataset(df, llm, cache_mode, kvtuner_scheme, kvtuner_dir, prompt_tem
     if cache_mode == 'kvtuner':
         print(f"KVTuner scheme: {kvtuner_scheme}")
     
-    # Add progress bar for inference
-    with tqdm(total=len(df), desc="Processing queries", unit="queries", 
-              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
+    # Add simple progress tracking for inference
+    with tqdm(total=len(df), desc="Processing", unit="rows", 
+              bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]',
+              disable=False, leave=False, miniters=1, mininterval=2.0) as pbar:
         
         for index, row in df.iterrows():
             row_data = {}
