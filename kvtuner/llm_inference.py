@@ -593,7 +593,7 @@ def main():
                         choices=['pertoken', 'kivi'],
                         help='KVTuner quantization scheme (default: pertoken). Only used with --cache_mode kvtuner.')
     parser.add_argument('--kvtuner_dir', type=str, 
-                        default='/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner',
+                        default='/home/data/so2/KVTuner',
                         help='Path to KVTuner directory. Only used with --cache_mode kvtuner.')
     
     # Inference configuration
