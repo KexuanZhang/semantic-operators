@@ -56,9 +56,9 @@ tqdm.tqdm.__enter__ = lambda self: self
 tqdm.tqdm.__exit__ = lambda self, *args, **kwargs: None
 
 # Add paths for vLLM and KVTuner
-vllm_path = "/home/data/so2/vllm"
-kvtuner_path = "/home/data/so2/KVTuner"
-semantic_operators_path = "/home/data/so2/semantic-operators"
+vllm_path = "/Users/zhang/Desktop/huawei/untitled folder 6/vllm"
+kvtuner_path = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner"
+semantic_operators_path = "/Users/zhang/Desktop/huawei/untitled folder 6/semantic-operators"
 sys.path.insert(0, vllm_path)
 sys.path.insert(0, kvtuner_path)
 
@@ -768,7 +768,7 @@ def main():
                         choices=['pertoken', 'kivi'],
                         help='KVTuner quantization scheme (default: pertoken). Only used with --cache_mode kvtuner.')
     parser.add_argument('--kvtuner_dir', type=str, 
-                        default='/home/data/so2/KVTuner',
+                        default='/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner',
                         help='Path to KVTuner directory. Only used with --cache_mode kvtuner.')
     
     # Inference configuration

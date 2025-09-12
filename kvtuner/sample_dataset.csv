@@ -1,0 +1,11 @@
+text_content,label
+"I love this product! It works perfectly.",positive
+"This is terrible, completely broken.",negative
+"The weather is nice today.",neutral
+"Amazing service and great quality!",positive
+"Could be better, not satisfied.",negative
+"This software is really helpful.",positive
+"Bad experience with customer service.",negative
+"The food was delicious and fresh.",positive
+"Delivery was late and items were missing.",negative
+"Great value for the money!",positive
