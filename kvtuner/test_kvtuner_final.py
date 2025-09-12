@@ -1,14 +1,32 @@
 #!/usr/bin/env python3
 """
 Test script to verify KVTuner integration with correct paths.
-This script validates that all the fixes are working correctly.
+T    # Test 6: Test vLLM quantization registration
+    print("\n6. Testing vLLM quantization registration...")
+    try:
+        from vllm.model_executor.layers.quantization import QuantizationMethods
+        if hasattr(QuantizationMethods, '__args__') and "kvtuner" in QuantizationMethods.__args__:
+            print("✅ KVTuner registered in QuantizationMethods")
+        else:
+            print("⚠️  KVTuner not found in QuantizationMethods (may be expected)")
+            
+        # Alternative check - try to import the quantization config directly
+        try:
+            from vllm.model_executor.layers.quantization.kvtuner import KVTunerConfig as TestConfig
+            print("✅ KVTuner config can be imported directly")
+        except ImportError as ie:
+            print(f"❌ Direct import failed: {ie}")
+            
+    except Exception as e:
+        print(f"⚠️  Quantization registration test had issues: {e}")
+        print("   This may be normal depending on vLLM version")pt validates that all the fixes are working correctly.
 """
 import sys
 import os
 
 # Set correct paths for your environment
-vllm_path = "/home/data/so2/vllm"
-kvtuner_path = "/home/data/so2/KVTuner"
+vllm_path = "/Users/zhang/Desktop/huawei/untitled folder 6/vllm"
+kvtuner_path = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner"
 
 print("KVTuner Integration Test")
 print("=" * 50)
@@ -48,8 +66,18 @@ try:
     filenames = config.get_config_filenames()
     print(f"✅ get_config_filenames(): {filenames}")
     
-    quant_method = config.get_quant_method()
+    # Test get_quant_method with a dummy layer
+    import torch.nn as nn
+    dummy_layer = nn.Linear(10, 10)
+    quant_method = config.get_quant_method(dummy_layer, "test_prefix")
     print(f"✅ get_quant_method(): {quant_method}")
+    
+    # Test other basic methods
+    name = config.get_name()
+    print(f"✅ get_name(): {name}")
+    
+    supported_dtypes = config.get_supported_act_dtypes()
+    print(f"✅ get_supported_act_dtypes(): {supported_dtypes}")
     
     # Test 4: Test KV cache method
     print("\n4. Testing KV cache method...")
@@ -58,7 +86,7 @@ try:
     
     # Test 5: Test YAML config loading
     print("\n5. Testing YAML config loading...")
-    config_path = "/home/data/so2/KVTuner/calibration_presets/Qwen2.5-3B-Instruct_pertoken_KVTuner4_0.yaml"
+    config_path = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner/calibration_presets/Qwen2.5-3B-Instruct_pertoken_KVTuner4_0.yaml"
     
     if os.path.exists(config_path):
         import yaml
@@ -73,7 +101,7 @@ try:
     else:
         print(f"⚠️  YAML config not found: {config_path}")
         # Try to find any available config
-        preset_dir = "/home/data/so2/KVTuner/calibration_presets"
+        preset_dir = "/Users/zhang/Desktop/huawei/untitled folder 6/KVTuner/calibration_presets"
         if os.path.exists(preset_dir):
             available_configs = [f for f in os.listdir(preset_dir) if f.endswith('.yaml')]
             print(f"   Available configs: {available_configs[:3]}...")
