@@ -310,8 +310,9 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
             # Start with single GPU for KVTuner mode, use tensor parallelism for basic mode
             if cache_mode == 'kvtuner':
                 print(f"Warning: KVTuner quantization with tensor parallelism may be unstable.")
-                print(f"Attempting tensor parallelism with {gpu_count} GPUs for KVTuner...")
-                llm_kwargs["tensor_parallel_size"] = gpu_count
+                print(f"Starting with single GPU for KVTuner, will fallback to tensor parallelism if needed...")
+                # Start with single GPU for KVTuner to avoid compatibility issues
+                llm_kwargs["tensor_parallel_size"] = 1
             else:
                 llm_kwargs["tensor_parallel_size"] = gpu_count
                 print(f"Using tensor parallelism with {gpu_count} GPUs")
