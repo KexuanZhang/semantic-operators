@@ -326,12 +326,88 @@ def initialize_llm_vllm(model_name, cache_mode='kvtuner', kvtuner_scheme='pertok
         llm = LLM(**llm_kwargs)
         print("✓ vLLM model loaded successfully")
         
-        # Print model info (minimal)
-        print(f"  Model: {model_name}")
-        print(f"  Cache mode: {cache_mode}")
+        # Print detailed cache configuration information
+        print("\n" + "="*60)
+        print("CACHE CONFIGURATION DETAILS")
+        print("="*60)
+        print(f"Model: {model_name}")
+        print(f"Cache Mode: {cache_mode}")
+        
         if cache_mode == 'kvtuner':
-            print(f"  KVTuner scheme: {kvtuner_scheme}")
-        print(f"  GPU memory: {gpu_memory_utilization:.1%}")
+            print(f"KVTuner Scheme: {kvtuner_scheme}")
+            print(f"KVTuner Directory: {kvtuner_dir}")
+            
+            # Print KVTuner config details if available
+            if temp_config_file and os.path.exists(temp_config_file):
+                print(f"KVTuner Config File: {temp_config_file}")
+                try:
+                    with open(temp_config_file, 'r') as f:
+                        config_content = yaml.safe_load(f)
+                    print("KVTuner Configuration:")
+                    for key, value in config_content.items():
+                        if isinstance(value, dict):
+                            print(f"  {key}:")
+                            for subkey, subvalue in value.items():
+                                print(f"    {subkey}: {subvalue}")
+                        else:
+                            print(f"  {key}: {value}")
+                except Exception as e:
+                    print(f"  Could not read config file: {e}")
+            
+            # Try to access vLLM's cache configuration
+            try:
+                if hasattr(llm, 'llm_engine') and hasattr(llm.llm_engine, 'cache_config'):
+                    cache_config = llm.llm_engine.cache_config
+                    print("vLLM Cache Config:")
+                    print(f"  Cache implementation: {type(cache_config).__name__}")
+                    if hasattr(cache_config, 'cache_dtype'):
+                        print(f"  Cache dtype: {cache_config.cache_dtype}")
+                    if hasattr(cache_config, 'block_size'):
+                        print(f"  Block size: {cache_config.block_size}")
+                    if hasattr(cache_config, 'num_gpu_blocks'):
+                        print(f"  GPU blocks: {cache_config.num_gpu_blocks}")
+                    if hasattr(cache_config, 'num_cpu_blocks'):
+                        print(f"  CPU blocks: {cache_config.num_cpu_blocks}")
+                    
+                    # KVTuner specific attributes
+                    kvtuner_attrs = ['kvtuner_backend', 'kvtuner_scheme', 'kvtuner_config_path']
+                    for attr in kvtuner_attrs:
+                        if hasattr(cache_config, attr):
+                            print(f"  {attr}: {getattr(cache_config, attr)}")
+                            
+            except Exception as e:
+                print(f"  Could not access cache config: {e}")
+        else:
+            print("Using vLLM default cache (no quantization)")
+            try:
+                if hasattr(llm, 'llm_engine') and hasattr(llm.llm_engine, 'cache_config'):
+                    cache_config = llm.llm_engine.cache_config
+                    print("vLLM Cache Config:")
+                    print(f"  Cache implementation: {type(cache_config).__name__}")
+                    if hasattr(cache_config, 'cache_dtype'):
+                        print(f"  Cache dtype: {cache_config.cache_dtype}")
+                    if hasattr(cache_config, 'block_size'):
+                        print(f"  Block size: {cache_config.block_size}")
+                    if hasattr(cache_config, 'num_gpu_blocks'):
+                        print(f"  GPU blocks: {cache_config.num_gpu_blocks}")
+                    if hasattr(cache_config, 'num_cpu_blocks'):
+                        print(f"  CPU blocks: {cache_config.num_cpu_blocks}")
+            except Exception as e:
+                print(f"  Could not access cache config: {e}")
+        
+        print(f"GPU Memory Utilization: {gpu_memory_utilization:.1%}")
+        print(f"Tensor Parallel Size: {llm_kwargs.get('tensor_parallel_size', 1)}")
+        
+        if gpu_ids:
+            print(f"GPU IDs: {gpu_ids}")
+        
+        # Print quantization status
+        if 'quantization' in llm_kwargs:
+            print(f"Quantization: {llm_kwargs['quantization']}")
+        else:
+            print("Quantization: None")
+            
+        print("="*60)
         
         # Note: We leave the KVTuner config file in place as vLLM may need it during operation
         if temp_config_file:
